@@ -28544,7 +28544,7 @@ const allowed = [
         protect: [
           DATA_ROOT,                    // 数据根（projects.json / sessions 都在这）
           SKILLS_ROOT,                  // 技能目录
-          PROJECT_ROOT,                 // 源码根（D:\nis0812）
+          PROJECT_ROOT,                 // 源码根（仓库根）
           BACKEND_ROOT,                 // 后端根
           String((globalSettings as any).storagePath || ''),  // 存储根
           defaultStorageRoot(),         // 默认存储根

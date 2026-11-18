@@ -14,17 +14,21 @@ import { buildFamilyTool } from './familyTool.ts'
 import { DATA_ROOT, BACKEND_ROOT } from './paths.ts'
 
 /* ── 内核脚本路径（0917 支持 env 覆盖 / **0918 改为随应用自带**）──────
- * 背景（双版本隔离）：以前打包版（版本1）与开发版（版本2）都 spawn 网页版目录里那一份
- * `E:\nis-h-v1.0\nis内核\src-python\memory_bridge.py` —— 改内核会同时影响两边，
- * 而且客户端其实是在**依赖网页版的安装目录**（E 盘一删就全废）。
+ * 背景（双版本隔离）：以前打包版（版本1）与开发版（版本2）都 spawn 网页版目录里那一份内核脚本
+ * —— 改内核会同时影响两边，而且客户端其实是在**依赖网页版的安装目录**（那个盘一删就全废）。
  * 现在：内核包（memory_bridge.py + core/）随项目自带在 `backend/memory-kernel/`，
  * 打包时跟着 sidecar 一起进安装包 → 每个实例带自己那份。
- * 优先级：NIS_BRIDGE_SCRIPT 显式覆盖 → 自带内核 → 老路径（兼容用，不再更新）。 ── */
+ * 优先级：NIS_BRIDGE_SCRIPT 显式覆盖 → 自带内核。
+ *
+ * ★开源整理批（2026-11）：**删掉 LEGACY_BRIDGE**（原来写死 `E:\<旧内核目录>\...`）。
+ *   那是最典型的兜底：别人的机器上恒不存在，spawn 只会失败成"文件找不到"，
+ *   而不是明说"内核缺失"。现在来源只有两个：env 显式指定，或随包自带的那份；
+ *   到底在不在由 BRIDGE_SCRIPT_EXISTS 如实暴露。 ── */
 const BUNDLED_BRIDGE = path.join(BACKEND_ROOT, 'memory-kernel', 'memory_bridge.py')
-const LEGACY_BRIDGE = 'E:\\nis-h-v1.0\\nis内核\\src-python\\memory_bridge.py'
-export const BRIDGE_SCRIPT = String(process.env.NIS_BRIDGE_SCRIPT || '').trim()
-  || (fs.existsSync(BUNDLED_BRIDGE) ? BUNDLED_BRIDGE : LEGACY_BRIDGE)
-/** 用的是不是自带内核（false = 回落到网页版那份老脚本，日志里会提示） */
+export const BRIDGE_SCRIPT = String(process.env.NIS_BRIDGE_SCRIPT || '').trim() || BUNDLED_BRIDGE
+/** 内核脚本是不是真的在（缺了要明说，别静默变成"记忆功能莫名不可用"） */
+export const BRIDGE_SCRIPT_EXISTS = fs.existsSync(BRIDGE_SCRIPT)
+/** 用的是不是自带内核（false = 被 env 指到了别处） */
 export const USING_BUNDLED_KERNEL = BRIDGE_SCRIPT === BUNDLED_BRIDGE
 
 /* ── Python 解释器解析（0913 事故修复 / 0917 二次重做）───────────────
@@ -80,7 +84,7 @@ function pythonCandidates(): PyCand[] {
   push(UP ? path.join(UP, 'NISEnv', 'memory-venv', 'Scripts', 'python.exe') : '', [], 'legacy')
   push(path.join(LP, 'hermes', 'hermes-agent', 'venv', 'Scripts', 'python.exe'), [], 'legacy')
   /* ⚠️ 0918 移除：以前这里有两条指向**网页版安装目录**的 venv
-   *   （`E:\nis-h-v1.0\nis内核\.venv`、`…\src-python\.venv`）。
+   *   （`<旧内核目录>\.venv`、`…\src-python\.venv`）。
    *   那是"客户端偷偷用网页版环境"的直连——网页版一升级/一删，客户端就变形。
    *   语义环境必须由本实例自己装（设置→软件环境→记忆检索模型）。 */
   // 常见 Python 安装位置（winget 装 Python.Python.3.1x 的默认落点）—— 只是解释器，不带依赖，仅作 FTS 降级兜底
@@ -168,7 +172,7 @@ function originNote(c: PyCand): string {
  *
  * ⚠️ 0918 用户明确：「网页版用网页版的目录，客户端用客户端自己的，不要串」→
  *    已**删除**旧的「缺省回退旧网页版目录 + 首启把旧库整包拷过来」的行为
- *    （旧目录 = E:\nis-h-v1.0\nis内核\.nis_data）。两边的记忆库/知识库从此互不影响。
+ *    （旧目录 = <旧内核目录>\.nis_data）。两边的记忆库/知识库从此互不影响。
  *    注意：只隔离**数据**；python 内核脚本仍默认引用那份（可用 NIS_BRIDGE_SCRIPT 覆盖）。 */
 let _dataDirOverride = ''
 
