@@ -5,8 +5,8 @@
  * 历史 bug：前端新建项目时用**浏览器 API** 取目录（`showDirectoryPicker` / `webkitdirectory`），
  * 浏览器安全沙箱只给**目录名**（拿不到绝对路径）→ 项目 root_path 被存成 `chat_20260921_141903`
  * 这类相对路径 → 各处以「后端进程 cwd」为基准解析：
- *   · dev（cwd=backend）    → D:\nis0812\backend\chat_20260921_141903
- *   · 打包版（cwd=pack\backend）→ D:\NIS\pack\backend\chat_20260921_141903
+ *   · dev（cwd=backend）    → <旧dev仓库>\backend\chat_20260921_141903
+ *   · 打包版（cwd=pack\backend）→ D:\NiusDream\pack\backend\chat_20260921_141903
  * 结果是**同一个工作区在两处生根**：项目档案、产出、下载各落一份，会话之间互相看不见。
  * （前端取值来源已在 0921y 修好：改用 Tauri 原生目录对话框，拿到的一定是绝对路径。）
  *
@@ -58,7 +58,7 @@ function candidateRoots(opts: { storageRoot?: string; dataRoot?: string; cwd?: s
   if (data) push(path.dirname(data))
   push(cwd)
   push(path.dirname(cwd))
-  // 盘符根兜底：历史脏数据常是"用户在某个盘里选的目录名"（如 `nis0812` → `D:\nis0812`）
+  // 盘符根兜底：历史脏数据常是"用户在某个盘里选的目录名"（如 `nis0812` → `<旧dev仓库>`）
   for (const base of [...list]) {
     const root = path.parse(base).root
     if (root && !list.includes(root)) list.push(root)
@@ -107,7 +107,7 @@ export function resolveRelativeRoot(rel: string, opts: { storageRoot?: string; d
  * ① **绝不硬删**：用 Shell 的 `delete` 动词 → 进 Windows 回收站（用户可还原）；不用 fs.rm 永久删。
  * ② **硬护栏**（`guardWorkspaceDelete`）：盘符根 / 系统目录 / 受保护目录（数据根、存储根、源码根、
  *    用户主目录…）以及"目标包含受保护目录"一律拒绝 —— 项目 root_path 是用户自己的文件夹，
- *    它既可能是别的 AI 做一半的工作区，也可能是 `D:\nis0812` 这种要命的位置。
+ *    它既可能是别的 AI 做一半的工作区，也可能是 `<旧dev仓库>` 这种要命的位置。
  * ③ 路径通过**环境变量**传给 PowerShell（不做字符串拼接）→ 路径里的引号/空格不可能变成注入。
  * ④ 删除是异步的（Shell 处理大目录要时间）→ 调用后**轮询确认**目录真的消失才回 ok。
  */

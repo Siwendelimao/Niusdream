@@ -12,7 +12,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { writeJsonAtomic, loadJsonOrBackup } from './jsonStore.ts'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 import { Type as TbType } from 'typebox'
 import { DATA_ROOT } from './paths.ts'
 import { checkToolCodeSyntax, runSandboxedToolCode, ToolSandboxError } from './toolSandbox.ts'

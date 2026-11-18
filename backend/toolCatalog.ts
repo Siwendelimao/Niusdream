@@ -29,7 +29,7 @@ export interface ToolRegistryEntry {
   /** 来源（registry 合并 MCP/自定义时写入） */
   source?: 'builtin' | 'mcp' | 'custom'
   /** 挂载门槛：不满足则勾选也不会出现在该会话（预设编辑器显示徽标，勾选仅表达"允许"） */
-  gating?: 'toolset:install' | 'toolset:preset-admin' | 'toolset:custom-tools' | 'toolset:self-modify' | 'team'
+  gating?: 'toolset:install' | 'toolset:preset-admin' | 'toolset:custom-tools' | 'team'
   /** 高危标记（执行弹权限卡）：仓库卡片显示警示 */
   risky?: boolean
   /** MCP 专属：所属 server 名 */
@@ -44,16 +44,15 @@ export const TOOL_CATALOG: ToolRegistryEntry[] = [
   // ── 文件（tools.ts buildSessionTools，cwd=会话工作区）──
   { name: 'fs_read', label: '读取文件', description: '读取工作区文件内容（可截断；支持 startLine/endLine 分段读）', group: '文件', variant: 'read', tab: 'system' },
   { name: 'list_dir', label: '列目录', description: '列出目录内容（文件/子目录+大小，毫秒级）——看结构用它，别 run_command dir', group: '文件', variant: 'read', tab: 'system' },
-  { name: 'history', label: '文件时光机', description: '改动历史/回滚/统计：list 查历史（拿 change_id）· restore 回滚（只认本会话，可 dry_run）· stat 摸底', group: '文件', variant: 'others', tab: 'system' },
   { name: 'schedule', label: '定时任务', description: '定时任务：create 建（once/hourly/daily/weekly/monthly）· list 查 · update 改/停启用 · remove 删 · run_now 立跑', group: '定时任务', variant: 'others', tab: 'system', risky: true },
-  { name: 'git', label: 'git', description: '版本管理：status 状态 · diff 对比（大 diff 自动裁剪成摘要）· log 历史 · commit 提交（弹确认）', group: '命令', variant: 'bash', tab: 'system', risky: true },
   { name: 'repo', label: '仓库地图', description: '仓库导航：map 结构概览 · search 按符号/概念找代码位置 · build 重建索引（与 fs_grep 互补）', group: '文件', variant: 'search', tab: 'system' },
   { name: 'fs_grep', label: '搜索文件内容', description: '按关键词/正则搜索工作区文件内容（返回 文件:行号 + 上下文），查代码引用/配置项时用它，别再拼 findstr', group: '文件', variant: 'search', tab: 'system' },
   { name: 'fs_write', label: '写入文件', description: '写入/新建文件（含多模态图片写入）', group: '文件', variant: 'write', tab: 'system', risky: true },
   { name: 'fs_edit', label: '精确替换', description: '按锚点精确替换文件片段（old_string 必须原样且默认唯一；改大文件比 fs_write 整文件覆盖安全，会回报命中行号）', group: '文件', variant: 'edit', tab: 'system', risky: true },
-  { name: 'fs_delete', label: '删除文件', description: '删除文件或目录', group: '文件', variant: 'delete', tab: 'system', risky: true },
   // ── 命令（tools.ts buildCmdTool）──
   { name: 'run_command', label: '执行命令', description: '在会话工作目录执行命令', group: '命令', variant: 'bash', tab: 'system', risky: true },
+  /* ★ g3：验收专用 —— 跑命令只看退出码（审批与 run_command 同级，见 server.ts assessRisk 的 check_run 分支） */
+  { name: 'check_run', label: '验收命令', description: '跑一条命令并返回退出码（exitCode===0 算通过）；run_command 是干活、check_run 是验收', group: '命令', variant: 'bash', tab: 'system', risky: true },
   // ── 后台任务（tools.ts buildBgTools）—— ★ 0929 刀①：6 个 bg_* 合并成 bg(action=…) ──
   // 0921 接线补：此前只在 tools.ts 里实现，目录/预设白名单都漏登记 → 预设编辑器勾不到、AI 会话里也调不到
   //（server.ts 的严格白名单过滤会把未声明的工具全部裁掉）。本文件是「工具唯一事实源」，必须登记在这里，
@@ -76,14 +75,18 @@ export const TOOL_CATALOG: ToolRegistryEntry[] = [
   // ── 技能 ──
   { name: 'use_skill', label: '使用技能', description: '加载已安装技能（SKILL.md）的完整指令', group: '技能', variant: 'others', tab: 'system' },
   // ── 团队（绑团队会话且主预设=团队指挥官时自动挂载；预设勾选不生效）──
-  { name: 'team_dispatch', label: '派发任务', description: '派发任务单给团队成员（数组+deps 依赖硬校验，同步等成员完成返回产出；打回≤2）', group: '团队', variant: 'others', tab: 'system', gating: 'team' },
+  { name: 'team_dispatch', label: '派发任务', description: '派发任务单给团队成员（数组+deps 依赖硬校验；stepId 可省、计划里没有会自动补建；打回≤2）', group: '团队', variant: 'others', tab: 'system', gating: 'team' },
+  { name: 'member_tell', label: '给成员补充', description: '给正在执行某一步的成员追加补充/修正（插话，不重派、不打断）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'member_new_session', label: '给成员开新对话', description: '给成员换新窗口并交交接（旧段归档，只查不续）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
   /* ★ 0925v（需求的"分身"功能）：非团队模式派 1~3 个自己并行干活（气泡/过程回放与团队成员同款）
    * ★ 0925x（用户定）：派分身必弹权限申请 —— 批准后分身内部免审畅通（分身工具箱已圈安全区） */
   { name: 'spawn_clone', label: '派出分身', description: '派出 1~3 个自己的分身并行执行子任务（同步等待完成后返回产出摘要）', group: '团队', variant: 'others', tab: 'system', risky: true },
   { name: 'bb_goal', label: '写黑板目标', description: '写黑板：目标+计划步骤（owner/deps），同步用户计划卡', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
   { name: 'bb_write', label: '写黑板', description: '写黑板：审核 done/打回 rejected（带 feedback）、发现、最终汇总', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
   { name: 'bb_read', label: '读黑板', description: '读黑板快照（目标/计划进度/发现/汇总）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
-  { name: 'team_info', label: '读团队信息', description: '读团队成员清单（id/职责/工具/模型）与运行模式', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
+  /* ★1036-S3：指挥官读「某次执行的过程 + 用户与该成员的单聊」（只读） */
+  { name: 'sub_read', label: '读执行详情', description: '读某个成员/某次执行的过程与单聊记录（只读）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
+  { name: 'team_info', label: '读团队信息', description: '读团队成员清单（id/职责/工具/模型）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
   { name: 'project_note', label: '写项目档案', description: '维护工作区根的项目档案（NIS-notes.md）：项目约定/当前进度/决策记录/产物清单——让同项目的其他窗口了解项目背景与进度', group: '交互', variant: 'write', tab: 'system' },  // ★1010-E（已定案）：从「记忆」组挪到「交互」——"记忆"留给记忆库（memory），消除系统/特殊两个 tab 都出现"记忆"分组的疑惑
   { name: 'sub_plan', label: '成员自列执行计划', description: '团队成员自列子任务清单（3~12 条），逐条推进并更新完成状态（只进自己的执行气泡，不动会话计划卡）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
   // ── 安装助手（toolsets: install 会话才有）──
@@ -102,20 +105,6 @@ export const TOOL_CATALOG: ToolRegistryEntry[] = [
   { name: 'list_custom_tools', label: '列自定义工具', description: '列出全部自定义工具（高风险工具清单）', group: '特殊工具', variant: 'read', tab: 'special', gating: 'toolset:custom-tools' },
   { name: 'save_custom_tool', label: '建自定义工具', description: '创建/更新自定义工具（高风险：执行必弹权限卡）', group: '特殊工具', variant: 'write', tab: 'special', gating: 'toolset:custom-tools' },
   { name: 'delete_custom_tool', label: '删自定义工具', description: '删除自定义工具', group: '特殊工具', variant: 'delete', tab: 'special', gating: 'toolset:custom-tools' },
-  // ── 项目自我修改（toolsets: self-modify，创造模式专属）──
-  // 0904 修正：旧目录里 project_read/project_write/project_delete/project_run 四条是假名（AI 照之调用必失败），
-  // 真实挂载名如下（server.ts 'project_' + buildSessionTools 派生，run_command→project_run_command）。
-  { name: 'project_fs_read', label: '项目·读文件', description: '读取 NIS 项目源码文件（前后端）', group: '项目自我修改', variant: 'read', tab: 'special', gating: 'toolset:self-modify' },
-  // 0913 二次审计补：buildSessionTools 的每个工具都会自动生成 project_ 孪生（server.ts 'project_' + name 映射），
-  // 此前漏了 grep/edit 两个孪生 → 升级模式用到它们时图标/分类/审批都不对（详见 docs/工具开发接入清单.md §七）
-  { name: 'project_fs_grep', label: '项目·搜索内容', description: '在 NIS 项目源码里搜索文件内容（只读）', group: '项目自我修改', variant: 'search', tab: 'special', gating: 'toolset:self-modify' },
-  { name: 'project_fs_write', label: '项目·写文件', description: '写入/修改 NIS 项目源码（后端 .ts 需重启生效）', group: '项目自我修改', variant: 'write', tab: 'special', gating: 'toolset:self-modify', risky: true },
-  { name: 'project_fs_edit', label: '项目·精确替换', description: '对 NIS 项目源码做精确片段替换（old_string → new_string，含唯一性校验）', group: '项目自我修改', variant: 'edit', tab: 'special', gating: 'toolset:self-modify', risky: true },
-  { name: 'project_fs_delete', label: '项目·删文件', description: '删除 NIS 项目源码文件', group: '项目自我修改', variant: 'delete', tab: 'special', gating: 'toolset:self-modify', risky: true },
-  // ★ 0924：旧描述写的是「如重启后端/装依赖」—— 等于在教 AI 自杀。AI 照做时链路是
-  // 后端(node) → cmd.exe → 脚本，那条"重启"命令杀掉的正是承载它的宿主后端：工具调用永不返回、
-  // 会话直接中断，脚本作为孤儿跑完再拉起新后端 ⇒ 用户看到的就是「后端起来一会儿又断 + AI 突然不回话」。
-  { name: 'project_run_command', label: '项目·执行命令', description: '在项目根目录执行命令（装依赖/跑测试/构建等）。⚠️ 禁止用它重启或停止后端：那会杀掉正在承载本条命令的后端自身，命令永远不返回、会话直接中断；后端代码改完请让用户到「NIS 后端控制台」点「重启后端」。', group: '项目自我修改', variant: 'bash', tab: 'special', gating: 'toolset:self-modify', risky: true },
 ]
 
 /**

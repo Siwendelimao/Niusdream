@@ -54,9 +54,9 @@ interface AcpTurnResult {
   reason?: string
 }
 
-/* ★1005 可移植性修复：原来这三处**写死了 `D:\nis0924\...`** —— 本机在、打包版装到别的目录或换机就全废
+/* ★1005 可移植性修复：原来这三处**写死了 `<dev仓库>\...`** —— 本机在、打包版装到别的目录或换机就全废
  *（同文件早就 import 了 BACKEND_ROOT，说明作者知道要用相对根，这三处漏了）。现在一律运行时派生：
- *  · AGENTS_ROOT：外部 agent 安装根（安装器就是往「NIS 根\external-agents\<id>\」装的）
+ *  · AGENTS_ROOT：外部 agent 安装根（安装器就是往「NiusDream 根\external-agents\<id>\」装的）
  *  · NODE_DIR   ：**跑我们自己的那个 node** 在哪（比写死 toolchain 路径正确）
  *  · GIT_CMD    ：Git for Windows 的 cmd 目录；找不到就不塞 PATH（并留痕，不静默假装有）
  *  · codex 入口 ：**唯一权威 = 安装器写的 install.json.entry**（与"登录/查额度"读同一份），

@@ -1,5 +1,5 @@
 /**
- * secretbox.ts —— NIS 供应商密钥保险箱（★ 0930）
+ * secretbox.ts —— NiusDream 供应商密钥保险箱（★ 0930）
  *
  * 为什么需要（实测反馈）：原来 API Key 是**明文**躺在 data/providers.json 里。
  * 这个文件只要被复制走（备份 / 网盘同步 / 打包发人），所有 key 一起走。
@@ -20,7 +20,7 @@
  * 无新依赖：口令层用 node 内置 scrypt + aes-256-gcm；本机层调 Windows DPAPI（PowerShell）。
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, execFile } from 'node:child_process'
 import crypto from 'node:crypto'
 
 export const DPAPI_PREFIX = 'enc:v1:dpapi:'
@@ -44,7 +44,7 @@ export function isEncrypted(v: unknown): boolean {
  */
 export function encryptWithPassphrase(plain: string, passphrase: string): string {
   const pw = String(passphrase || '')
-  /* ★1011（老大要求："哪怕口令弱也可以使用"）：原来 <8 位直接拒绝，现在**只要非空就放行**。
+  /* ★1011（需求："哪怕口令弱也可以使用"）：原来 <8 位直接拒绝，现在**只要非空就放行**。
      弱口令的风险交由**前端明确提示**（强度条 + 警告），而不是替用户做决定、更不是
      默默不带密钥（那才是真的坑：填了口令却什么也没带，用户还不知道为什么）。 */
   if (!pw) throw new Error('口令不能为空（留空 = 不带密钥，不会走到这里）')
@@ -84,6 +84,25 @@ export function decryptWithPassphrase(blob: string, passphrase: string): string 
 
 /* ────────────────────── 本机层：Windows DPAPI ────────────────────── */
 
+/** 异步版：**参数与同步版完全一致**，只是不阻塞事件循环（`execFile` 回调式）。
+ *  为什么需要它：同步版 `execFileSync` 会拉起 PowerShell（Add-Type 编译 C#，实测 2~3 秒），
+ *  这 2~3 秒里整个后端主线程是死的（所有 RPC/帧排队）—— 启动时"刚打开就卡"的一个大头。
+ *  ⚠️ 只给**启动预热**用；运行期热路径（`plainKey` 等）仍然走同步版（那时缓存已热，不拉进程）。 */
+function runPsAsync(script: string, inputB64?: string): Promise<string> {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+      windowsHide: true,
+      timeout: 15000,
+      encoding: 'utf8',
+      env: inputB64 ? { ...process.env, NIS_SEC_IN: inputB64 } : process.env,
+    }, (err, stdout) => {
+      if (err) return reject(err)
+      resolve(String(stdout || '').trim())
+    })
+  })
+}
+
 function runPs(script: string, inputB64?: string): string {
   // 数据走 env 而不是命令行：命令行参数在进程列表里对同机其他进程可见，key 不能进那儿
   const encoded = Buffer.from(script, 'utf16le').toString('base64')            // -EncodedCommand：绕开中文/引号转义地狱
@@ -99,7 +118,7 @@ function runPs(script: string, inputB64?: string): string {
   const s = String(out || '').trim()
   /* ★ 自测实测：PowerShell 失败时会把错误写到 stderr，且经 -EncodedCommand 出来是**中文乱码**
    * （`ʹ�á�3���` 之类，编码是 GBK 而 Node 按 utf8 读）；成功时 Add-Type 还会吐一段 CLIXML 进度流。
-   * 两者都会污染 NIS 日志、且乱码会误导排查。所以：脚本内自己 try/catch，只回 ASCII 错误码，
+   * 两者都会污染 NiusDream 日志、且乱码会误导排查。所以：脚本内自己 try/catch，只回 ASCII 错误码，
    * 中文解释由 Node 侧拼接 —— 日志里从此只有我们自己写的中文。 */
   if (s.startsWith('ERR:')) throw new Error(s.slice(4))
   if (!s) throw new Error('PowerShell 无输出（DPAPI 调用异常）')
@@ -231,6 +250,12 @@ export function decryptDpapiBatch(blobs: string[]): Array<{ ok: boolean; value?:
     const reason = String(e?.message || e)
     return raw.map(() => ({ ok: false, reason, transient: true }))
   }
+  return parseBatchOutput(raw, out)
+}
+
+/** DPAPI 批量解密的**结果解析**（同步/异步两个入口共用，绝不各写一份）。
+ *  参数：`raw` = 原始密文列表，`out` = PowerShell 的原始输出。 */
+function parseBatchOutput(raw: string[], out: string): Array<{ ok: boolean; value?: string; reason?: string; transient?: boolean }> {
   const lines = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   /* ★1005 诚实性修复：**结果行数必须与输入等长**，否则一律拒绝采信。
      原实现纯按行号 `lines[i]` 对齐 —— PowerShell 只要多吐一行（profile / Add-Type 噪声），
@@ -253,6 +278,28 @@ export function decryptDpapiBatch(blobs: string[]): Array<{ ok: boolean; value?:
 }
 
 /* ────────────────────── 统一入口 ────────────────────── */
+
+/** **异步版**批量 DPAPI 解密（启动预热专用）：与同步版逐字同语义，只是不阻塞事件循环。
+ *  调用方：`providers.ts` 的启动预热 —— 这样那 2~3 秒的 PowerShell 编译不会把整个后端冻住。 */
+export async function decryptDpapiBatchAsync(blobs: string[]): Promise<Array<{ ok: boolean; value?: string; reason?: string; transient?: boolean }>> {
+  const raw = blobs.map(b => String(b || ''))
+  if (!raw.length) return []
+  const payloadB64 = Buffer.from(
+    raw.map(s => s.slice(DPAPI_PREFIX.length)).join('\n'), 'utf8',
+  ).toString('base64')
+  /* 环境变量有长度上限：超了退回逐条（结果一样，只是慢）—— 与同步版同一口径 */
+  if (payloadB64.length > 200_000) {
+    return raw.map(b => { try { return { ok: true, value: decryptDpapi(b) } } catch (e: any) { return { ok: false, reason: String(e?.message || e), transient: false } } })
+  }
+  let out: string
+  try {
+    out = await runPsAsync(dpapiBatchScript(), payloadB64)
+  } catch (e: any) {
+    const reason = String(e?.message || e)
+    return raw.map(() => ({ ok: false, reason, transient: true }))
+  }
+  return parseBatchOutput(raw, out)
+}
 
 /**
  * 统一解密：明文直通；dpapi 走本机层；pwd 必须给口令。

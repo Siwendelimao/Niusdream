@@ -2,8 +2,8 @@
  * Skill 系统：自研扫描 SKILL.md（★1011 起，不再依赖上游），
  * 注册 use_skill 工具让模型按需读取技能全文指令（产生标准工具过程块）。
  *
- * ★1011 pi 1.1.0 升级：上游在 1.0 把 harness（含 skills）整个搬出 pi-agent-core，
- *  `loadSkills` / `Skill` 类型都没了，`@earendil-works/pi-agent-core/node`（NodeExecutionEnv 所在子路径）
+ * ★1011 底座 1.1.0 升级：上游在 1.0 把 harness（含 skills）整个搬出 Agent 运行时，
+ *  `loadSkills` / `Skill` 类型都没了，Node 环境子路径（NodeExecutionEnv 所在处）
  *  的 exports 也被收掉 ⇒ 原实现三行 import 全部失效、后端**启动即崩**（ESM 静态解析失败）。
  *  这里改为自研扫描（约 80 行），外部行为与上游 loadSkills 对齐：
  *   · 递归遍历目录；**某目录里有 SKILL.md 就收下它并停止深入该目录**（与上游 loadSkillFromDir 同款短路）；
@@ -94,6 +94,15 @@ function parseSkillFile(filePath: string): Skill | null {
 function scanSkills(dir: string): { skills: Skill[]; warnings: string[] } {
   const skills: Skill[] = []
   const warnings: string[] = []
+  /* ★1116：目录判定要**跟随符号链接 / 目录联接（junction）**。
+     `Dirent.isDirectory()` 对 reparse point 返回 **false** ⇒ 把外部 skill 目录链接进来时
+     会被整条跳过（实测：`mklink /J backend/skills/ego-browser → ~/.agents/skills/ego-browser`，
+     日志一直是 `loaded 8` 不变 9）。符号链接再 stat 一次跟随目标；stat 失败当不可读跳过。 */
+  const isDirEntry = (parent: string, e: fs.Dirent): boolean => {
+    if (e.isDirectory()) return true
+    if (!e.isSymbolicLink()) return false
+    try { return fs.statSync(path.join(parent, e.name)).isDirectory() } catch { return false }
+  }
   const walk = (d: string, depth: number, isRoot: boolean) => {
     let ents: fs.Dirent[] = []
     try { ents = fs.readdirSync(d, { withFileTypes: true }) } catch (e: any) {
@@ -102,7 +111,7 @@ function scanSkills(dir: string): { skills: Skill[]; warnings: string[] } {
     }
     ents.sort((a, b) => a.name.localeCompare(b.name))
     /* 上游同款短路：本目录有 SKILL.md 就只收它，不再往下递归 */
-    const own = ents.find(e => e.isFile() && e.name === SKILL_FILE)
+    const own = ents.find(e => e.name === SKILL_FILE && (e.isFile() || e.isSymbolicLink()))
     if (own) {
       const s = parseSkillFile(path.join(d, own.name))
       if (s) skills.push(s)
@@ -112,7 +121,7 @@ function scanSkills(dir: string): { skills: Skill[]; warnings: string[] } {
     for (const e of ents) {
       if (e.name.startsWith('.') || e.name === 'node_modules') continue
       const fp = path.join(d, e.name)
-      if (e.isDirectory()) {
+      if (isDirEntry(d, e)) {
         if (depth < MAX_SCAN_DEPTH) walk(fp, depth + 1, false)
         continue
       }

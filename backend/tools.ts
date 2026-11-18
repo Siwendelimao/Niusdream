@@ -1,5 +1,5 @@
 /**
- * NIS 内置工具注册表（阶段 3a）
+ * NiusDream 内置工具注册表（阶段 3a）
  *
  * 约定：
  *  - 工具 cwd 一律取「会话工作区」（createSession 时定的 workDir），
@@ -17,11 +17,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
-import { snapshotFile, snapshotTree, markAfterContent, listChanges, changeStatus, restoreChange, historyStats } from './fileHistory.ts'
+import type { AgentTool } from './agentCompat.ts'
+import { snapshotFile, snapshotTree, markAfterContent, listChanges, changeStatus, restoreChange, historyStats, diffStat } from './fileHistory.ts'
 import { createTask, listTasks, updateTask, removeTask, runTaskNow, describeSchedule } from './scheduledTasks.ts'
 import { acquireFileWrite, fileLockDenyMessage } from './fileLocks.ts'
 import { DATA_ROOT } from './paths.ts'
+/* ★1016 s1：只读类工具的「允许根」判定（工作区外可读/可列；写工具不改） */
+import { isReadablePath, readRootsDenyMessage } from './readRoots.ts'
 /* ★ 1001 修复（0930b 遗留）：git 族工具走 `gitExe()` 绝对路径解析，但本文件**漏了这行 import**
    ⇒ 一调 git_status / git_diff / git_log / git_commit 就 `ReferenceError: gitExe is not defined`。
    tsx 只剥类型不做检查，所以只有真跑起来才炸；`_tscheck.cjs --types` 的"运行时致命类"就是报的它。
@@ -38,6 +40,32 @@ import { procRegister, procEndByPid } from './processRegistry.ts'
 /** 文件写锁上下文（0911 反馈③）：成员 run 传入 { owner: runId, label: 成员名 }；
  *  主 agent 与其它场景不传 = 完全不参与锁（零影响）。 */
 interface FileLockCtx { owner: string; label: string }
+
+/* ★1015i【预览白名单】——修"AI 交付到工作区外的文件，用户点开报 path outside workdir"。
+ *
+ * 病根（本机实测数据，见 fs_edit 里那条 1015 注释）：**AI 写文件是允许越界的**（34 个会话
+ * 571 次 fs_edit 里 406 次落在工作区外，占 71%），而**用户点开预览却被严格限制在工作区内**
+ * （server.ts 的 resolveWorkdirPath）⇒ 只要 AI 把成果交付到工作区外（改 <dev仓库> 这类工程
+ * 目录是常态），用户就永远点不开 —— 小弹窗显示 `path outside workdir`，"进入预览"按钮因为
+ * 异常被 catch 吞掉而"点了没反应"。
+ *
+ * 修法：**只读**一侧放行"本会话 AI 自己写过的绝对路径"，其余不动：
+ *   · 登记点在 fs_write / fs_edit 的**落盘成功之后**（写失败不登记）；
+ *   · 只在**同会话**内生效（换会话即失效，防跨会话偷看）；
+ *   · 写 / 删 / 改名 / 静态文件代理**一律保持原严格校验**（本次不放宽任何写权限）。
+ * 内存：每会话一个 Set，随会话进程生命周期，不落盘（重启后需重新交付一次，可接受）。 */
+const sessionWrittenAbs = new Map<string, Set<string>>()
+function noteWrittenPath(sessionId: string | undefined, absPath: string): void {
+  if (!sessionId || !absPath) return
+  let s = sessionWrittenAbs.get(sessionId)
+  if (!s) { s = new Set(); sessionWrittenAbs.set(sessionId, s) }
+  s.add(path.normalize(absPath))
+}
+/** 本会话 AI 是否写过这个绝对路径（给"只读预览"放行用；详见 sessionWrittenAbs 注释） */
+export function wasWrittenBySession(sessionId: string | undefined, absPath: string): boolean {
+  if (!sessionId || !absPath) return false
+  return sessionWrittenAbs.get(sessionId)?.has(path.normalize(absPath)) === true
+}
 
 /** 快照来源标识默认值（主 agent）。0910 二批 F：成员实例改用 buildSessionTools(cwd, actor) 闭包捕获，
  *  不再用模块级可变全局——原实现是"一个白板写谁在干活"，同一成员被派出多个实例并发写文件时
@@ -74,6 +102,23 @@ function resolvePath(cwd: string, p: string): string {
    ⚠️ 提示前缀统一为"…（此处省略" —— server.ts 的发送层裁剪靠这个前缀识别"已经处理过的文本"，
    避免同一份输出被"工具层截断 + 发送层裁剪"连环改（那会让历史每轮都变、把前缀缓存打散）。 */
 import { omitNotice } from './spillStore.ts'
+
+/* ★1127：**命令是否可能修改工作区文件** —— 决定要不要在命令前拍树快照。
+   为什么需要：快照是同步全量扫描（walk + readFileSync + sha256 + gzip），
+   大工作区单次 1.5 秒，每条命令都做 = 主线程反复被堵 2~5 秒 → WS 心跳超时 →
+   前端判定后端死亡 → 用户看到"后端连续断连"（1127 实测）。
+   判据用**写特征黑名单**（宁可多拍几次，也别漏掉写操作）；纯读命令一律跳过。
+   ⚠️ 性能闸门，不是正确性闸门：漏判只影响"这次命令能不能撤销"，不影响命令执行与文件内容。 */
+const WRITE_OP_RE = /(?:^|[\s&|;(])(?:>|>>|tee|cp|copy|xcopy|robocopy|mv|move|rm|del|erase|rmdir|mkdir|md|touch|ln|chmod|chown|truncate|dd|sed\s+-i|tar\s+[^|]*-?x|unzip|git\s+(?:checkout|reset|apply|clean|stash|restore|rm|mv|merge|rebase|pull)|npm\s+(?:i|install|ci|update|un)\b|pnpm\s+(?:i|install|add|remove|update)|yarn\s+(?:add|install|remove)|pip\s+install|python\s+-m\s+pip|new-item|set-content|add-content|out-file|remove-item|move-item|copy-item|rename-item|start-bitstransfer|reg\s+add|schtasks\s+\/create)/i
+function commandMayWrite(command: string): boolean {
+  const cmd = String(command || '')
+  if (!cmd) return false
+  if (WRITE_OP_RE.test(cmd)) return true
+  /* 内联脚本里的写调用也算（node -e "fs.writeFileSync(...)" 这类） */
+  if (/\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|copyFileSync|renameSync|unlinkSync|rmSync|mkdirSync)\b/.test(cmd)) return true
+  if (/open\s*\([^)]*,\s*['"](?:w|a|wb|ab|x)['"]/.test(cmd)) return true
+  return false
+}
 function tail(s: string, n = 4000): string {
   if (s.length <= n) return s
   const headLen = Math.floor(n * 0.35)
@@ -229,6 +274,15 @@ export function buildGrepTool(cwd: string, opts: GrepOpts = {}): AgentTool<typeo
       const t0 = Date.now()
       const seenFiles = new Set<string>()
 
+      /* ★1032-TM（P107）：**每处理完一个文件让出一次事件循环**。
+         病（实测"成员界面卡住、盯很久才动" + 后端日志 [eventloop] 主线程被堵 2684ms）：
+         IO 是异步的（`await fsp.readFile`），但**读完后的分行 + 逐行正则**是纯 CPU ——
+         一个大文件 split 出几万行、每行 `re.test`，单个文件就吃掉几十~几百毫秒；目录里连着几个
+         大文件，主线程就连续堵上秒级 ⇒ 期间所有 WebSocket 帧（含成员窗口流式）全排队 ⇒ 界面"卡住"。
+         这里在每个文件处理完让出一次（setImmediate），每 2000 行再让一次；
+         代价是每文件多一个 tick（微秒级），换回主线程响应性。扫描语义与结果**完全不变**。 */
+      const yieldLoop = () => new Promise<void>((r) => setImmediate(r))
+
       const scanFile = async (abs: string) => {
         if (truncated || budgetHit) return
         if (skipExt(abs)) return
@@ -249,7 +303,10 @@ export function buildGrepTool(cwd: string, opts: GrepOpts = {}): AgentTool<typeo
         let fileCounted = false
         for (let i = 0; i < arr.length; i++) {
           re.lastIndex = 0
-          if (!re.test(arr[i])) continue
+          if (!re.test(arr[i])) {
+            if ((i & 2047) === 2047) await yieldLoop()   // 巨型文件也不要一口气占满主线程
+            continue
+          }
           if (matches >= maxResults) { truncated = true; return }
           if (!fileCounted) { fileCounted = true; fileHits++ }
           const rel = path.relative(cwd, abs).replace(/\\/g, '/')
@@ -262,6 +319,7 @@ export function buildGrepTool(cwd: string, opts: GrepOpts = {}): AgentTool<typeo
           }
           matches++
         }
+        await yieldLoop()   // 文件处理完让出一次：让 IO/帧广播插进来（见函数头注释）
       }
 
       /* ★ 0924 预算闸门：文件数 / 读入量 / 耗时三重上限，任一超限即停并明确告知（不再静默扫 14.7 万文件） */
@@ -336,7 +394,7 @@ const writeParams = Type.Object({
 /* ── 0923：同文件写操作串行队列 ──
  * 背景（harness 层踩坑实锤）：同一文件多个 fs_edit **并行**执行会互相覆盖 ——
  * 每个调用都是"读原文件→改自己那处→全量写回"，并行时后写的把先改的冲掉（本次会话实录）。
- * NIS agent 工具层从机制上拆雷：同 path 的 fs_write/fs_edit 自动排队，前一个落盘完成才执行下一个；
+ * NiusDream agent 工具层从机制上拆雷：同 path 的 fs_write/fs_edit 自动排队，前一个落盘完成才执行下一个；
  * 不同 path 照常并行；链上节点失败只跳过自己（catch 吞掉），不堵死后续操作。 */
 const _fileWriteChains = new Map<string, Promise<void>>()
 function enqueueFileWrite<T>(absPath: string, fn: () => Promise<T>): Promise<T> {
@@ -373,6 +431,7 @@ function buildWriteTool(cwd: string, actor: string = DEFAULT_ACTOR, sessionId?: 
       const changeId = snapshotFile({ workDir: cwd, absPath: full, tool: 'fs_write', actor: actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
       await fsp.mkdir(path.dirname(full), { recursive: true })
       await fsp.writeFile(full, params.content, 'utf8')
+      noteWrittenPath(sessionId, full)   // ★1015i：登记"本会话写过"，供只读预览放行（见 sessionWrittenAbs 注释）
       // 写入后回填 afterHash 与 +N-M 差异量（快照时"改动后"内容还不存在，语义是"写入前"）
       const diff = changeId ? markAfterContent(cwd, changeId, Buffer.from(params.content, 'utf8')) : null
       const bytes = Buffer.byteLength(params.content, 'utf8')
@@ -464,8 +523,43 @@ function buildEditTool(cwd: string, actor: string = DEFAULT_ACTOR, sessionId?: s
       }
       const changeId = snapshotFile({ workDir: cwd, absPath: full, tool: 'fs_edit', actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
       await fsp.writeFile(full, after, 'utf8')
+      noteWrittenPath(sessionId, full)   // ★1015i：登记"本会话写过"，供只读预览放行（见 sessionWrittenAbs 注释）
       const diff = changeId ? markAfterContent(cwd, changeId, Buffer.from(after, 'utf8')) : null
-      const diffInfo = diff ? { added: diff.diffAdded, removed: diff.diffRemoved } : {}
+      /* ★1015【#4「为什么有的有 diff 有的没有」根因修复】
+       * 现象（反馈）：对话流里精确替换过程块，有的行尾带「+N-M 行」，有的不带。
+       * 真因：这个 +N-M **完全依赖快照 changeId**，而 `snapshotFile()` 第一件事就是
+       *   `const rel = path.relative(workDir, absPath); if (rel.startsWith('..')) return null`
+       *   ⇒ **工作区外的文件一律不落快照** ⇒ changeId=null ⇒ diffInfo={} ⇒ 行尾什么都不显示。
+       *   实证（本机 34 个会话 / 571 次 fs_edit）：工作区内 165 次、工作区外 406 次；
+       *   成功的调用里恰有一大批落在工作区外（改 `<dev仓库>\**` 与 `<旧dev仓库>\**` 这类工程目录）。
+       * 修法：本工具手里本来就有 before/after，快照给不出数字时自己算。
+       *
+       * ★1015b【性能修正 —— 我第一版闸门设错，实测抓出来的，别改回去】
+       * 第一版写的是"整文件 diffStat，**3MB** 以上才跳过"。实测：diffStat 是 LCS O(n×m)，
+       *   server.ts（1.24MB / 2 万行）一次要 **2.1~2.7 秒** —— 而 1.24MB 根本没碰到 3MB 闸门
+       *   ⇒ "改一行"要卡两秒。不可接受：fs_edit 是高频工具，且这段是**同步**阻塞事件循环的。
+       *   闸门必须按**行数**（决定 O(n×m) 的其实是行数，不是字节数），实测标定：
+       *     1000 行 4ms / 3000 行 44ms / 5000 行 463ms / 2 万行 ~2000ms
+       *   ⇒ 取 **3000 行**：≈40ms 可忽略，且覆盖绝大多数被改文件（2 万行的巨型文件才降级不显示）。
+       * 中途试过"只 diff 命中行前后各 200 行的窗口"（想让巨型文件也快），**实测两个都不过关、已撤回**：
+       *   ① 正确性：窗口内重复行（空行/`}`）在 LCS 里大量"假配"，改 1 行却报 +8/-121 这种噪声；
+       *   ② 性能：400×400 的窗口对**中文长行**依然要 1.8s（O(n×m) 的代价跟行长相关，不是行数少就快）。
+       *   ⇒ 结论：整文件 diffStat 才是**逐行对齐的真值**，只能在"文件够小"时用。 */
+      const _DIFF_MAX_LINES = 3000
+      const diffInfo = diff
+        ? { added: diff.diffAdded, removed: diff.diffRemoved }
+        : (() => {
+            try {
+              const beforeBuf = Buffer.from(before, 'utf8')
+              const afterBuf = Buffer.from(after, 'utf8')
+              // 行数闸门（判据见上：O(n×m) 的成本由行数决定）
+              const nB = (before.match(/\n/g) || []).length + 1
+              const nA = (after.match(/\n/g) || []).length + 1
+              if (nB > _DIFF_MAX_LINES || nA > _DIFF_MAX_LINES) return {}
+              const s = diffStat(beforeBuf, afterBuf)
+              return { added: s.diffAdded, removed: s.diffRemoved }
+            } catch { return {} }
+          })()
       // 回报命中行号 + 替换后该处上下文（前后各 3 行，带行号）—— 让"改在点上了"可自证
       const anchorLine = lines[0] || 1
       const afterLines = after.split('\n')
@@ -493,6 +587,10 @@ const cmdParams = Type.Object({
   timeoutMs: Type.Optional(Type.Number({ description: '超时毫秒（默认 120000）' })),
   /* ★ 0925g（用户定）：显式指定本条命令的终端 —— 自动选择被"混合语法"误判时的逃生舱 */
   shell: Type.Optional(Type.String({ description: '显式指定终端：cmd / powershell / pwsh（默认=设置里的命令终端；命令里混有两种语法导致误判时才需要填）' })),
+  /* ★ s5（命令摘要 A 方案，需求）：可选的一句话业务意图 —— 前端折叠行**优先**显示它，
+     比规则推断的「执行命令 · 查找文件」有信息量；不填=零影响（前端回退现有规则摘要）。
+     只加在命令类工具上（run_command / bg_start），不给 105 个工具都加，控 schema token。 */
+  intent: Type.Optional(Type.String({ description: '一句话说明这步要干什么（中文 10~20 字，面向用户，别用工具名或「执行命令」这类泛词重复；例：「在 server.ts 里找压缩触发逻辑」）。可选：不确定就不填' })),
 })
 
 
@@ -671,7 +769,7 @@ export function pwshExePath(): string | null {
  *    ② tasklist/netstat 等 Windows 命令经bash 调用时输出为 GBK 乱码。
  *    故作为**可选**项而非默认，默认仍是 cmd/自动选择。 */
 let _bashPath: string | null | undefined
-/** ★1010-D（已定案 A，仿 pwsh「装了才能用」）：Git Bash 探测 = NIS 自装 MinGit（<envDir>/gitbash）
+/** ★1010-D（已定案 A，仿 pwsh「装了才能用」）：Git Bash 探测 = NiusDream 自装 MinGit（<envDir>/gitbash）
  *  优先 → 系统 Git for Windows。未装则终端下拉置灰、自动选择绝不调 bash。
  *  envDir 每次现读 settings.json（与 defaultReadCap 同款「改完设置立刻生效」模式）。 */
 function bashCandidates(): string[] {
@@ -909,85 +1007,131 @@ procRegister(cp.pid as number, { exe, cmdline: command, cwd, origin: { tool: met
 
 function buildCmdTool(cwd: string, actor: string = DEFAULT_ACTOR, sessionId?: string): AgentTool<typeof cmdParams, /* ★1005 放宽声明：onUpdate 还会传 cwd / running / shell（跑起来时的即时态），原声明只有收尾三件套。 */
   /* 同 grep：进度帧只有 cwd/running/shell，收尾才给 code/stdout/stderr ⇒ 后者必须可选。 */
-  { code?: number | null; stdout?: string; stderr?: string; cwd?: string; running?: boolean; shell?: string }> {
+  { code?: number | null; stdout?: string; stderr?: string; cwd?: string; running?: boolean; shell?: string; intent?: string }> {
   return {
     name: 'run_command',
     label: '执行命令',
     description: '在会话工作区中执行 shell 命令并返回输出。适合安装依赖、运行测试、跑脚本、构建等。' +
       '参数 shell 可显式指定终端（cmd/powershell/pwsh）——命令里混有两种语法导致自动选择误判时用它兜底。' +
       'node -e 内联脚本会自动落盘成临时 .cjs 执行（引号/中文不再被转义搞崩），复杂脚本仍建议直接写文件跑。' +
-      'Windows 注意：多行命令用 \\n 分隔；查文件内容用 fs_read（找内容可用 run_command 跑 node/rg，别用 findstr 搜中文）。' + shellHintForModel(),
+      'Windows 注意：多行命令用 \\n 分隔；查文件内容用 fs_read（找内容可用 run_command 跑 node/rg，别用 findstr 搜中文）。' +
+      '★ 命令摘要：尽量同时填 intent —— 一句话说清这步的业务目的（中文 10~20 字，面向用户，如「在 server.ts 里找压缩触发逻辑」），' +
+      '不要写「执行命令」「查找文件」这类泛词；不确定就不填（界面会退回规则摘要）。' + shellHintForModel(),
     parameters: cmdParams,
     async execute(_callId, params, _signal, onUpdate) {
       const work = params.cwd ? resolvePath(cwd, params.cwd) : cwd
       const timeoutMs = params.timeoutMs ?? 120000
+      /* s5：模型给的摘要（可缺）——只做归一化，不参与任何执行逻辑 */
+      const intent = String((params as any).intent || '').trim() || undefined
       // 命令执行前拍工作区树快照（兜底覆盖 shell 重定向/脚本写入的文件变更）
-      snapshotTree({ workDir: cwd, actor: actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
+      if (commandMayWrite(params.command)) {
+              // ★1127：snapshotTree 已异步分片化（IO 走 fs.promises，每 32 个文件让出一次事件循环），
+              // 这里必须 await —— 否则命令会先跑、快照拍到的是"执行后"状态。
+              await snapshotTree({ workDir: cwd, actor: actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
+            }
       /* 0920：先按语法特征预判一次（与 runCommand 内部同一函数，结果一致），
          这样"执行中"那一帧就能显示终端标识，不用等命令跑完 */
       const shellPreview = process.platform === 'win32'
         ? resolveShellForCommand((params.shell as any) || currentShellKind(), params.command.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
         : 'sh'
-      onUpdate?.({ content: [], details: { cwd: work, running: true, shell: shellPreview } })
+      onUpdate?.({ content: [], details: { cwd: work, running: true, shell: shellPreview, ...(intent ? { intent } : {}) } })
       const { stdout, stderr, code, shell } = await runCommand(work, params.command, timeoutMs, { tool: 'run_command', conversationId: sessionId }, (params.shell as any) || undefined, _signal)
       const outText = [stdout.trim() ? `stdout:\n${tail(stdout)}` : '', stderr.trim() ? `stderr:\n${tail(stderr)}` : ''].filter(Boolean).join('\n')
       return {
         content: [{ type: 'text', text: outText || `(无输出) 退出码 ${code}` }],
-        details: { code, stdout: tail(stdout), stderr: tail(stderr), shell },
+        details: { code, stdout: tail(stdout), stderr: tail(stderr), shell, ...(intent ? { intent } : {}) },
       }
     },
   }
 }
 
-/* ── fs_delete：删除文件/目录（专用删除工具，替代 run_command del/rm 的引号转义陷阱） ── */
-const deleteParams = Type.Object({
-  path: Type.String({ description: '要删除的文件或目录路径（相对会话工作区或绝对路径）' }),
-  recursive: Type.Optional(Type.Boolean({ description: 'true=删除非空目录（递归）；默认 false 仅删文件/空目录' })),
+
+/* ══════ ★ g3：check_run —— 验收专用命令（只看退出码，不看输出）══════════════════════
+ * 为什么要有（总方案 §2.5）：要真删「目标模式」，必须先把 `goalVerifier.runGate()` 那套
+ * 「真跑命令、拿 exitCode 当硬判据」迁成通用能力 —— 目标模式里唯一不可替代的就是它。
+ * 与 run_command 的分工：run_command 是"干活"（模型要读输出、据输出继续改）；check_run 是
+ * "验收"（模型/前端/测试流程只关心 ok:true|false）。
+ *
+ * ★ 安全边界（本工具**不是**旁路，与 run_command 同级）：
+ *   · 执行器同一个：runCommand() —— 同一套 shell 解析（自动选终端 / 多行落 .cmd）、同一套
+ *     超时树杀与中止树杀、同一套进程登记、同一套 cwd 语义（默认会话工作区）。
+ *     没有第二套实现 = 没有第二套漏洞面。
+ *   · 审批链同一个：server.ts 的 assessRisk 里有与 run_command **逐条对齐**的 check_run 分支
+ *     （DANGEROUS_CMD / MUTATING_CMD / 工作区外 三条判定 + 同样的 risk 分级 + 同样用命令串做
+ *     会话级授权指纹）；approvalGate 里那条「无差别进程杀伤命令」硬拦截（full_access 也不放行）
+ *     也已按 check_run 补齐（否则换名即绕过 0902 那次 taskkill /IM node.exe 事故的护栏）。
+ *   · 这里**故意不做白名单 / 只读闸门**：验收命令天然会写盘（npm test、tsc 出 tsbuildinfo、
+ *     jest 写 coverage），任何"看起来安全"的白名单都会误杀真实验收；更糟的是它会造出假象——
+ *     模型以为"工具自己会拦"，于是把危险命令塞进来。真正可靠的判据只有「命令内容 + 审批链」，
+ *     那属于 server.ts；工具层再判一次 = 两套判据必然漂移，漂移的那一边一定先失效。
+ *   · 因此 `readOnly` 只是**意图声明**（默认 true），写进 details 供前端/验收流程展示，
+ *     ⚠️ 它不参与任何放行判定 —— 传 false 也照旧走审批，传 true 也不会免审。
+ */
+
+export const CHECK_RUN_DEFAULT_TIMEOUT_MS = 120000
+export const CHECK_RUN_MAX_TIMEOUT_MS = 600000
+/** stdout+stderr 合计超过它就只留**末尾**（验收看的就是最后那批报错；32KB ≈ 8000 汉字） */
+export const CHECK_RUN_MAX_OUTPUT_CHARS = 32 * 1024
+/** 正文回给模型的尾部行数上限（再长的让它 fs_read 落盘正文，别把上下文撑爆） */
+const CHECK_RUN_TAIL_LINES = 60
+
+const checkRunParams = Type.Object({
+  cmd: Type.String({ description: '要执行并验收的命令（如 "npm test" / "node check-b1-syntax.cjs"）' }),
+  timeoutMs: Type.Optional(Type.Number({ description: '超时毫秒（默认 120000，上限 600000）；超时按 FAIL 处理，exitCode 记 null' })),
+  cwd: Type.Optional(Type.String({ description: '可选：覆盖工作目录（默认＝会话工作区）' })),
+  readOnly: Type.Optional(Type.Boolean({ description: '（默认 true）仅声明"这条是只读检查"给界面看；⚠️ 不参与审批判定，也不影响执行' })),
+  intent: Type.Optional(Type.String({ description: '一句话说明在验什么（中文 10~20 字，如「验 check-b1-syntax 语法」）' })),
 })
 
-
-function buildDeleteTool(cwd: string, actor: string = DEFAULT_ACTOR, sessionId?: string, lockCtx?: FileLockCtx): AgentTool<typeof deleteParams, { path: string; recursive: boolean }> {
+/** 验收命令：真跑、拿 exitCode、给 ok 硬判据（details.ok = exitCode === 0） */
+export function buildCheckRunTool(cwd: string, sessionId?: string): AgentTool<any> {
   return {
-    name: 'fs_delete',
-    label: '删除文件',
-    description: '删除文件或目录。recursive=true 时递归删除目录及其内容（危险操作）。',
-    parameters: deleteParams,
-    async execute(_callId, params, _signal, onUpdate) {
-      const full = resolvePath(cwd, params.path)
-      // 0911 反馈③：并行成员互斥——删除同样参与防互覆（该文件被其他成员 run 持有时拒绝）
-      if (lockCtx) {
-        const deny = acquireFileWrite(full, lockCtx.owner, lockCtx.label)
-        if (deny) throw new Error(fileLockDenyMessage(full, deny))
-      }
-      const st = await fsp.stat(full).catch(() => null)
-      if (!st) {
-        throw new Error(`路径不存在：${full}`)
-      }
-      if (st.isDirectory()) {
-        if (!params.recursive) {
-          throw new Error(`「${full}」是目录，删除非空目录需 recursive=true`)
-        }
-        // 目录删除：目录内每个文件各自留精确快照（恢复=逐文件写回）
-        const walkSnap = async (dir: string) => {
-          for (const e of await fsp.readdir(dir, { withFileTypes: true })) {
-            const p = path.join(dir, e.name)
-            if (e.isDirectory()) { await walkSnap(p); continue }
-            snapshotFile({ workDir: cwd, absPath: p, tool: 'fs_delete', actor: actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
-          }
-        }
-        if (params.recursive) await walkSnap(full).catch(() => {})
-      } else {
-        snapshotFile({ workDir: cwd, absPath: full, tool: 'fs_delete', actor: actor, sessionId, toolCallId: _callId, turn: getSnapshotTurn(sessionId) ?? undefined })
-      }
-      if (st.isDirectory()) {
-        await fsp.rm(full, { recursive: true, force: true })
-      } else {
-        await fsp.rm(full, { force: true })
-      }
-      onUpdate?.({ content: [], details: { path: full, recursive: !!params.recursive } })
+    name: 'check_run',
+    label: '验收命令',
+    description: '跑一条命令并返回**退出码** —— 用于验收：exitCode===0 算通过。'
+      + '与 run_command 的区别：run_command 是"干活"（看输出）；check_run 是"验收"（看退出码）。'
+      + '用户说"跑一下测试验一下"、或计划里写了验收命令时用它。'
+      + '返回末尾若干行输出 + details.ok（可直接当硬判据）。',
+    parameters: checkRunParams,
+    async execute(_callId: string, params: any, signal?: AbortSignal, onUpdate?: any) {
+      const command = String(params?.cmd || '').trim()
+      if (!command) throw new Error('cmd 不能为空')
+      const work = params?.cwd ? resolvePath(cwd, String(params.cwd)) : cwd
+      const asked = Number(params?.timeoutMs)
+      const timeoutMs = Math.min(
+        Math.max(1000, Number.isFinite(asked) && asked > 0 ? asked : CHECK_RUN_DEFAULT_TIMEOUT_MS),
+        CHECK_RUN_MAX_TIMEOUT_MS,
+      )
+      const readOnly = params?.readOnly !== false
+      const intent = String(params?.intent || '').trim() || undefined
+      /* 跑起来那一帧：与 run_command 同款（前端据此显示"进行中"），不带 shell —— 终端由执行器内部判 */
+      onUpdate?.({ content: [], details: { running: true, cmd: command, cwd: work, ...(intent ? { intent } : {}) } })
+      const t0 = Date.now()
+      /* 与 run_command **完全同一个执行器**（shell 解析 / 超时树杀 / 中止树杀 / 进程登记都在里面） */
+      const { stdout, stderr, code } = await runCommand(
+        work, command, timeoutMs, { tool: 'check_run', conversationId: sessionId }, undefined, signal as any,
+      )
+      const durationMs = Date.now() - t0
+      const ok = code === 0
+      /* 输出截断：stdout+stderr 合计 > 32KB 只留**末尾**。
+         ⚠️ 不复用 tail()：tail 是"头 35% + 尾 65%"（给模型看上下文用的），验收只关心尾部报错。 */
+      const merged = [stdout, stderr].filter(s => s && s.trim()).join('\n')
+      const truncated = merged.length > CHECK_RUN_MAX_OUTPUT_CHARS
+      const kept = truncated ? merged.slice(-CHECK_RUN_MAX_OUTPUT_CHARS) : merged
+      const lines = kept.replace(/\s+$/, '').split('\n').filter(l => l.trim())
+      const tailLines = lines.slice(-CHECK_RUN_TAIL_LINES)
+      const text = [
+        `退出码：${code === null ? '（无：超时/被杀）' : code}`,
+        `命令：${command}`,
+        `耗时：${(durationMs / 1000).toFixed(2)}s${readOnly ? '' : '（已声明为写操作）'}`,
+        `输出（尾部 ${tailLines.length} 行${truncated ? `；原文 ${merged.length} 字，已截至末尾 ${CHECK_RUN_MAX_OUTPUT_CHARS} 字` : ''}）：`,
+        tailLines.length ? tailLines.join('\n') : '（无输出）',
+        ok ? '结论：PASS（exitCode=0）' : `结论：FAIL（exitCode=${code === null ? 'null' : code}）`,
+      ].join('\n')
       return {
-        content: [{ type: 'text', text: `已删除 → ${full}` }],
-        details: { path: full, recursive: !!params.recursive },
+        content: [{ type: 'text', text }],
+        /* details.ok 是**硬判据**：前端/验收流程/后续 check_run 汇总直接读它，不用再解析文本 */
+        details: { ok, exitCode: code, cmd: command, durationMs, readOnly, truncated, ...(intent ? { intent } : {}) },
       }
     },
   }
@@ -1008,7 +1152,7 @@ const noteParams = Type.Object({
 })
 
 function upsertProjectNote(raw: string, section: string, text: string): string {
-  const head = '# 项目档案（NIS 自动维护）\n\n> 同一工作区的所有对话共享这份档案；新窗口会自动在系统提示里看到它的「档案卡」（体量+各节行范围+最近任务）——要细节用 project_note(action="read", section="…") 按节取，**别整份读**。\n'
+  const head = '# 项目档案（NiusDream 自动维护）\n\n> 同一工作区的所有对话共享这份档案；新窗口会自动在系统提示里看到它的「档案卡」（体量+各节行范围+最近任务）——要细节用 project_note(action="read", section="…") 按节取，**别整份读**。\n'
   const sections: Record<string, string[]> = {}
   for (const s of NOTE_SECTIONS) sections[s] = []
   if (raw) {
@@ -1097,13 +1241,15 @@ export function buildProjectNoteTool(cwd: string): AgentTool<typeof noteParams, 
  *  挂后台 → 立刻拿到 task_id 继续干别的；结束时 server 会 steer 一条通知回来（见 backgroundTasks.ts）。
  */
 const bgStartParams = Type.Object({
-  title: Type.String({ description: '任务名（给人看的短标题，如「下载 NIS 模型」「npm install」）' }),
+  title: Type.String({ description: '任务名（给人看的短标题，如「下载 NiusDream 模型」「npm install」）' }),
   command: Type.Optional(Type.String({ description: '要后台执行的 shell 命令（与 run_command 同一套 Shell 语义）；与 url 二选一' })),
   url: Type.Optional(Type.String({ description: '要后台下载的 http(s) 地址；配 dest 使用' })),
   dest: Type.Optional(Type.String({ description: '下载保存路径（绝对路径或相对会话工作区）' })),
   headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: '(仅 url 模式) 自定义请求头（鉴权直链用，带了才有进度条/可暂停）' })),
   est_sec: Type.Optional(Type.Number({ description: '预计秒数（面板画「预计」条+约剩多久）——只在对时长有把握时给；守护型任务（服务/监听）不要给' })),
   cwd: Type.Optional(Type.String({ description: '命令的工作目录（缺省=会话工作区）' })),
+  /* s5：同 run_command 的 intent —— 挂后台时也让人一眼看出这一步在干什么 */
+  intent: Type.Optional(Type.String({ description: '一句话说明这步要干什么（中文 10~20 字，面向用户，别用工具名或「执行命令」这类泛词重复；例：「后台重装依赖修 npm 缓存」）。可选：不确定就不填' })),
 })
 
 const bgWatchParams = Type.Object({
@@ -1147,7 +1293,7 @@ export function buildBgTools(cwd: string, sessionId?: string): AgentTool<any>[] 
         '⚠️ 只有"值得挂后台"的才用它（几秒就完的直接 run_command）；挂完可以继续做别的事，任务结束时会收到通知。' +
         '**任务失败时**：能自愈（网络抖动/换源/临时占用）就自己重试一次并说明；需要用户拍板或已失败两次 → 停下来用 ask_user 问用户，别默默重试到天荒地老。',
       parameters: bgStartParams,
-      async execute(_callId, params) {
+      async execute(callId, params) {
         const title = String((params as any).title || '').trim() || '后台任务'
         const cmd = String((params as any).command || '').trim()
         const url = String((params as any).url || '').trim()
@@ -1159,7 +1305,7 @@ export function buildBgTools(cwd: string, sessionId?: string): AgentTool<any>[] 
         const estSec = Number((params as any).est_sec) > 0 ? Math.round(Number((params as any).est_sec)) : undefined
         if (url) {
           const abs = resolvePath(cwd, dest)
-          const r = bgStartDownload(url, abs, { title, conversationId: convId, cwd: work, headers: hdr, estSec })
+          const r = bgStartDownload(url, abs, { title, conversationId: convId, cwd: work, headers: hdr, estSec, spawnedByCall: String(callId || '') })
           if (!r.ok) return { content: [{ type: 'text', text: `【挂后台失败】${r.error}` }], details: { ok: false } }
           return {
             content: [{ type: 'text', text: `已在后台开始下载：${title}\n· task_id = ${r.task!.task_id}\n· 保存到 ${abs}${hdr ? '\n· 已带自定义请求头' : ''}\n（用户可暂停/继续，面板有进度条）继续做别的事即可；跑完会自动通知你（也可以随时用 bg_list / bg_read 查）。\n· 想中途看一眼：约 ${bgSuggestWatchSec(r.task!.task_id)} 秒后回访（用 bg_watch）；不约也行，跑完会通知你。` }],
@@ -1167,7 +1313,7 @@ export function buildBgTools(cwd: string, sessionId?: string): AgentTool<any>[] 
           }
         }
         if (!cmd) return { content: [{ type: 'text', text: '【错误】command 与 url 至少要给一个。' }], details: { ok: false } }
-        const r = bgStartCommand(cmd, { title, conversationId: convId, cwd: work, estSec })
+        const r = bgStartCommand(cmd, { title, conversationId: convId, cwd: work, estSec, spawnedByCall: String(callId || '') })
         if (!r.ok) return { content: [{ type: 'text', text: `【挂后台失败】${r.error}` }], details: { ok: false } }
         return {
           content: [{ type: 'text', text: `已挂到后台执行：${title}\n· task_id = ${r.task!.task_id}\n· 工作目录 ${work}\n· 命令 ${cmd.length > 120 ? cmd.slice(0, 120) + '…' : cmd}\n继续做别的事即可；跑完会自动通知你（也可以随时用 bg_list / bg_read 查）。\n· 知道总步数/总量的话，中途可用 bg_note 报进度（面板就会画读条）；想中途看一眼可约 ${bgSuggestWatchSec(r.task!.task_id)} 秒后回访。` }],
@@ -1273,6 +1419,7 @@ export function buildBgTools(cwd: string, sessionId?: string): AgentTool<any>[] 
     fullMemberDescriptions: false,
     description: '后台任务工具箱（六动作）：把耗时动作挂后台，立刻返回不阻塞对话。'
       + '· start：装依赖/下载大文件/几分钟以上的构建·测试·脚本才挂（几秒就完的直接 run_command）；command 或 url+dest 二选一——'
+      + '★ 尽量填 intent：一句话说清这步业务目的（中文 10~20 字，如「后台装依赖」「下载模型权重」），别写「执行命令」这种废话；不确定就不填。'
       + 'url 下载有进度条、用户可暂停继续；POST/多文件/CLI 的下载走 command 模式（只有计时没有百分比，要主动告知用户）。'
       + 'est_sec 只在对时长有把握时给；服务/监听等守护型任务不要给（没有结束时间，给了就是假倒计时）。'
       + '· list：列任务（状态/进度/结果摘要）。· read：读输出尾部（失败行以 [err] 开头）。· stop：停止（连子进程一起杀）。'
@@ -1290,8 +1437,16 @@ export function buildBgTools(cwd: string, sessionId?: string): AgentTool<any>[] 
   })]
 }
 
+/* ★1128【工具执行模式】实现搬到 toolExecMode.ts（纯逻辑、可单独测试）：
+   · 分级名单（哪些工具必须 sequential）
+   · 按会话的并行闸门（只读工具并行但有上限）
+   本文件 import 一次（自用）+ re-export（外部照旧从 tools.ts 拿）。 */
+import { applyExecutionModes } from './toolExecMode.ts'
+export { applyExecutionModes, createToolGate, SEQUENTIAL_TOOL_NAMES } from './toolExecMode.ts'
+
 export function buildSessionTools(cwd: string, actor: string = DEFAULT_ACTOR, sessionId?: string, lockCtx?: FileLockCtx, grepOpts?: GrepOpts): AgentTool<any>[] {
-  return [buildReadTool(cwd), buildGrepTool(cwd, grepOpts), buildWriteTool(cwd, actor, sessionId, lockCtx), buildEditTool(cwd, actor, sessionId, lockCtx), buildDeleteTool(cwd, actor, sessionId, lockCtx), buildCmdTool(cwd, actor, sessionId), ...buildBgTools(cwd, sessionId)]
+  const list: AgentTool<any>[] = [buildReadTool(cwd), buildGrepTool(cwd, grepOpts), buildWriteTool(cwd, actor, sessionId, lockCtx), buildEditTool(cwd, actor, sessionId, lockCtx), buildCmdTool(cwd, actor, sessionId), ...buildBgTools(cwd, sessionId)]
+  return applyExecutionModes(list)
 }
 
 /* ★ 0929 刀②：低频能力包按需加载器（喊一声才加载）—— 工具始终挂载（能力不减），
@@ -1333,9 +1488,9 @@ export function buildListDirTool(cwd: string): AgentTool<any> {
     name: 'list_dir',
     label: '列目录',
     description: '列出目录内容（文件/子目录 + 大小），毫秒级返回。找文件/看结构用它，别再 run_command dir。'
-      + 'path 不填=会话工作区根；要看更深层就带 depth（默认 1 层，最多 3）。',
+      + 'path 不填=会话工作区根；要看更深层就带 depth（默认 1 层，最多 3）。工作区外的「允许根」（文档/桌面/下载/NiusDream 工程目录等）也能列。',
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: '相对会话工作区的目录路径（不填=工作区根）' })),
+      path: Type.Optional(Type.String({ description: '目录路径（相对工作区或绝对路径；不填=工作区根；允许根内的工作区外目录也可）' })),
       depth: Type.Optional(Type.Number({ description: '递归层数（默认 1，最多 3；大目录别贪深）' })),
     }),
     async execute(_callId, params: any) {
@@ -1343,7 +1498,10 @@ export function buildListDirTool(cwd: string): AgentTool<any> {
       const depth = Math.min(3, Math.max(1, Number(params?.depth) || 1))
       const base = path.resolve(cwd)
       const abs = path.resolve(base, rel || '.')
-      if (!(abs === base || abs.startsWith(base + path.sep))) throw new Error(`路径超出会话工作区：${rel}`)
+      /* ★1016 s1：原来是硬限会话工作区（实测：工作区外的目录列不出来）。现在放开到「允许根」
+         （会话工作区 + settings.json 的 allowedReadRoots，默认含 文档/桌面/下载/NiusDream 工程根/数据根）；
+         越界时把可用根列出来，不再说含糊的"超出会话工作区"。写工具（fs_write/fs_edit）不在此列。 */
+      if (!isReadablePath(abs, base)) throw new Error(readRootsDenyMessage(rel || abs, base))
       if (!fs.existsSync(abs)) throw new Error(`目录不存在：${rel || '.'}`)
       const lines: string[] = []
       const walk = (dir: string, prefix: string, d: number) => {
@@ -1369,84 +1527,6 @@ export function buildListDirTool(cwd: string): AgentTool<any> {
       }
     },
   }
-}
-
-/** history：文件时光机（list/restore/stat）—— fileHistory.ts 能力已有，0929 开工具口 */
-export function buildHistoryTools(workDir: string, sessionId?: string): AgentTool<any>[] {
-  const subs: any[] = [
-    {
-      name: 'history_list', label: '改动历史',
-      description: '查看本会话对工作区文件的改动历史（哪一轮、哪个文件、加减多少行、当前是否仍生效）。改砸了想回滚时先看它拿 change_id。',
-      parameters: Type.Object({
-        path: Type.Optional(Type.String({ description: '只看某个文件（相对工作区路径）；不填=全部' })),
-        limit: Type.Optional(Type.Number({ description: '最多返回条数（默认 20）' })),
-      }),
-      async execute(_c: string, params: any) {
-        const all = listChanges(workDir)
-        const mine = all.filter(c => !sessionId || !c.sessionId || c.sessionId === sessionId)
-        const rel = String(params?.path || '').trim()
-        const rows = (rel ? mine.filter(c => c.relPath === rel) : mine).slice(-Math.min(50, Number(params?.limit) || 20)).reverse()
-        if (!rows.length) return { content: [{ type: 'text', text: '（本会话还没有文件改动历史）' }], details: { count: 0 } }
-        const lines = rows.map(c => {
-          const st = changeStatus(workDir, c, all)
-          const stTxt = st === 'active' ? '生效中' : st === 'undone' ? '已撤销' : '已被覆盖'
-          return `#${c.id} [${stTxt}] 轮${c.turnIndex ?? '?'} ${c.tool} ${c.relPath || c.kind} +${c.diffAdded ?? 0}/-${c.diffRemoved ?? 0}（${new Date(c.t).toLocaleString('zh-CN', { hour12: false })}）`
-        })
-        return {
-          content: [{ type: 'text', text: `改动历史（最近 ${rows.length} 条，撤销用 restore + change_id）：\n${lines.join('\n')}` }],
-          details: { count: rows.length },
-        }
-      },
-    },
-    {
-      name: 'history_restore', label: '撤销改动',
-      description: '把某个文件改动回滚到改动前（=时光机）。只认**本会话**的改动（跨会话不给撤，防串数据）；'
-        + '回滚前会做冲突检查：文件若又被改过会拒绝并提示。用户说"撤销/改回去/恢复刚才的"时用；dry_run=true 先看会动什么。',
-      parameters: Type.Object({
-        change_id: Type.String({ description: 'history_list 返回的 change_id' }),
-        dry_run: Type.Optional(Type.Boolean({ description: 'true=只预演不动文件' })),
-      }),
-      async execute(_c: string, params: any) {
-        const id = String(params?.change_id || '').trim()
-        const all = listChanges(workDir)
-        const change = all.find(c => c.id === id)
-        if (!change) throw new Error(`没有找到改动 ${id}（用 history_list 查）`)
-        if (sessionId && change.sessionId && change.sessionId !== sessionId) throw new Error(`改动 ${id} 属于别的会话——撤销只认本会话的改动（防串数据），请在对应会话里撤`)
-        const r = restoreChange(workDir, id, { dryRun: !!params?.dry_run })
-        if (!r.ok) throw new Error(r.error || '回滚失败')
-        return {
-          content: [{ type: 'text', text: params?.dry_run ? `预演通过：回滚 ${id}（${change.relPath}）没有冲突，可正式执行` : `已回滚 ${id}（${change.relPath}）到改动前` }],
-          details: { ok: true, id, dryRun: !!params?.dry_run },
-        }
-      },
-    },
-    {
-      name: 'history_stat', label: '历史统计',
-      description: '看文件历史的规模（条数/占用/配额），清理前摸底用。',
-      parameters: Type.Object({}),
-      async execute() {
-        const s = historyStats([workDir])
-        return { content: [{ type: 'text', text: `历史统计：${JSON.stringify(s)}` }], details: s as any }
-      },
-    },
-  ]
-  return [buildFamilyTool({
-    name: 'history',
-    label: '文件时光机',
-    group: '文件',
-    variant: 'others',
-    tab: 'system',
-    fullMemberDescriptions: false,
-    description: '文件时光机（三动作）：工作区文件的改动历史与回滚（快照由系统在每次写入时自动打，不用你存）。'
-      + '· list：查改动历史（拿 change_id；带 [生效中/已撤销/已被覆盖] 状态）。'
-      + '· restore：按 change_id 回滚到改动前（**只认本会话的改动**，跨会话不给撤；文件被后续改动覆盖会拒绝并提示；dry_run 先预演）。'
-      + '用户说"撤销/改回去/恢复刚才的文件"→ 先 list 找到那条再 restore。· stat：看历史规模/占用。',
-    members: [
-      { action: 'list', tool: subs[0], summary: '查改动历史（拿 change_id）' },
-      { action: 'restore', tool: subs[1], required: ['change_id'], summary: '回滚某个改动到改前（可 dry_run 预演）' },
-      { action: 'stat', tool: subs[2], summary: '历史规模/占用统计' },
-    ],
-  })]
 }
 
 /** schedule：定时任务（create/list/update/remove/run_now）—— scheduledTasks.ts 能力已有，0929 开工具口 */
@@ -1570,107 +1650,6 @@ function gitRun(cwd: string, args: string[]): Promise<string> {
       else resolve(String(stdout))
     })
   })
-}
-
-export function buildGitTools(cwd: string, origin?: { sessionId?: string; sessionTitle?: string }): AgentTool<any>[] {
-  const subs: any[] = [
-    {
-      name: 'git_status', label: 'git 状态',
-      description: '工作区状态（--short --branch）：改了/暂存了/未跟踪哪些文件。动手前先看一眼。',
-      parameters: Type.Object({}),
-      async execute() {
-        const out = await gitRun(cwd, ['status', '--short', '--branch'])
-        return { content: [{ type: 'text', text: out.slice(0, 4000) || '（工作区干净）' }], details: { ok: true } }
-      },
-    },
-    {
-      name: 'git_diff', label: 'git 改动对比',
-      description: '看改动 diff —— **默认自动裁剪**：先给逐文件 +N/-M 摘要（改了几个文件、大头是谁），大 diff 只抽样，绝不全文灌上下文。'
-        + '要看全文：full=true（确认值得才用）；只看某文件带 path；看暂存区带 staged=true。',
-      parameters: Type.Object({
-        path: Type.Optional(Type.String({ description: '只看这个文件（相对工作区）' })),
-        staged: Type.Optional(Type.Boolean({ description: 'true=看暂存区（git diff --staged）' })),
-        full: Type.Optional(Type.Boolean({ description: 'true=不裁剪要全文（大 diff 慎用，会撑爆上下文）' })),
-      }),
-      async execute(_c: string, params: any) {
-        const tail = [...(params?.staged ? ['--staged'] : []), ...(params?.path ? ['--', String(params.path)] : [])]
-        const numstat = await gitRun(cwd, ['diff', '--numstat', ...tail])
-        const files = numstat.trim().split('\n').filter(Boolean).map(l => {
-          const [a, d, ...rest] = l.split('\t')
-          return { added: a === '-' ? '?' : a, removed: d === '-' ? '?' : d, path: rest.join('\t') }
-        })
-        if (!files.length) return { content: [{ type: 'text', text: '（没有改动）' }], details: { files: 0 } }
-        const totalA = files.reduce((s, f) => s + (Number(f.added) || 0), 0)
-        const totalR = files.reduce((s, f) => s + (Number(f.removed) || 0), 0)
-        const big = [...files].sort((x, y) => (Number(y.added) + Number(y.removed)) - (Number(x.added) + Number(x.removed))).slice(0, 5)
-        const summary = `改了 ${files.length} 个文件 +${totalA}/-${totalR}，大头：${big.map(f => `${f.path} +${f.added}/-${f.removed}`).join('；')}`
-        const raw = await gitRun(cwd, ['diff', '-U2', ...tail])
-        if (params?.full || raw.length <= 4000) {
-          const over = raw.length > 20000
-          return {
-            content: [{ type: 'text', text: `${summary}\n\n${raw.slice(0, 20000)}${over ? '\n…（diff 过大，已截到 2 万字上限——可带 path= 分文件看）' : ''}` }],
-            details: { files: files.length, truncated: over, rawChars: raw.length },
-          }
-        }
-        // 裁剪：抽头几个文件的前 15 行片段
-        const sample = raw.split('\n').slice(0, 60).join('\n')
-        return {
-          content: [{ type: 'text', text: `${summary}\n\n（diff 共 ${raw.length} 字，已裁剪——抽样如下；要看某个文件全文：带 path= 或 full=true）\n${sample}\n…（裁剪）` }],
-          details: { files: files.length, truncated: true, rawChars: raw.length },
-        }
-      },
-    },
-    {
-      name: 'git_log', label: 'git 提交历史',
-      description: '提交历史（oneline，默认最近 20 条）。',
-      parameters: Type.Object({ limit: Type.Optional(Type.Number({ description: '条数（默认 20，最多 100）' })) }),
-      async execute(_c: string, params: any) {
-        const n = Math.min(100, Math.max(1, Number(params?.limit) || 20))
-        const out = await gitRun(cwd, ['log', '--oneline', '-n', String(n)])
-        return { content: [{ type: 'text', text: out.slice(0, 6000) || '（还没有提交）' }], details: { ok: true } }
-      },
-    },
-    {
-      name: 'git_commit', label: 'git 提交',
-      description: '提交改动（写操作，会弹确认）。纪律：commit 前先 status/diff 看清改了什么、别盲提；message 写清这提交干了什么；'
-        + '只提交指定文件就带 path（会先 add 该文件）；all=true 提交全部已跟踪文件的改动（不加新文件）。',
-      parameters: Type.Object({
-        message: Type.String({ description: '提交说明（这提交干了什么，一句话说清）' }),
-        path: Type.Optional(Type.String({ description: '只提交这个文件（先 add 再 commit）' })),
-        all: Type.Optional(Type.Boolean({ description: 'true=提交全部已跟踪文件的改动（不含新文件）' })),
-      }),
-      async execute(_c: string, params: any) {
-        const msg = String(params?.message || '').trim()
-        if (!msg) throw new Error('提交必须给 message')
-        if (params?.path) await gitRun(cwd, ['add', '--', String(params.path)])
-        // ★ 版本面板：把"来源对话"写进提交（换机器/清缓存都不丢）；读口径见 gitTimeline.ts
-        const args = ['commit', '-m', withNisTrailer(msg, { ...origin, source: 'ai' })]
-        if (params?.all) args.push('-a')
-        const out = await gitRun(cwd, args)
-        const stat = await gitRun(cwd, ['show', '--stat', '--oneline', '-1']).catch(() => '')
-        return { content: [{ type: 'text', text: `${out.trim().slice(0, 300)}\n${stat.trim().slice(0, 600)}` }], details: { ok: true } }
-      },
-    },
-  ]
-  return [buildFamilyTool({
-    name: 'git',
-    label: 'git',
-    group: '命令',
-    variant: 'bash',
-    tab: 'system',
-    risky: true,
-    fullMemberDescriptions: false,
-    description: 'git 工具箱（四动作）：版本管理。· status：看改了什么（动手前先看）。· diff：看改动对比——**默认自动裁剪成摘要**'
-      + '（逐文件 +N/-M + 大头排行，大 diff 只抽样；全文要 full=true 或带 path）。· log：提交历史。· commit：提交（弹确认；'
-      + '先 status/diff 看清再提；带 path=只提某文件；all=true 提全部已跟踪改动，不含新文件）。'
-      + '⚠️ 不做分支切换/回滚/强推（那是用户的事）；大 diff 别要全文——摘要够定位，明细按文件点名看。',
-    members: [
-      { action: 'status', tool: subs[0], summary: '工作区状态（改了/暂存/未跟踪）' },
-      { action: 'diff', tool: subs[1], summary: '改动对比（默认裁剪成摘要）' },
-      { action: 'log', tool: subs[2], summary: '提交历史（oneline）' },
-      { action: 'commit', tool: subs[3], required: ['message'], summary: '提交（弹确认；先看再提）' },
-    ],
-  })]
 }
 
 /* ══════ ★ 0929 批次C：repo 族（仓库地图 + 符号/概念级代码搜索）══════ */

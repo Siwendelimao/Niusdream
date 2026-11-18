@@ -1,7 +1,7 @@
 /**
  * 定时任务（0912 十二批）—— 到点让 AI 在指定会话里跑一段 prompt。
  *
- * 设计取向（对齐 NIS「会话即一切」的模型）：
+ * 设计取向（对齐 NiusDream「会话即一切」的模型）：
  *   · 任务 = 名称 + 一段 prompt + 调度规则 + 目标会话
  *   · 执行走 `runPromptCore`（与手打消息同一条路径），结果**落在会话里** —— 打开对话就能看到
  *   · 不用 rrule 字符串，改用**结构化字段**（kind/interval/time/weekdays/dayOfMonth）：
@@ -65,7 +65,7 @@ export interface ScheduledTask {
   /**
    * 目标会话：
    *   'own'（默认）—— **任务专属会话**：首次执行时自动创建（标题带 ⏰），跨次复用，
-   *                  上下文连续、会话列表不堆积（用户拍板：「每个任务就是一条专属会话」）
+   *                  上下文连续、会话列表不堆积（需求：「每个任务就是一条专属会话」）
    *   'new'        —— 每次执行新建一个会话
    *   '<sessionId>'—— 固定落进某个已有会话
    */
@@ -75,7 +75,7 @@ export interface ScheduledTask {
   /**
    * 每个通知目标各自的专属会话（0912 十七批）—— key = `${channel}:${botId}:${peerId}`。
    *
-   * 为什么必须按目标拆开（用户实测 bug）：一条任务可以同时推「微信 + 群A + 群B」，
+   * 为什么必须按目标拆开（实测 bug）：一条任务可以同时推「微信 + 群A + 群B」，
    * 若它们共用一条会话，**历史会互相污染** —— 用户在微信里回一句「ok」，
    * AI 却接上了 QQ 群里别人的话题（因为那条会话里躺着群聊记录）。
    * 拆开之后：哪个通道的通知就落在哪个通道的会话里，互不可见。
@@ -85,8 +85,10 @@ export interface ScheduledTask {
   execSessionId?: string
   /** 执行完成后通过哪些通道推送结果（可多选；空/未设 = 不推送） */
   notifyTargets?: TaskNotifyTarget[]
+  /** ★1013b：值守任务标记 —— 与普通定时任务相互独立（值守弹窗只列它、定时任务列表不列它） */
+  watch?: boolean
   /**
-   * 任务用的模型（0912 用户拍板）。
+   * 任务用的模型（0912 需求）。
    *   'global'（默认）—— 用「设置 → 人格 → 全局模型」；全局模型未选 → 执行时**明确报错**，不静默兜底。
    *   'custom'        —— 用 modelId/modelProviderId 指定的自选模型。
    *  未设（老数据）= 'global'。
@@ -177,50 +179,38 @@ function computeNextRunAt(s: TaskSchedule, from: number = Date.now(), createdAt 
     }
     case 'daily': {
       const [h, m] = parseTime(s.time)
+      const dayIndex = (ms: number) => { const d = new Date(ms); return Math.floor(Date.UTC(d.getFullYear(),d.getMonth(),d.getDate()) / 86400000) }
       const d = new Date(from)
-      d.setHours(h, m, 0, 0)
-      if (d.getTime() <= from) d.setDate(d.getDate() + iv)
+      d.setHours(h,m,0,0)
+      if (d.getTime() <= from) d.setDate(d.getDate()+1)
+      const offset = ((dayIndex(d.getTime()) - dayIndex(createdAt || from)) % iv + iv) % iv
+      if (offset) d.setDate(d.getDate()+iv-offset)
       return d.getTime()
     }
     case 'weekly': {
-      const wd = (Array.isArray(s.weekdays) && s.weekdays.length) ? s.weekdays : [1]
-      const [h, m] = parseTime(s.time)
-      const step = iv * 7
-      /* ★1003 批次4 4.36/4.37 双修：
-       * ① 原 i 从 1（明天）起扫 —— 今天正是配置星期且时刻未到也轮空，直接推到下周（最多七天）；
-       *    改 i=0 起，靠 `> from` 守卫自然排除已过的时刻。
-       * ② "每 N 周"原按 (d-from)/7d 算周序 —— 14 天窗口内只可能是 0/1，`0 % N === 0` 恒真
-       *    ⇒ N>1 形同虚设（第一个匹配日必中）；改按**稳定纪元周序**取模（锚点不随 from 漂移），
-       *    以任务创建周为基准，创建当周即"第 0 周"，符合直觉。 */
-      /* ★1003 批次4 4.37 + 审计复核 #1（回归补修）：锚点取**任务创建周** —— 原写 `(s as any).createdAt`
-       * 是错的：createdAt 在 ScheduledTask 上、不在 TaskSchedule 上，undefined||0 ⇒ 锚点恒 0、
-       * "每 N 周"照旧不按创建周算（修复目标落空），`(s as any)` 还把类型错误盖住了。现由调用方
-       * 以 createdAt 显式传入（类型可见，再错编译器会叫）。 */
-      const epochWeek = (ms: number) => Math.floor(ms / (7 * 86400_000))
-      const anchorWeek = epochWeek(Number(createdAt) || 0)
-      for (let i = 0; i <= 14; i += 1) {
-        const d = new Date(from)
-        d.setDate(d.getDate() + i)
-        d.setHours(h, m, 0, 0)
-        if (d.getTime() > from && wd.includes(d.getDay())) {
-          if (iv === 1) return d.getTime()
-          if ((epochWeek(d.getTime()) - anchorWeek) % iv === 0) return d.getTime()
-        }
+      const wd = (Array.isArray(s.weekdays) && s.weekdays.length) ? s.weekdays.filter(x => Number.isInteger(x) && x >= 0 && x <= 6) : [1]
+      if (!wd.length) return 0
+      const [h,m] = parseTime(s.time)
+      // Monday-based LOCAL calendar weeks, independent of timezone/DST offsets.
+      const week = (ms: number) => {
+        const d = new Date(ms)
+        return Math.floor((Date.UTC(d.getFullYear(),d.getMonth(),d.getDate()) / 86400000 - (d.getDay()+6)%7) / 7)
       }
-      // 兜底：至少给出 7 天后的同一时刻（防止规则异常导致任务永不触发）
-      return from + step * 86400_000
+      const d = new Date(from)
+      d.setHours(h,m,0,0)
+      for (let i=0;i<=iv*7+7;i++) {
+        if (d.getTime()>from && wd.includes(d.getDay()) && ((week(d.getTime())-week(createdAt || from))%iv+iv)%iv===0) return d.getTime()
+        d.setDate(d.getDate()+1)
+      }
+      return 0
     }
     case 'monthly': {
-      const dom = Math.min(28, Math.max(1, Math.floor(s.dayOfMonth || 1)))
-      const [h, m] = parseTime(s.time)
-      const d = new Date(from)
-      d.setDate(dom)
-      d.setHours(h, m, 0, 0)
-      if (d.getTime() <= from) {
-        d.setMonth(d.getMonth() + iv)
-        d.setDate(dom)
-        d.setHours(h, m, 0, 0)
-      }
+      const dom=Math.min(28,Math.max(1,Math.floor(s.dayOfMonth||1))), [h,m]=parseTime(s.time)
+      const d=new Date(from), anchor=new Date(createdAt || from)
+      d.setDate(dom); d.setHours(h,m,0,0)
+      if(d.getTime()<=from)d.setMonth(d.getMonth()+1)
+      const offset=((d.getFullYear()*12+d.getMonth()-(anchor.getFullYear()*12+anchor.getMonth()))%iv+iv)%iv
+      if(offset)d.setMonth(d.getMonth()+iv-offset)
       return d.getTime()
     }
   }
@@ -307,7 +297,7 @@ export function normalizeNotifyTargets(input: any): TaskNotifyTarget[] {
 }
 
 export function createTask(input: {
-  name?: string; prompt?: string; targetSessionId?: string; schedule?: any; enabled?: boolean; notifyTargets?: any
+  name?: string; prompt?: string; targetSessionId?: string; schedule?: any; enabled?: boolean; notifyTargets?: any; watch?: any
   modelMode?: 'global' | 'custom'; modelId?: string; modelProviderId?: string; modelEffort?: string
 }): ScheduledTask {
   const data = load()
@@ -320,6 +310,7 @@ export function createTask(input: {
     // 默认「任务专属会话」—— 未指定时不再每次新建（0912 十三批）
     targetSessionId: String(input.targetSessionId || '').trim() || 'own',
     notifyTargets: normalizeNotifyTargets(input.notifyTargets),
+    watch: input.watch === true ? true : undefined,
     modelMode: input.modelMode === 'custom' ? 'custom' : 'global',
     modelId: input.modelMode === 'custom' ? String(input.modelId || '').trim() || undefined : undefined,
     modelProviderId: input.modelMode === 'custom' ? String(input.modelProviderId || '').trim() || undefined : undefined,
@@ -337,7 +328,7 @@ export function createTask(input: {
 }
 
 export function updateTask(id: string, patch: {
-  name?: string; prompt?: string; targetSessionId?: string; schedule?: any; enabled?: boolean; notifyTargets?: any
+  name?: string; prompt?: string; targetSessionId?: string; schedule?: any; enabled?: boolean; notifyTargets?: any; watch?: any
   modelMode?: 'global' | 'custom'; modelId?: string; modelProviderId?: string; modelEffort?: string
 }): ScheduledTask | null {
   const data = load()
@@ -347,6 +338,7 @@ export function updateTask(id: string, patch: {
   if (typeof patch.prompt === 'string') t.prompt = patch.prompt.trim()
   if (typeof patch.targetSessionId === 'string') t.targetSessionId = patch.targetSessionId.trim() || 'own'
   if (Array.isArray(patch.notifyTargets)) t.notifyTargets = normalizeNotifyTargets(patch.notifyTargets)
+  if (typeof patch.watch === 'boolean') t.watch = patch.watch || undefined
   if (patch.modelMode === 'global' || patch.modelMode === 'custom') {
     t.modelMode = patch.modelMode
     if (patch.modelMode === 'global') { t.modelId = undefined; t.modelProviderId = undefined; t.modelEffort = undefined }
@@ -486,7 +478,7 @@ export async function runTaskNow(id: string): Promise<{ ok: boolean; error?: str
       const atMs = Date.parse(String(t.schedule.at || ''))
       t.nextRunAt = t.enabled && Number.isFinite(atMs) && atMs > Date.now() + 1000 ? atMs : 0
     } else if (t.enabled) {
-      t.nextRunAt = computeNextRunAt(t.schedule, Date.now() + 1000, t.createdAt)
+      if (!(t.nextRunAt > Date.now())) t.nextRunAt = computeNextRunAt(t.schedule, Date.now() + 1000, t.createdAt)
     } else {
       t.nextRunAt = 0
     }
@@ -504,7 +496,7 @@ export async function runTaskNow(id: string): Promise<{ ok: boolean; error?: str
       const atMs = Date.parse(String(t.schedule.at || ''))
       t.nextRunAt = t.enabled && Number.isFinite(atMs) && atMs > Date.now() + 1000 ? atMs : 0
     } else if (t.enabled) {
-      t.nextRunAt = computeNextRunAt(t.schedule, Date.now() + 1000, t.createdAt)
+      if (!(t.nextRunAt > Date.now())) t.nextRunAt = computeNextRunAt(t.schedule, Date.now() + 1000, t.createdAt)
     } else {
       t.nextRunAt = 0
     }

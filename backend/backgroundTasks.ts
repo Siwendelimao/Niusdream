@@ -16,7 +16,7 @@
  *   ② 会话**没在跑** → 记成 pending notice，下次该会话发消息时补进上下文。
  *   （`bg_list` / `bg_read` 工具任何时候都能主动查，这是兜底。）
  *
- * ⚠️ 边界：任务是**本进程内**的（跟 NIS 后端同生共死）。关窗口选「最小化到托盘」→ 后端还在跑，
+ * ⚠️ 边界：任务是**本进程内**的（跟 NiusDream 后端同生共死）。关窗口选「最小化到托盘」→ 后端还在跑，
  *   任务继续；真正退出应用 → 正在跑的任务丢失（重启后状态会从持久化文件恢复成"已中断"，不装成功）。
  */
 
@@ -61,6 +61,10 @@ export interface BgTask {
   status: BgStatus
   /** 派发它的会话（前端胶囊 tab 按它过滤） */
   conversationId: string
+  /** ★1024bd：**挂它的那条工具调用的 callId** —— 完成通知要钉回"命令那一行"，
+   *  必须记在这里。原来通知去取"当前累加器里最后一个 tool_use"，而任务往往是**上一轮**挂的，
+   *  完成时累加器里根本没有它 ⇒ 锚点为空 ⇒ 通知掉到正文末尾并一路跟着往下走（实测）。 */
+  spawnedByCall?: string
   createdAt: number
   finishedAt?: number
   /** 命令任务 */
@@ -425,6 +429,8 @@ function buildInvocation(command: string): { exe: string; argv: string[] } {
 interface BgStartOpts {
   title: string
   conversationId: string
+  /** ★1024bd：挂它的那条工具调用的 callId（完成通知的定位锚点） */
+  spawnedByCall?: string
   cwd?: string
   /** ★ 0922c-5：url 模式的请求头（string→string） */
   headers?: Record<string, string>
@@ -446,6 +452,7 @@ export function bgStartCommand(command: string, opts: BgStartOpts): { ok: boolea
     kind: 'command',
     status: 'background',
     conversationId: String(opts.conversationId || ''),
+    spawnedByCall: opts.spawnedByCall ? String(opts.spawnedByCall) : undefined,
     createdAt: Date.now(),
     command: cmd,
     cwd,
@@ -556,6 +563,7 @@ export function bgStartDownload(url: string, dest: string, opts: BgStartOpts): {
     kind: 'download',
     status: 'background',
     conversationId: String(opts.conversationId || ''),
+    spawnedByCall: opts.spawnedByCall ? String(opts.spawnedByCall) : undefined,
     createdAt: Date.now(),
     url: u,
     dest: d,
@@ -600,7 +608,7 @@ function httpGet(url: string, redirects = 0, headers?: Record<string, string>): 
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https:') ? https : http
     /* ★ 0922c-5：透传自定义请求头（默认 UA 保留，可被覆盖）—— 需鉴权的直链也能走 url 模式 */
-    const hdrs: Record<string, string> = { 'User-Agent': 'NIS-BgTask/1.0', ...(headers || {}) }
+    const hdrs: Record<string, string> = { 'User-Agent': 'NiusDream-BgTask/1.0', ...(headers || {}) }
     const req = mod.get(url, { headers: hdrs, timeout: 30000 }, (res) => {
       const code = res.statusCode || 0
       if (code >= 300 && code < 400 && res.headers.location) {

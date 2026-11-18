@@ -25,9 +25,13 @@ import sys
 import time
 import traceback
 
+# The lock helper lives beside backend/dataMerge.py, one directory above this kernel.
+SRC_PYTHON = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(SRC_PYTHON))
+from dataMergeLocks import DataLocks
+
 # 指向 NIS Python 后端源码（core.memory / core.knowledge 独立可导入，不依赖 main）
 # 0918：改成"内核包就在本文件旁边" —— 不再依赖网页版目录
-SRC_PYTHON = os.path.dirname(os.path.abspath(__file__))
 # 数据目录（0913）：优先 NIS_MEMORY_DIR（NIS 后端按「设置→通用→存储目录」注入），缺省回退旧后端 .nis_data。
 # 首次指向新目录时由 Node 侧把旧库一次性拷过去（不删旧，旧后端仍可用）。
 DATA_DIR = os.environ.get("NIS_MEMORY_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "_data")
@@ -41,22 +45,71 @@ _knowledge = None    # KnowledgeStore
 _nis_core_scope_id = None
 _embedding_provider = None
 _retrieval_backend = None
+# ★memp1（P1-2）：语义模型加载失败不再是"无声 None"——记原因 + 缓存失败结果（TTL）。
+#   原来：失败后 _embedding_provider 仍是 None ⇒ 每次检索/知识写入都重新 import + 重新加载一次
+#   （秒级白付），并且**一个字都不留**（用户只表现为"搜不到"）。
+_embedding_failed_reason = ""      # 非空 = 明确失败过（最后一次异常摘要，供响应/日志引用）
+_embedding_failed_at = 0.0         # 失败时刻（time.time()）
+_embedding_retry_after = 0.0       # 该时刻之前不再重试；到期自动再试一次（装完模型无需重启应用）
+_embedding_degraded_announced = False   # 「第一次降级」是否已告知（进响应，只告知一次）
+_embedding_degrade_notice = ""     # 待取走的降级提示（由 memory_search 响应带出去一次）
+# 失败缓存时长（秒）：默认 300；NIS_EMBED_RETRY_SECONDS 可覆盖（0=不缓存，调试用）
+_EMBED_RETRY_SECONDS = float(os.environ.get("NIS_EMBED_RETRY_SECONDS") or 300)
+
+# ★memp1（P1-1）：内核启动预加载（store/knowledge 建连）失败的原因（"" = 正常）
+_preload_error = ""
 
 
-def _ensure_embedding():
-    """惰性加载本地语义模型（bge-small-zh-v1.5），失败则 None → 检索降级 FTS。"""
-    global _embedding_provider, _retrieval_backend
+def _ensure_embedding(force: bool = False):
+    """惰性加载本地语义模型（bge-small-zh-v1.5），失败则 None → 检索降级 FTS。
+
+    ★memp1：① 失败必须留痕 —— traceback + 一行中文原因写 stderr（Node 侧会把子进程 stderr 转进
+    后端日志），并记进 _embedding_failed_reason；② **失败结果要缓存** —— TTL（_EMBED_RETRY_SECONDS，
+    默认 300s）内直接返回，不再重复 import/加载模型；到期自动重试一次，装好模型不用重启就能恢复；
+    force=True 立即重试；③ 第一次降级留一条 degraded_notice，由 memory_search 响应带出去一次。
+    """
+    global _embedding_provider, _retrieval_backend, _embedding_failed_reason
+    global _embedding_failed_at, _embedding_retry_after, _embedding_degraded_announced, _embedding_degrade_notice
     if _embedding_provider is not None:
         return
+    if not force and _embedding_retry_after and time.time() < _embedding_retry_after:
+        return   # 失败仍在缓存期内：直接走 FTS，不重复加载
     try:
         from core.memory.embedding import SentenceTransformerEmbedder
         from core.memory.vector_index import SqliteVectorIndex
         provider = SentenceTransformerEmbedder("BAAI/bge-small-zh-v1.5")
         _embedding_provider = provider
         _retrieval_backend = SqliteVectorIndex(MEMORY_DB, provider.dimensions)
-    except Exception:
+        if _embedding_failed_reason:
+            print("[memory-bridge] 语义模型已恢复可用（此前失败：" + _embedding_failed_reason + "）",
+                  file=sys.stderr, flush=True)
+        _embedding_failed_reason = ""
+        _embedding_failed_at = 0.0
+        _embedding_retry_after = 0.0
+        _embedding_degraded_announced = False
+        _embedding_degrade_notice = ""
+    except Exception as e:
         _embedding_provider = None
         _retrieval_backend = None
+        _embedding_failed_at = time.time()
+        _embedding_retry_after = (_embedding_failed_at + _EMBED_RETRY_SECONDS) if _EMBED_RETRY_SECONDS > 0 else 0.0
+        reason = type(e).__name__ + ": " + str(e)[:300]
+        first = reason != _embedding_failed_reason
+        _embedding_failed_reason = reason
+        traceback.print_exc(file=sys.stderr)   # 完整堆栈（原来这里连 str(e) 都不留）
+        print("[memory-bridge] ⚠ 语义模型不可用 → 检索降级为 FTS 关键词（%.0fs 内不再重试）：%s"
+              % (_EMBED_RETRY_SECONDS, reason), file=sys.stderr, flush=True)
+        if first and not _embedding_degraded_announced:
+            _embedding_degraded_announced = True
+            _embedding_degrade_notice = "语义模型不可用，检索已降级为关键词(FTS)匹配：" + reason
+
+
+def _take_degrade_notice() -> str:
+    """取走（只返回一次）语义降级提示；memory_search 响应带上它，让「搜不到」有个原因。"""
+    global _embedding_degrade_notice
+    n = _embedding_degrade_notice
+    _embedding_degrade_notice = ""
+    return n
 
 
 def _get_store():
@@ -394,13 +447,18 @@ def handle_memory_search(params: dict) -> dict:
     except Exception:
         pass
     _mark_hits(store, [m.id for m, _ in filtered])  # 最后回写，避免污染本次冷热权重
-    return {
+    out = {
         "memories": items,
         "retrieval_method": res.retrieval_method,
         "total_candidates": len(filtered),
         "layers": layers,
         "detail": detail,
     }
+    # ★memp1（P1-2）：第一次降级时带一条告知（Node 侧 memoryBridge 会显示在工具结果里）
+    _notice = _take_degrade_notice()
+    if _notice:
+        out["degraded_notice"] = _notice
+    return out
 
 
 def handle_memory_maintenance(params: dict) -> dict:
@@ -430,7 +488,39 @@ def handle_memory_store(params: dict) -> dict:
     source = str(params.get("source") or "ai").strip() or "ai"
     # 0924：tags 流转（0913 待确认审核区靠 pending_review 标签；auto 提炼会带 from_auto_memory）
     tags = [str(t).strip() for t in (params.get("tags") or []) if str(t).strip()][:12]
-    importance = float(params.get("importance") or 0.5)
+    # ── importance：**按类型保底**（老板 1112 拍板）────────────────────────────
+    # 病：原来 `params.get("importance") or 0.5` ⇒ 调用方不传就恒为 0.5。
+    #     而 L0 常驻块的排序第一键是 importance（server.ts:20898）⇒ 全 0.5 时退化成纯时间序
+    #     ⇒ 每轮注入的永远是"最近三天最新产生的几条"，多半是当前任务的技术细节。
+    # 设计原则（结构性）：**不依赖 AI 每次都判断对 —— 类型本身就是信号**。
+    #     用户偏好/已拍板的决策，不知道就会做错；能从代码/档案/git 查到的事实，不知道也只是慢一点。
+    # 顺序：AI 显式传了就用它的（尊重调用方判断）；没传就按类型给保底。
+    # ⚠️ 两个映射都要给：新调用方传 category，老调用方只传 memory_type（都要有合理保底，别又落到 0.5）。
+    _IMP_BY_TYPE = {
+        "preference": 0.7,        # 用户偏好/审美/表达要求 —— 不知道就会做错
+        "project_decision": 0.8,  # 已拍板的选择 —— 不知道就会反着做
+        "project_lesson": 0.6,    # 踩过的坑 —— 不知道会再踩
+        "procedure": 0.6,         # 可复用做法
+        "semantic": 0.4,          # 能从代码/档案/git 查到
+        "project_fact": 0.4,
+        "user_profile": 0.8,      # 用户画像
+    }
+    _raw_imp = params.get("importance")
+    # 空值（None / 空串 / 纯空白）⇒ 按类型保底。注意：0 是**合法值**，不能当空值处理。
+    if _raw_imp is None or (isinstance(_raw_imp, str) and _raw_imp.strip() == ""):
+        importance = _IMP_BY_TYPE.get(mtype, 0.5)
+    else:
+        # 脏值（非数字）不能抛错中断整次写入 —— 退回类型保底，并在 stderr 留一行痕迹（不静默吞）。
+        try:
+            importance = float(_raw_imp)
+        except (TypeError, ValueError):
+            print(f"[memory-bridge] importance 非数字（{_raw_imp!r}）⇒ 按类型保底 {_IMP_BY_TYPE.get(mtype, 0.5)}", flush=True)
+            importance = _IMP_BY_TYPE.get(mtype, 0.5)
+    # 夹在 0~1：越界值不进库
+    try:
+        importance = max(0.0, min(1.0, float(importance)))
+    except Exception:
+        importance = _IMP_BY_TYPE.get(mtype, 0.5)
     scope = str(params.get("scope") or "nis_core")
     scope_type = ScopeType.PROJECT if scope == "project" else ScopeType.NIS_CORE
     scope_id = str(params.get("scope_id") or "")
@@ -824,7 +914,7 @@ def handle_memory_graph(params: dict) -> dict:
                 # 0924 一期：废除"长期记忆"兜底桶 → 按 memory_type 映射 6 类（偏好/决策/教训/模式/事实/画像）
                 "node_type": _map_node_type(d.get("memory_type")),
                 "scope": str(d.get("scope_type") or "nis_core"),
-                "project_id": str(d.get("scope_id") or ""),
+                "project_id": str(d.get("scope_id") or "") if str(d.get("scope_type")) == "project" else "",
                 "tags": tags0 + (["src:" + src] if src else []),
                 "enabled": True,
                 "md_file": None,
@@ -885,17 +975,61 @@ def handle_memory_node_update(params: dict) -> dict:
     if nid.startswith("mem_"):
         store = _get_store()
         _ensure_extra_columns(store)
-        if "tags" in params:
-            new_tags = [str(t).strip() for t in (params.get("tags") or []) if str(t).strip()][:12]
-            _write_extra(store, nid, tags=new_tags)
-        ex = _extra_fields(store, nid) or {}
-        return {"node": {"id": nid, "tags": ex.get("tags") or []}}
+        conn = store._conn()
+        try:
+            row = conn.execute("SELECT * FROM memory_records WHERE id = ?", (nid,)).fetchone()
+            if row is None:
+                raise ValueError("memory not found")
+            changes = {}
+            if "content" in params:
+                changes["content"] = str(params["content"])
+            if "summary" in params:
+                changes["summary"] = str(params["summary"])
+            if "tags" in params or params.get("review"):
+                tags = json.loads(row["tags"] or "[]") if params.get("review") else list(params.get("tags") or [])
+                changes["tags"] = json.dumps([str(t) for t in tags if not (params.get("review") and t == "pending_review")], ensure_ascii=False)
+            if "node_type" in params:
+                category = str(params["node_type"])
+                if category == "pitfall": category = "lesson"
+                if category not in CATEGORY_TO_TYPE: raise ValueError("unsupported node_type")
+                changes["memory_type"] = CATEGORY_TO_TYPE[category]
+            if "project_id" in params or "scope" in params:
+                project = str(params.get("project_id") or "")
+                changes["scope_type"] = "project" if project else "nis_core"
+                changes["scope_id"] = project or (_nis_core_scope_id or "")
+            if "enabled" in params and not params["enabled"]:
+                raise ValueError("Long-term memories cannot be disabled here; delete or archive them explicitly")
+            # Long-term titles are derived from content; never pretend a separate title was stored.
+            if "title" in params and "content" not in params:
+                raise ValueError("Long-term memory title is derived from its content")
+            if changes:
+                changes["updated_at"] = time.time()
+                conn.execute("UPDATE memory_records SET " + ", ".join(k + " = ?" for k in changes) + " WHERE id = ?", [*changes.values(), nid])
+                conn.commit()
+            return {"updated": True, "node": {"id": nid}}
+        finally:
+            conn.close()
     g = _get_graph()
     if not nid:
         raise ValueError("id required")
-    changes = {k: params[k] for k in ("title", "content", "summary", "tags", "node_type")
-               if k in params}
-    ok = g.update_node(nid, **changes)
+    changes = {k: params[k] for k in ("title", "content", "summary", "tags", "node_type", "scope", "project_id", "enabled") if k in params}
+    if params.get("review"):
+        node = g.get_node(nid)
+        if not node: raise ValueError("node not found")
+        changes["tags"] = [t for t in (node.get("tags") or []) if t != "pending_review"]
+    # The graph module is excluded by the legacy memory/ ignore rule. Persist the
+    # UI contract here rather than ship a fix in an untracked source dependency.
+    if not changes:
+        raise ValueError("no supported changes")
+    conn = g._conn()
+    try:
+        values = {k: json.dumps(v, ensure_ascii=False) if k == "tags" else v for k, v in changes.items()}
+        values["updated_at"] = time.time()
+        cursor = conn.execute("UPDATE memory_nodes SET " + ", ".join(k + " = ?" for k in values) + " WHERE id = ?", [*values.values(), nid])
+        conn.commit()
+        ok = cursor.rowcount > 0
+    finally:
+        conn.close()
     return {"updated": ok, "node": g.get_node(nid) if ok else None}
 
 
@@ -968,15 +1102,34 @@ HANDLERS = {
 
 
 def main() -> None:
+    lock = DataLocks([DATA_DIR], 'bridge')
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     # 预加载（启动即建连，供 Node 侧检测就绪）
+    # ★memp1（P1-1）：不再「吞异常 + 照旧宣告就绪且零留痕」——
+    #   ① 失败时完整 traceback + 一行中文原因进 stderr（Node 侧 memoryBridge.ts 会把子进程 stderr
+    #      转进后端日志，原来这里一个字都没有）；
+    #   ② ready 行带上 degraded / preloadError 供 Node 侧留痕（Node 只认 msg.ready === true，
+    #      所以 ready 仍为 true：本进程协议层是活的、每个 op 内部都会惰性重试建连；若宣告
+    #      ready:false，Node 侧永远不会点亮 ready ⇒ 所有 memory_*/knowledge_* 报「未就绪·去装
+    #      记忆检索模型」，正是任务单警告的"内核起不来"新问题，故不采用）；
+    #   ③ 原因记进 _preload_error，后续每个请求报错时一并带出（用户/agent 看得到真正原因）。
+    global _preload_error
     try:
         _get_store()
         _get_knowledge()
-    except Exception:
-        pass
-    print(json.dumps({"ready": True}, ensure_ascii=False), flush=True)
+        if _embedding_failed_reason:
+            _preload_error = "语义模型不可用（已降级 FTS）：" + _embedding_failed_reason
+    except Exception as e:
+        _preload_error = type(e).__name__ + ": " + str(e)[:300]
+        traceback.print_exc(file=sys.stderr)
+        print("[memory-bridge] ⚠ 预加载失败（记忆库/知识库建连）：" + _preload_error
+              + " —— 桥仍可接活（op 内会惰性重试），但相关调用会现场报错", file=sys.stderr, flush=True)
+    _ready_msg = {"ready": True}
+    if _preload_error:
+        _ready_msg["degraded"] = True
+        _ready_msg["preloadError"] = _preload_error
+    print(json.dumps(_ready_msg, ensure_ascii=False), flush=True)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -995,10 +1148,16 @@ def main() -> None:
             result = handler(params)
             print(json.dumps({"id": rid, "ok": True, "result": result}, ensure_ascii=False), flush=True)
         except Exception as e:
+            # ★memp1：① 每请求异常也把堆栈写 stderr（原来只回一句 str(e)，后端日志里查不到堆栈）；
+            #   ② 若内核启动预加载曾失败，把真正原因追加进错误串（用户/agent 看得到，不再只有现场报错）。
+            traceback.print_exc(file=sys.stderr)
+            _err = str(e)[:500]
+            if _preload_error and _preload_error not in _err:
+                _err = (_err + "（内核启动预加载曾失败：" + _preload_error + "）")[:800]
             print(json.dumps({
                 "id": rid if 'rid' in locals() else None,
                 "ok": False,
-                "error": str(e)[:500],
+                "error": _err,
             }, ensure_ascii=False), flush=True)
 
 

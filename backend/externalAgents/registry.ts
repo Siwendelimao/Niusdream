@@ -1,5 +1,5 @@
 /* registry.ts —— ★1001 外部 agent 安装配方表（数据驱动，可拆装）
- * 安装目录：NIS 根目录\external-agents\<id>\（已定案的固定文件夹）
+ * 安装目录：NiusDream 根目录\external-agents\<id>\（已定案的固定文件夹）
  * 渠道按序尝试（本机 GitHub 文件 CDN 被墙 → 自动落到备用渠道；正常网络走 GitHub）：
  *   github-release  = GitHub releases 最新资产（资产名正则匹配 win-x64）
  *   pypi-pip        = PyPI 包，python -m pip install --prefix <dir>（解析依赖，生成 Scripts\*.exe 入口）
@@ -8,7 +8,7 @@
 import path from 'node:path'
 import { BACKEND_ROOT } from '../paths.ts'
 
-/** NIS 根目录\external-agents —— 所有外部 agent 的固定安装家 */
+/** NiusDream 根目录\external-agents —— 所有外部 agent 的固定安装家 */
 export const EXT_AGENTS_DIR = path.join(path.dirname(BACKEND_ROOT), 'external-agents')
 
 export type ExtChannel =
@@ -77,7 +77,7 @@ export const EXT_AGENTS: ExtAgentRecipe[] = [
   },
   {
     id: 'pi', name: 'Pi', engine: 'pi',
-    desc: 'pi 原版编码 agent（NIS 引擎的上游，同源不同命；引擎接线中）',
+    desc: 'pi 原版编码 agent（NiusDream 引擎的上游，同源不同命；引擎接线中）',
     repo: 'https://github.com/earendil-works/pi',
     binName: 'pi.cmd',
     channels: [
@@ -97,7 +97,7 @@ export const EXT_AGENTS: ExtAgentRecipe[] = [
   },
   // ★1001 六批（已定案）：zcode 摘牌——命令行发行包只在其不可达 CDN（cdn.zcode-ai.com，实测 000），
   // GitHub 只有桌面安装器（已解剖：无独立 CLI 运行时，运行资源也是首跑时从同 CDN 拉）。
-  // 证据链：D:\nis0924\toolchain\codex\zcode_setup.exe + asar 解剖记录；哪天地址公开/网络通了再加回一行。
+  // 证据链：<dev仓库>\toolchain\codex\zcode_setup.exe + asar 解剖记录；哪天地址公开/网络通了再加回一行。
 ]
 
 export function findRecipe(id: string): ExtAgentRecipe | undefined {

@@ -1,298 +1,239 @@
-/* ============================================================================
- * cloneRuntime.ts —— 分身工具（spawn_clone）：非团队模式派出 1~3 个「自己」并行执行子任务
- *
- * 设计（0925 已定案）：
- *  · 形式 = 工具（与 team_dispatch 同构），触发靠自然语言；上限 3 个，命名「<AI名> 分身1/2/3」
- *  · 分身只听主 agent 的任务单，用户只能展开气泡查看过程
- *  · 失败链：分身重试 2 次 → 主 agent 亲自补 1 次 → 都失败汇报用户定夺；
- *    主 agent 预判不妙时，分身第一次失败就应告知用户调整策略（写进工具描述的行为纪律）
- *  · 复用团队管线（零复制）：给分身伪造轻量 TeamCtx + 单步黑板 → 直接调 runSubAgent ——
- *    气泡/过程回放(segments)/中断/文件锁/工具池/模型解析全套免费。
- *    黑板 sessionId 带 `#clone` 后缀落独立文件，不污染真黑板。
- * ========================================================================== */
-/* ★ 0925 修复：原写成 `@sinclair/typebox`（typebox 的**旧包名**，本项目从未安装）——
-   它在启动期直接抛 `ERR_MODULE_NOT_FOUND: Cannot find package '@sinclair/typebox'`，
-   整个后端起不来（症状：控制台报「30 秒内没等到就绪 + 日志尾部为空」，错误只在 .err 里）。
-   项目约定（tools.ts / server.ts / teamRuntime.ts 等 10 处）统一用 `'typebox'`（v1.3.7，已在 node_modules）。 */
-import { Type } from 'typebox'
+/** Temporary read-only agents are awaited tools of the current parent turn.
+ * No TeamCtx, member session, blackboard, detached dispatch or return notification.
+ * Only the model transport, tool implementations and immutable run verdict are shared.
+ */
 import { randomUUID } from 'node:crypto'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
-import { runSubAgent, loadBlackboard, abortedSince } from './teamRuntime.ts'
-import type { Blackboard, BlackboardStep, TeamCtx } from './teamRuntime.ts'
-import type { TeamMember } from './teamsStore.ts'
+import { Type } from 'typebox'
+import { Agent, toFinishTurn, type AgentTool } from './agentCompat.ts'
+import { judgeRunOutcome } from './runVerdict.ts'
 
-/** 主 agent 的自我信息（分身=复制它） */
-interface CloneSelf {
-  /** 显示名（如"小螺丝"）→ 分身命名 `${name} 分身N` */
+export interface CloneContext {
+  sessionId: string
   name: string
-  /** 自己的预设 id（分身用同款工具箱/角色底子） */
   presetId: string
+  model: string
+  workDir: string
+  tools: AgentTool<any>[]
+  createStream: (system: string, signal: AbortSignal, actor: string, onNote: (note: any) => void, tools: () => AgentTool<any>[]) => any
+  publish: (callId: string, runs: CloneRun[]) => void
+  log: (level: 'info' | 'warn' | 'error', message: string) => void
+}
+export interface CloneRun {
+  runId: string
+  callId: string
+  memberId: string
+  memberName: string
+  memberPreset: string
+  task: string
+  model: string
+  attempt: number
+  status: 'running' | 'done' | 'error' | 'interrupted'
+  startedAt: number
+  endedAt?: number
+  stopReason?: string
+  text: string
+  reasoning: string
+  error?: string
+  finalized: boolean
+  segments: any[]
+  tools: any[]
+  usage?: any
+  timing: { llmMs: number }
+  retrying?: { attempt: number; reason: string }
+}
+const MAX_CLONES = Math.max(1, Math.min(20, Number(process.env.NIS_MAX_CLONES) || 3))
+const slots = new Map<string, Set<number>>()
+const active = new Map<string, Map<string, () => void>>()
+export function isCloneRunActive(runId: string): boolean {
+  for (const runs of active.values()) if (runs.has(runId)) return true
+  return false
+}
+export function cancelClones(sessionId: string): void {
+  for (const stop of active.get(sessionId)?.values() || []) stop()
 }
 
-/** 分身需要的轻量上下文 = TeamCtx 的全部方法（server.ts 的 buildTeamCtx 直接提供，零转换） */
-type CloneCtxLite = TeamCtx
-
-const MAX_CLONES = 3
-/** 槽位表：sessionId → 已占用槽号（派发占位、批次收尾释放） */
-const cloneSlots = new Map<string, Set<number>>()
-
-/* ★ 0925x（设计口径修正："分身应该只有 1/2/3，不管多少轮"）：**三槽位制** ——
-   分身1/2/3 是固定槽位号（不是无限递增）：派分身时占用最小空闲槽，跑完释放复用；
-   3 个槽都占着 = 3 个分身都在跑，再派会被拒（"上限 3 个"的并发语义）。
-   ★1004 修复：本行原有第二个 `const cloneSlots`（同一作用域重复声明）→ esbuild 报
-   `The symbol "cloneSlots" has already been declared` ⇒ **整个后端起不来**；已删掉重复声明，
-   槽位表只保留上方第 37 行那一处。（注：同批加的 `cloneBusyCount()` 已被后续改动移除，
-   目前无任何消费方 —— 侧栏「分身工作中」指示的缺口见 1005 诊断。） */
-function acquireSlot(sessionId: string): number | null {
-  const used = cloneSlots.get(sessionId) || new Set<number>()
-  for (let i = 1; i <= MAX_CLONES; i++) {
-    if (!used.has(i)) { used.add(i); cloneSlots.set(sessionId, used); return i }
-  }
-  return null
-}
-function releaseSlot(sessionId: string, n: number) {
-  cloneSlots.get(sessionId)?.delete(n)
+// The safety boundary is enforced here, independently of member presets/tools.
+const READ_TOOLS = new Set(['fs_read', 'fs_grep', 'list_dir', 'web_search', 'web_fetch', 'github_search', 'use_skill'])
+const READ_ACTIONS: Record<string, string[]> = { repo: ['map', 'search'], memory: ['search'], knowledge: ['query'] }
+function readTools(tools: AgentTool<any>[]): AgentTool<any>[] {
+  return tools.filter(t => READ_TOOLS.has(t.name) || t.name in READ_ACTIONS).map(t => {
+    const allowed = READ_ACTIONS[t.name]
+    if (!allowed) return t
+    // Narrow both the schema and execution boundary: no hidden write actions.
+    const parameters: any = structuredClone(t.parameters)
+    parameters.properties.action = Type.Union(allowed.map(action => Type.Literal(action)))
+    return { ...t, parameters, async execute(id: string, args: any, signal?: AbortSignal, update?: any) {
+      if (!allowed.includes(args.action)) throw new Error(`${t.name}: 分身只允许 ${allowed.join('/')}`)
+      return t.execute(id, args, signal, update)
+    } }
+  })
 }
 
-/* ★ 0925w（实测三连：分身挂后台任务/回访串扰/权限卡死 "ctx.approval is not a function"）：
- * 分身定位=查资料/简单提效 —— 工具箱限定安全范围：**不含** 后台任务(bg_*)、询问卡(ask_user)、
- * 设置修改、删除(fs_delete)、预设/自定义工具管理、自我修改(project_*)等高危/串扰类。
- * 免审批（approval 兜底返回放行）——工具箱已圈安全区，分身不再被审批卡死。
- * ★1005（已定案·方案A）：**分身改"只读 + 汇报"** —— 再去掉 fs_write/fs_edit/run_command：
- *   并行分身不再能改文件/跑命令（并行写冲突源与误操作面整体下线；0927 taskkill 差点杀后端就是这类口子）；
- *   产出照旧走 bb_write→step.result 汇报 —— bb_write 是团队管线内置的受限汇报工具
- *   （teamRuntime buildSubWriteTool），不经 buildMemberToolPool 白名单过滤 ⇒ 不受本次改动影响（已核）；
- *   **改文件由主 agent 汇总分身结论后自己落地**（它有完整审批链）。
- *   对标 opencode 的 Explore 子 agent（"Cannot modify files"）与 codex 的 read-only 档。 */
-const CLONE_TOOL_WHITELIST = [
-  'fs_read', 'fs_grep',
-  'web_search', 'web_fetch', 'github_search',
-  'plan_write', 'project_note', 'use_skill',
-]
-/* ★ 0929 工具瘦身·刀①：家族工具在分身里按 action 收口 —— **严格保持合并前的安全区**：
- * 合并前分身只有 memory_search/store、knowledge_query/add、notebook_list/add/update（无任何删除类、无 distill）。
- * 合并后家族工具整只给出去会连 delete 一起给（安全区扩大）⇒ 必须按 action 白名单收口。 */
-const CLONE_ACTION_WHITELIST: Record<string, string[]> = {
-  memory: ['search', 'store'],
-  knowledge: ['query', 'add'],
-  notebook: ['list', 'add', 'update'],
-}
-function cloneRestrictTool(t: any): any {
-  const allow = CLONE_ACTION_WHITELIST[t.name]
-  if (!allow) return t
-  return {
-    ...t,
-    async execute(callId: string, params: any) {
-      const a = String((params as any)?.action || '').trim()
-      if (!allow.includes(a)) {
-        return { content: [{ type: 'text', text: `【分身安全区】${t.name}(action=${a || '空'}) 不在分身工具箱里（分身只开放：${allow.join(' / ')}）` }], details: { ok: false } }
+/** Ordered segments have backend-issued stable identities; the UI never assigns turn ownership. */
+function capture(run: CloneRun, messages: any[]): void {
+  const segments: any[] = []
+  const calls = new Map<string, any>()
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }
+  for (let mi = 0; mi < messages.length; mi++) {
+    const m = messages[mi]
+    if (m.role === 'assistant') {
+      for (const [bi, b] of (m.content || []).entries()) {
+        const id = `${run.runId}:${mi}:${bi}`
+        if (b.type === 'thinking') segments.push({ id, type: 'thinking', text: b.thinking })
+        if (b.type === 'text') segments.push({ id, type: 'text', text: b.text })
+        if (b.type === 'toolCall') {
+          const s = { id: b.id, type: 'tool', toolCallId: b.id, name: b.name, args: b.arguments, status: 'running', result: '' }
+          segments.push(s); calls.set(b.id, s)
+        }
       }
-      return t.execute(callId, params)
-    },
-  }
-}
-
-/** 给一组分身任务伪造「轻量 TeamCtx + 独立黑板」，返回可直接喂 runSubAgent 的壳 */
-function makeShell(lite: CloneCtxLite, self: CloneSelf, n: number, goal: string, slot = 1) {
-  const teamId = `clone-${randomUUID().slice(0, 8)}`
-  const members: TeamMember[] = []
-  for (let i = 1; i <= n; i++) {
-    members.push({
-      /* ★ 0925z（设计口径"#N 是身份牌"）：member.id 带**槽位号**（clone1/2/3）——
-         前端实例号 #N 直接取它（第二轮派的还是 #1/#2/#3，不按出现顺序累加）。 */
-      id: `clone${slot}`,
-      /* ★ 0925x（设计口径："分身1 分身2 就不要了，#1 #2 #3 就可以了"）：名字不带序号 ——
-         显示「<AI名> 分身」，实例区分交给界面的 #1/#2/#3（同成员多实例编号机制）。 */
-      name: `${self.name} 分身`,
-      preset: self.presetId,
-      role: `「${self.name}」的分身（一次性实例）：只读调研员——只查资料/读文件/搜索，不落盘不改文件不跑命令；产出写黑板汇报，改文件由本体落地`,
-      modelMode: 'shared',
-      modelId: '',
-      maxInstances: 1,
-    } as any)
-  }
-  const bb: Blackboard = {
-    sessionId: `${lite.sessionId}#clone`,
-    teamId,
-    goal,
-    steps: [],
-    findings: [],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    /* ★ 0925ab（实测"刷新后分身气泡没了"）：**续接历史 runs** ——
-       每次 spawn_clone 造新黑板会覆盖 #clone 文件（前几轮的回放快照丢）；这里把旧 runs 带上累积。 */
-    ...((): any => {
-      try {
-        const prev = loadBlackboard(`${lite.sessionId}#clone`) as any
-        return Array.isArray(prev?.runs) ? { runs: prev.runs.slice(-40) } : {}
-      } catch { return {} }
-    })(),
-  } as any
-  const ctx: TeamCtx = {
-    sessionId: lite.sessionId,
-    team: { id: teamId, name: `${self.name}·分身小队`, mode: 'parallel', maxParallel: MAX_CLONES, members } as any,
-    broadcast: lite.broadcast,
-    log: lite.log,
-    /* ★ 0925w：工具池包一层白名单过滤（分身只给查/轻写工具，bg_* 等不下发） */
-    buildMemberToolPool: (actor?: string, lock?: { owner: string; label: string }) =>
-      lite.buildMemberToolPool(actor, lock).filter(t => CLONE_TOOL_WHITELIST.includes(t.name) || CLONE_ACTION_WHITELIST[t.name]).map(cloneRestrictTool),
-    createSubStreamFn: lite.createSubStreamFn as any,
-    resolveMemberModel: lite.resolveMemberModel as any,
-    resolveMemberCapability: lite.resolveMemberCapability as any,
-    sessionModel: lite.sessionModel,
-    memberSkills: lite.memberSkills,
-    workDir: lite.workDir,
-    /* ★ 0925w（实测 "ctx.approval is not a function" 卡死）：审批回调兜底 ——
-       工具箱已圈定安全范围，分身一律放行，不再被审批链卡住。 */
-    approval: async () => ({ block: false }),
-    syncPlan: () => { /* 分身不碰会话计划卡（那是主 agent 的） */ },
-  } as any
-  return { ctx, bb, members }
-}
-
-/** 单个分身跑一次（★0926 已定案新失败链：**不再内层重试**——失败交批次层按失败数分流） */
-async function runCloneOnce(lite: CloneCtxLite, self: CloneSelf, idx: number, task: string, goal: string, batchT0 = Date.now()): Promise<{ name: string; ok: boolean; result: string; attempts: number; runs: any[]; aborted?: boolean }> {
-  const { ctx, bb, members } = makeShell(lite, self, 1, goal, idx)
-  const member = members[0]
-  const name = `${self.name} 分身${idx}`
-  /* ★0929 P1：步骤 id 加唯一后缀 —— 槽位号在每次 spawn 复用 1/2/3，`clone-<idx>` 撞 id 会让
-     合并落盘按 id 合并时互踩；全仓只此处构造、无处解析该前缀（已核）。 */
-  const step: BlackboardStep = {
-    id: `clone-${idx}-${randomUUID().slice(0, 6)}`, text: task, deps: [], owner: member.id,
-    status: 'pending', attempts: 0,
-  }
-  bb.steps.push(step)
-  /* ★0929 P1：本壳此前已带的 run（0925ab 续接的历史）——差集即本次新建的 run 快照 */
-  const prevRunIds = new Set(((bb as any).runs || []).map((r: any) => String(r.runId || '')))
-  const ownRuns = () => ((bb as any).runs || []).filter((r: any) => !prevRunIds.has(String(r.runId || '')))
-  try {
-    await runSubAgent(ctx, bb, step, member, randomUUID(), task, '')
-    /* ★ 0925x（实测"分身明明找到了却报失败、还跑了两轮"）：runSubAgent 不改 step.status
-       （'review' 是团队 runStepTask 设的，分身直调不经它）——旧判定看 status 恒不命中 →
-       误判失败 → 自动重试（两轮）→ 主 agent 以为失败自己上。改为按**汇报**判定：
-       bb_write 写了 step.result 即视为完成（分身的汇报通道就是 bb_write→step.result）。 */
-    const _res = String(step.result || '').trim()
-    /* 0927 netfix clone-block-0927：分身"遇阻/无法完成"类汇报不能算成功 —— 原只要非空就 ok:true，
-       失败链（重派/自补）永远不触发。命中阻塞词的汇报按失败走链。 */
-    const BLOCK_RE = /无法解决|无法继续|无法完成|缺少?(权限|信息|凭据)|方向不明|已中止|被中止|挂死|多次失败/
-    if (_res && !BLOCK_RE.test(_res.slice(0, 400))) {
-      return { name, ok: true, result: String(step.result || ''), attempts: 1, runs: ownRuns() }
+      if (m.usage) {
+        usage.input += Number(m.usage.input) || 0
+        usage.output += Number(m.usage.output) || 0
+        usage.cacheRead += Number(m.usage.cacheRead) || 0
+        usage.cacheWrite += Number(m.usage.cacheWrite) || 0
+      }
+    } else if (m.role === 'toolResult') {
+      const s = calls.get(m.toolCallId)
+      if (s) {
+        s.status = m.isError ? 'error' : 'done'
+        s.result = (m.content || []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n')
+      }
     }
-  } catch (e: any) {
-    step.result = String(e?.message || e)
   }
-  /* ★0930：失败带上「是否被用户中止」——失败链严禁把用户停止当失败重派（见批次层） */
-  return { name, ok: false, result: String(step.result || '(未汇报)'), attempts: 1, runs: ownRuns(), aborted: abortedSince(lite.sessionId, batchT0) }
+  if (run.status !== 'running') for (const s of segments) if (s.type === 'tool' && s.status === 'running') s.status = 'error'
+  usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
+  run.segments = segments
+  run.tools = segments.filter(s => s.type === 'tool')
+  run.reasoning = segments.filter(s => s.type === 'thinking').map(s => s.text).join('\n')
+  run.usage = usage
+  run.timing = { llmMs: (run.endedAt ?? Date.now()) - run.startedAt }
 }
 
-/** 分身工具工厂（挂载到普通模式主 agent 的工具集） */
-export function buildCloneTools(lite: CloneCtxLite, getSelf: () => CloneSelf): AgentTool<any>[] {
-  return [
-    {
-      name: 'spawn_clone',
-      label: '派出分身',
-      description:
-        '派出自己的分身（2~3 个，命名「<我> 分身1/2/3」）**并行执行只读子任务**。分身是「只读调研员」：只查资料/读文件/搜索，**不能改文件、不能跑命令**；' +
-        '产出写黑板汇报，**改文件由你（主 agent）汇总分身结论后自己落地**——别派分身去做写文件/跑命令的活。**立即返回，分身在后台干活**——' +
-        '完成后自动把产出摘要以「分身回归」消息送回本对话；★派出后**立即收轮挂起**（一两句告知即可，不要做总结/后续规划、不要继续做别的事），' +
-        '等待期间只有用户插话或后台任务通知才响应，「分身回归」消息到达后按其中指引收尾（含失败链）。' +
-        '何时派：任务可拆成 2~3 个**互相独立**的子任务（不同文件/不同方向）时才值得派；单一连贯小任务自己做更快，不要为了派而派。' +
-        '**派 2 个起——只派 1 个没必要（直接自己做）**。用户明说派几个就派几个（说 1 个=自己做）；没说就自己判断派不派/派几个（2~3）。' +
-        '失败链（严格遵守，单个分身不自动重试）：失败 1 个 → 你直接自己上补做；失败 ≥2 个（含全军覆没）→ 换新分身重派失败的那些一轮，**重试仍失败的 → 你自己上**；' +
-        '若你**预判自己也难解决**（缺权限/缺信息/方向不明），立即把情况与建议汇报给用户调整策略，不要硬补；' +
-        '都失败就汇总现状交用户定夺，不要无限循环。' +
-        '分身只听任务单，用户看不到过程之外的交互——任务单要写清目标/边界/注意事项/验收。',
-      parameters: Type.Object({
-        tasks: Type.Array(Type.Object({
-          task: Type.String({ description: '任务单：目标+边界+注意事项+验收标准（分身只有这张单子）' }),
-        }), { minItems: 2, maxItems: MAX_CLONES, description: '子任务清单（2~3 个，互相独立；只派 1 个没必要=直接自己做）' }),
-      }),
-      async execute(_callId, params: any) {
-        const tasks: any[] = Array.isArray(params?.tasks) ? params.tasks : []
-        if (tasks.length < 2) throw new Error('至少派 2 个分身——只派 1 个没必要，请直接自己做（0926 规则）')
-        if (tasks.length > MAX_CLONES) throw new Error(`最多 ${MAX_CLONES} 个分身——请精简或分批`)
-        const self = getSelf()
-        const goal = tasks.map((t) => `分身：${String(t?.task || '').slice(0, 120)}`).join('；')
-        /* ★ 0925x：三槽位制——每个任务占一个槽（1/2/3），3 个都在忙就拒绝 */
-        const slots: number[] = []
-        for (let i = 0; i < tasks.length; i++) {
-          const slot = acquireSlot(lite.sessionId)
-          if (slot == null) {
-            slots.forEach(s => releaseSlot(lite.sessionId, s))
-            throw new Error(`分身 1/2/3 都在执行中（上限 3 个）——等当前分身回归后再派`)
-          }
-          slots.push(slot)
-        }
-        lite.log('info', 'tool', `[分身] 派出 ${tasks.length} 个分身（${self.name} 分身${slots.join('/')}）`)
-        const t0 = Date.now()
-        /* ★0930（用户三点实测）：**即派即回** —— 批次放后台跑、工具立即返回。
-           旧病：spawn_clone 同步等全部分身（2~5 分钟）→ 主 agent 被钉在工具里，插话没人理、
-           通知不回话、界面看起来"AI 不输出"（实测三条全中）。现在分身跑完由 notifyCloneDone
-           把「分身回归」摘要送回对话（streaming→steer；空闲→自动拉起一轮），主 agent 统一按序处理。 */
-        void (async () => {
-          try {
-            const collectRuns = (list: any[]) => list.flatMap(r => (Array.isArray((r as any)?.runs) ? (r as any).runs : []))
-            const spawnedRuns: any[] = []
-            const results = await Promise.all(tasks.map((t, i) => runCloneOnce(lite, self, slots[i], String(t?.task || ''), goal, t0)))
-            spawnedRuns.push(...collectRuns(results))
-            /* ★0930（实测"点停止→又冒出两个分身继续干，根本停不掉"）：**用户中止不算失败** ——
-               旧失败链把"两个都失败"判成"≥2 失败→换新分身重派一轮"，用户一按停止就重派两个新的
-               （日志实锤 01:38:50「2 个分身失败（≥2）——换新分身重派一轮」）。现在批次期间发生过
-               用户中止 → 不重派、不汇报，直接收摊（气泡上已有「用户已停止」）。 */
-            if (abortedSince(lite.sessionId, t0) || results.some(r => (r as any).aborted)) {
-              lite.log('info', 'tool', '[分身] 用户已停止——本批分身中止收摊（不重派、不汇报）')
-              try { lite.registerSubRuns?.(_callId, spawnedRuns) } catch { /* ignore */ }
-              return
-            }
-            /* ★0926d（设计口径终版）：失败链=**挂 1 个自己上，挂 ≥2 个先重派一轮**——
-               · 失败 1 个（3 中挂 1 / 2 中挂 1）→ 不重派，主 agent 直接自己上补做；
-               · 失败 ≥2 个（3 中挂 2 / 2 挂 2 / 3 挂 3）→ 换新分身重派失败的那些一轮，**重试仍失败的 → 主 agent 自己上**；
-               · 限流类失败（429）不进重试（环境问题重试无意义，0925y 教训），如实汇报等用户调策略。 */
-            const isRateLimited = (r: { result: string }) => /429|速率|rate.?limit|too many/i.test(r.result || '')
-            const retryableFails = results.map((r, i) => (!r.ok && !r.aborted && !isRateLimited(r)) ? i : -1).filter(i => i >= 0)
-            if (retryableFails.length >= 2 && !abortedSince(lite.sessionId, t0)) {
-              lite.log('warn', 'tool', `[分身] ${retryableFails.length} 个分身失败（≥2）——换新分身重派一轮`)
-              const retry = await Promise.all(retryableFails.map(i => runCloneOnce(lite, self, slots[i], String(tasks[i]?.task || ''), goal, t0)))
-              spawnedRuns.push(...collectRuns(retry))
-              retry.forEach((r2, k) => { results[retryableFails[k]] = r2 })
-            }
-            /* ★0929 P1（分身刷新恢复兜底）：把本次 spawn 的全部 run 快照（含首轮失败/重试轮）
-               按 toolCallId 登记进 session.subRuns（随会话落盘）——injectSubRuns 的 subRuns
-               兜底原来只认 team_dispatch、分身 run 从不入表；黑板被清/60 条滚动裁掉后
-               分身气泡无从恢复（0929 排查实锤）。server.ts 接线；未设回调=老行为。 */
-            try { lite.registerSubRuns?.(_callId, spawnedRuns) } catch { /* 登记失败不拦汇报 */ }
-            /* 重派期间用户又点停止 → 同样不汇报 */
-            if (abortedSince(lite.sessionId, t0) || results.some(r => (r as any).aborted)) return
-            const lines = results.map(r =>
-              `[${r.name}] ${r.ok ? '完成' : `失败（${r.attempts} 次）`}\n产出摘要：${r.result || '(未汇报)'}`)
-            const allOk = results.every(r => r.ok)
-            lite.notifyCloneDone?.(
-              `【分身回归】分身回归（${results.filter(r => r.ok).length}/${results.length} 成功）。\n\n${lines.join('\n\n')}\n\n` +
-              (allOk ? '下一步：汇总各分身产出并向用户交付。' : '下一步：有分身失败——按失败链：失败 1 个直接自己上补做；失败 ≥2 个已自动重派过一轮、**重试仍失败的由你自己上**；预判难解决（缺权限/缺信息/方向不明）就立即向用户汇报现状与建议，不要硬撑。'),
-            )
-          } catch (e) {
-            /* ★0929 P0（停止级联兜底）：异常中断路径击杀失控分身——批次异常时
-               Promise.all 走人但分身子任务还在跑，且注册状态不一致导致 abortSubAgents 表够不着。 */
-            try { lite.abortSubAgents?.() } catch { /* ignore */ }
-            if (!abortedSince(lite.sessionId, t0)) {
-              lite.notifyCloneDone?.(`【分身回归】批次异常中止：${String((e as any)?.message || e).slice(0, 200)}`)
-            }
-          } finally {
-            /* ★ 0925x：无论成败，槽位都释放（分身1/2/3 循环复用） */
-            slots.forEach(s => releaseSlot(lite.sessionId, s))
-          }
-        })()
-        return {
-          content: [{
-            type: 'text',
-            text: `已派出 ${tasks.length} 个分身（${self.name} 分身${slots.join('/')}）并行开工，完成后自动把产出摘要送回本对话。\n` +
-              '请**就此收轮挂起**：一两句告知用户即可，不要做总结/后续规划、不要继续做别的事；' +
-              '「分身回归」消息到达后按其中指引收尾：汇总产出向用户交付；有失败的按失败链（失败 1 个自己补做；失败 ≥2 个已自动重派过一轮、重试仍失败的自己上；预判难解决就向用户汇报现状与建议）。' +
-              '等待期间只有用户插话或后台任务通知才需要响应。',
-          }],
-          details: { detached: true, spawned: tasks.length },
-        }
-      },
+async function runOnce(ctx: CloneContext, callId: string, slot: number, task: string, attempt: number, signal: AbortSignal | undefined, batch: CloneRun[]): Promise<CloneRun> {
+  const run: CloneRun = {
+    runId: randomUUID(), callId, memberId: `clone${slot}`, memberName: `${ctx.name} 分身`, memberPreset: ctx.presetId,
+    task, model: ctx.model, attempt, status: 'running', startedAt: Date.now(), text: '', reasoning: '', finalized: false,
+    segments: [], tools: [], timing: { llmMs: 0 },
+  }
+  batch.push(run)
+  const ac = new AbortController()
+  let report = '', failure = '', turns = 0, partial: any = null, lastPublish = 0
+  const findings: string[] = []
+  const system = `你是「${ctx.name} 分身 #${slot}」，本次任务的一次性只读调研员，不是团队成员。\n工作目录：${ctx.workDir}\n只处理任务单；只能使用实际提供的只读工具，不能改文件、跑命令、派活或询问用户。\n中途发现可用 bb_write(finding=...) 保存；完成后用 bb_write(result=完整结论, finish=true) 交回主 agent。\n没有文件写入能力，不要声称已落盘。汇报必须包含证据位置或来源，遇阻如实报告。\n大文件先搜索再按行读，不要整份读取。`
+  const reportTool: AgentTool<any> = {
+    name: 'bb_write', label: '分身汇报', description: '本次分身的本地汇报（不是团队黑板）。finding 记录中途发现；result + finish:true 提交最终结果。',
+    parameters: Type.Object({ finding: Type.Optional(Type.String()), result: Type.Optional(Type.String()), finish: Type.Optional(Type.Boolean()) }),
+    async execute(_id, args: { finding?: string; result?: string; finish?: boolean }) {
+      if (ac.signal.aborted) throw new Error('分身已停止')
+      if (args.finding) findings.push(String(args.finding))
+      if (args.result) report = String(args.result)
+      if (args.finish) {
+        if (!report.trim()) throw new Error('finish:true 必须带非空 result')
+        run.finalized = true
+      }
+      return { content: [{ type: 'text', text: args.finish ? '已提交结果，本次分身结束。' : '已记录本次发现。' }], details: { finalized: run.finalized } }
     },
-  ]
+  }
+  const agent = new Agent({
+    streamFn: ctx.createStream(system, ac.signal, `${ctx.name} 分身 #${slot}`, note => {
+      if (note.kind === 'retry') run.retrying = { attempt: note.attempt, reason: note.reason }
+      else delete run.retrying
+      if (note.kind === 'failed') failure = String(note.reason)
+      ctx.publish(callId, batch)
+    }, () => agent.state.tools),
+    initialState: { systemPrompt: system, tools: [...readTools(ctx.tools), reportTool] },
+    sessionId: run.runId,
+    finishTurn: toFinishTurn(st => {
+      if (run.finalized) return true
+      if (++turns >= 30) { failure = '分身达到 30 次模型调用上限'; return true }
+      return String(st.message?.stopReason || '') !== 'toolUse'
+    }),
+    beforeToolCall: async tool => {
+      ctx.log('info', `[分身 #${slot}] ${tool.toolCall.name}`)
+      return undefined
+    },
+  })
+  const messages = () => {
+    const list: any[] = [...agent.state.messages]
+    if (partial && !list.includes(partial)) list.push(partial)
+    return list
+  }
+  const publish = () => { capture(run, messages()); ctx.publish(callId, batch) }
+  const stop = () => {
+    if (ac.signal.aborted) return
+    run.status = 'interrupted'; run.stopReason = 'user'; run.endedAt = Date.now()
+    ac.abort(); agent.abort(); publish()
+  }
+  let runs = active.get(ctx.sessionId)
+  if (!runs) { runs = new Map(); active.set(ctx.sessionId, runs) }
+  runs.set(run.runId, stop)
+  const unsubscribe = agent.subscribe((event: any) => {
+    if (event.type === 'message_start' || event.type === 'message_update') partial = event.message
+    if (event.type === 'message_end') partial = null
+    if (event.type === 'message_update' || event.type === 'message_end' || event.type === 'tool_execution_start' || event.type === 'tool_execution_end') {
+      const now = Date.now()
+      if (event.type !== 'message_update' || now - lastPublish >= 250) { lastPublish = now; publish() }
+    }
+  })
+  signal?.addEventListener('abort', stop, { once: true })
+  try {
+    publish()
+    if (signal?.aborted) stop()
+    if (!ac.signal.aborted) await agent.prompt(task)
+    const msgs = messages()
+    const last: any = msgs.filter(m => m.role === 'assistant').at(-1)
+    if (last?.stopReason === 'error') failure = String(last.errorMessage || '分身模型调用失败')
+    run.text = report || msgs.filter(m => m.role === 'assistant').flatMap(m => m.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n')
+    if (findings.length) run.text += '\n\n发现：\n' + findings.join('\n')
+    const verdict = judgeRunOutcome({ output: run.text, llmFailed: failure, aborted: ac.signal.aborted, task, checkArtifactClaims: true, finalized: run.finalized })
+    if (run.status === 'running') {
+      run.status = verdict.ok ? 'done' : 'error'
+      if (!verdict.ok) run.error = verdict.detail
+    }
+  } catch (error: any) {
+    if (run.status === 'running') { run.status = 'error'; run.error = String(error.message || error) }
+  } finally {
+    signal?.removeEventListener('abort', stop)
+    unsubscribe()
+    run.endedAt ??= Date.now()
+    delete run.retrying
+    runs.delete(run.runId)
+    if (!runs.size) active.delete(ctx.sessionId)
+    publish()
+  }
+  return run
+}
+
+export function buildCloneTools(ctx: CloneContext): AgentTool<any>[] {
+  return [{
+    name: 'spawn_clone', label: '派出分身',
+    description: `在当前用户轮内并行执行 2~${MAX_CLONES} 个互相独立的只读子任务。不是团队成员派活。工具会等待全部分身结束并直接返回结果，主 agent 随后在同一轮汇总，不收轮、不发回归通知。分身不能改文件或跑命令，任务单须写清目标、边界、证据要求。失败 1 个由主 agent 补做；失败至少 2 个由工具重派一次，仍失败由主 agent 处理。`,
+    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String({ description: '目标、边界与证据要求' }) }), { minItems: 2, maxItems: MAX_CLONES }) }),
+    async execute(callId, params: { tasks: Array<{ task: string }> }, signal) {
+      const tasks: Array<{ task: string }> = params.tasks
+      if (tasks.length < 2 || tasks.length > MAX_CLONES || tasks.some(t => !t.task.trim())) throw new Error(`分身必须是 2~${MAX_CLONES} 个非空只读任务`)
+      signal?.throwIfAborted()
+      const used = slots.get(ctx.sessionId) || new Set<number>()
+      const free = Array.from({ length: MAX_CLONES }, (_, i) => i + 1).filter(n => !used.has(n))
+      if (free.length < tasks.length) throw new Error('当前分身槽位不足，请等待当前调用结束')
+      const own = free.slice(0, tasks.length)
+      own.forEach(n => used.add(n)); slots.set(ctx.sessionId, used)
+      const batch: CloneRun[] = []
+      try {
+        const result = await Promise.all(tasks.map((t, i) => runOnce(ctx, callId, own[i], t.task, 1, signal, batch)))
+        if (!signal?.aborted && !result.some(r => r.status === 'interrupted')) {
+          const retry = result.map((r, i) => r.status === 'error' && !/429|rate.?limit|速率|too many/i.test(r.error || '') ? i : -1).filter(i => i >= 0)
+          if (retry.length >= 2) {
+            const retried = await Promise.all(retry.map(i => runOnce(ctx, callId, own[i], tasks[i].task, 2, signal, batch)))
+            retried.forEach((r, i) => { result[retry[i]] = r })
+          }
+        }
+        const text = result.map(r => `[${r.memberName} #${r.memberId.slice(5)}] ${r.status}\n${r.error || ''}\n${r.text}`).join('\n\n')
+        return { content: [{ type: 'text', text }], details: { spawned: tasks.length, completed: result.filter(r => r.status === 'done').length, aborted: result.some(r => r.status === 'interrupted') } }
+      } finally {
+        own.forEach(n => used.delete(n))
+        if (!used.size) slots.delete(ctx.sessionId)
+      }
+    },
+  }]
 }

@@ -5,11 +5,11 @@
  * 数据目录：**本应用自己的** `NIS_MEMORY_DIR`（打包版 = %APPDATA%\nis\memory）或 `<DATA_ROOT>/memory`，
  * 与网页版、与「存储目录」都互不影响（见下方 resolveDataDir 的说明）。
  */
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { Type } from 'typebox'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 import { buildFamilyTool } from './familyTool.ts'
 import { DATA_ROOT, BACKEND_ROOT } from './paths.ts'
 
@@ -35,11 +35,11 @@ export const USING_BUNDLED_KERNEL = BRIDGE_SCRIPT === BUNDLED_BRIDGE
  * 语义检索直接返回空结果（质量事故），所以不能随便换「更快」的裸解释器。
  *
  * ⚠️ 0917 二次事故（用户报「导出记忆/导出知识库/写记忆全失败」）：
- *   NIS.exe 拉起后端时注入的进程环境里 **PATH 不含任何用户装的东西**，
+ *   NiusDream.exe 拉起后端时注入的进程环境里 **PATH 不含任何用户装的东西**，
  *   于是最后一个候选 `'python'` 直接 ENOENT → 子进程根本起不来 →
  *   桥永远 ready=false → 所有 memory_* / knowledge_* op 报 "memory-bridge not ready"。
  *   （开发终端里测得到是因为那个终端自己带了 PATH —— 典型的「我这儿是好的」。）
- * 现在策略：**绝对路径优先**，把 NIS 自管的 memory venv / 常见安装位置全列上，
+ * 现在策略：**绝对路径优先**，把 NiusDream 自管的 memory venv / 常见安装位置全列上，
  * 裸名与 py 启动器只作最后兜底。
  * ─────────────────────────────────────────────────────────────── */
 type PyCand = { bin: string; pre: string[]; origin?: 'own' | 'legacy' | 'system' }
@@ -47,6 +47,12 @@ let _pythonCand: PyCand | null = null
 /** 允许外部（装完语义环境后）强制重新解析一次 */
 export function resetMemoryPython(): void {
   _pythonCand = null
+}
+/** Resolve the same installed interpreter for stdlib-only offline jobs. Does not start a bridge. */
+export function memoryPythonCommand(): { bin: string; pre: string[] } {
+  const cand = resolvePythonCand()
+  if (!cand) throw new Error('未找到 Python，请先在软件环境安装 Python')
+  return { bin: cand.bin, pre: [...cand.pre] }
 }
 function pythonCandidates(): PyCand[] {
   const cands: PyCand[] = []
@@ -94,13 +100,36 @@ function pythonCandidates(): PyCand[] {
   push('py', ['-3'])
   return cands
 }
+/** python 可执行文件旁边可能放 site-packages 的位置（Windows venv / 便携版 / embed 包三种布局） */
+function sitePackageDirs(bin: string): string[] {
+  const dir = path.dirname(bin)                     // venv\Scripts 或 venv\bin 或 embed 根
+  return [
+    path.join(dir, '..', 'Lib', 'site-packages'),   // 标准 venv：venv\Scripts\python.exe → venv\Lib\site-packages
+    path.join(dir, 'Lib', 'site-packages'),         // 便携/embed：python.exe 旁边的 Lib
+    path.join(dir, '..', 'lib', 'site-packages'),
+    path.join(dir, 'site-packages'),                // 有些打包版直接把包放脚本目录
+  ]
+}
+
 function resolvePythonCand(): PyCand | null {
   if (_pythonCand) return _pythonCand
-  // 探测：0=不可用 1=可用但无嵌入依赖（FTS 降级） 2=可用且有嵌入依赖（语义检索）
+  /* ★P115：**探测不再 spawn python**。
+     原来 `probe()` 用 `spawnSync(python, ['-c', 'import ... find_spec(...)'])` **逐个候选**跑一遍 ——
+     venv 里 python 启动本身就要 1~2 秒（加载 site-packages），候选 4~5 个 ⇒ 实测
+     `[eventloop] 主线程被堵 15092ms`，整个后端在这 15 秒里是死的（老大："刚打开就卡"）。
+     现在改成**查文件**：python 可执行文件在不在 + 它旁边 site-packages 里有没有 sentence_transformers 目录。
+     这是事实检查（毫秒级）：包目录在 ⇒ 能 import；不在 ⇒ 不能。
+     ⚠️ `py` 这类**启动器**（不是 exe、无法用文件定位解释器）按"可用但无嵌入依赖"处理 ——
+        宁可降级到 FTS，也不谎报"有语义能力"（那会让 bridge 起来后 import 失败）。 */
   const probe = (c: PyCand): number => {
     try {
-      const r = spawnSync(c.bin, [...c.pre, '-c', 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("sentence_transformers") else 3)'], { timeout: 8000, windowsHide: true })
-      return r.status === 0 ? 2 : (r.status === 3 ? 1 : 0)
+      const looksLikePath = c.bin.includes('/') || c.bin.includes('\\') || /\.exe$/i.test(c.bin)
+      if (!looksLikePath) return 1              // py 启动器 / 裸名：无法静态判定，按降级处理
+      if (!fs.existsSync(c.bin)) return 0
+      for (const sp of sitePackageDirs(c.bin)) {
+        if (fs.existsSync(path.join(sp, 'sentence_transformers'))) return 2
+      }
+      return 1
     } catch { return 0 }
   }
   let degraded: PyCand | null = null
@@ -197,7 +226,7 @@ function resolveDataDir(): string {
     seedFromLegacyMemoryDir(want)
     return want
   } catch (e) {
-    console.warn('[memory-bridge] 数据目录准备失败，回退 NIS 默认目录：', e)
+    console.warn('[memory-bridge] 数据目录准备失败，回退 NiusDream 默认目录：', e)
     const fb = defaultMemoryDir()
     try { fs.mkdirSync(fb, { recursive: true }) } catch { /* ignore */ }
     return fb
@@ -402,6 +431,13 @@ class MemoryBridge {
     } catch {
       return
     }
+    /* ★memp1：内核「已就绪但预加载失败 / 语义模型降级」必须留痕 —— 原来这类信息只进 Python 的
+       stderr，还会被下面 stderr 转发的 200 字截断，后端日志里查不到完整原因。
+       **不动控制流**：ready=true 照旧点亮（内核仍可接活，op 内会惰性重试建连）。 */
+    if (msg.ready === true && (msg.degraded || msg.preloadError)) {
+      console.warn('[memory-bridge] ⚠ 内核已就绪但**预加载降级**（记忆/知识库调用可能现场报错）：'
+        + String(msg.preloadError || msg.degraded).slice(0, 500))
+    }
     if (msg.ready === true) {
       this.ready = true
       this.everReady = true
@@ -429,11 +465,14 @@ class MemoryBridge {
 export const memoryBridge = new MemoryBridge()
 
 /* ── 0924 二期批6b 核心小抄：高频记忆摘要缓存 ────────────────────────────
- * 桥就绪后拉「命中最多的 5 条摘要」，拼进 memory_search 工具描述 ——
- * 每轮构造 tools 时读缓存 ⇒ 会话级常驻速查（≈200 字），省一次检索往返。
+ * 桥就绪后拉「命中最多的 5 条摘要」，**随本轮用户消息尾部注入**（★1014n 从工具描述迁出，原因见下）——
+ * 每轮发消息时读缓存 ⇒ 会话级常驻速查（≈200 字），省一次检索往返。
  * 失败静默等下轮（每 5 分钟刷新）；桥未就绪时调用会 reject，属预期。 */
 let _digestLines = ''
-function coreDigestLine(): string {
+/* ★1014n：**改从「本轮用户消息尾部」注入**（原先拼在 memory / memory_search 的工具描述里）——
+   工具表在缓存前缀头，速查一变就把整段前缀作废；移到本轮消息尾部 = 纯追加，零前缀伤害。
+   调用点：server.ts 发消息处（finalMessage 末尾，且本轮冻住）。 */
+export function coreDigestLine(): string {
   return _digestLines ? `\n【核心记忆速查（高频常用，可直接引用）】\n${_digestLines}` : ''
 }
 async function refreshDigest(): Promise<void> {
@@ -446,6 +485,10 @@ async function refreshDigest(): Promise<void> {
 }
 setInterval(() => { void refreshDigest() }, 5 * 60 * 1000)
 void refreshDigest()
+/* ★1014n：**启动那次常撞上 Python 桥还没就绪**（`void refreshDigest()` 探活失败被静默吞掉），
+   而下一次要等 5 分钟 ⇒ 实测"重启后头 5 分钟没有速查"。这里补两次短延迟重试，把窗口压到 ~30s。 */
+setTimeout(() => { void refreshDigest() }, 15 * 1000)
+setTimeout(() => { void refreshDigest() }, 40 * 1000)
 
 /* ── 0924 二期批6b-2 记忆蒸馏 ────────────────────────────────────────────
  * 散碎同主题记忆 →（LLM）合成主题记忆草案 → 打 pending_review 进「待确认」，由用户把关（A+C 衔接）。
@@ -562,7 +605,7 @@ function buildMemorySearchTool(): AgentTool<any> {
     description: '检索 Nis 的长期记忆（用户偏好、决策、教训、项目进度等）。适合回答"用户之前说过/喜欢什么"或回忆历史。【主动读纪律★0930】涉及偏好/历史/进度/教训/"上次·之前·还记得"/第一次接手某项目任务——先搜再答，别等用户点名。'
       + '【用法规矩（0924 拍板）】结果带 pending=true 或 ⚠️待确认 的是**未确认记忆**（自动提炼/待用户审核）——只可当线索，'
       + '【口径★1010k】返回的是**本次检索命中的条数**，不是全库总量——别把命中数当库存数报给用户；要判断库多大看记忆面板。'
-      + '当事实使用前必须先与用户核实；已确认记忆可直接用。' + coreDigestLine() + memoryLocationHint(),
+      + '当事实使用前必须先与用户核实；已确认记忆可直接用。' + memoryLocationHint(),   /* ★1014n：原此处拼 coreDigestLine()，已迁到本轮用户消息尾部（见 server.ts） */
     parameters: Type.Object({
       query: Type.String({ description: '要检索的记忆关键词或语义描述' }),
       top_k: Type.Optional(Type.Number({ description: '返回条数（默认 5，最多 20）' })),
@@ -574,8 +617,16 @@ function buildMemorySearchTool(): AgentTool<any> {
         top_k: Math.min(params.top_k || 5, 20),
         detail: !!params.detail,
       })
+      /* ★memp1：语义模型失败降级 FTS 时，「第一次降级」由内核带一条 degraded_notice —— 必须让
+         agent/用户看见（原来只有"搜不到"这一种表现，检索质量骤降却无感）。 */
+      const notice = String(result.degraded_notice || '')
+      if (notice) console.warn('[memory-bridge] ⚠ ' + notice)
       return {
-        content: [{ type: 'text', text: formatMemories(result.memories) }],
+        content: [{
+          type: 'text',
+          text: (notice ? `⚠️ ${notice}\n（本次结果按关键词匹配返回，可能漏召回；模型修好后自动恢复）\n` : '')
+            + formatMemories(result.memories),
+        }],
         details: { retrieval: result.retrieval_method, count: result.memories?.length || 0, detail: !!params.detail },
       }
     },
@@ -593,6 +644,14 @@ function buildMemoryStoreTool(): AgentTool<any> {
       category: Type.Optional(Type.String({ description: '类别（推荐必填）：preference/decision/lesson/pattern/fact/profile 之一，不填默认 fact' })),
       summary: Type.Optional(Type.String({ description: '一句话摘要（≤60字），进检索索引层；不填自动取首句' })),
       memory_type: Type.Optional(Type.String({ description: '旧式类型直传（semantic/preference/procedure/project_lesson/project_decision/user_profile）；优先用 category' })),
+      /* ★g5：importance 明确定级（老板 1112 拍板）。
+         不填时后端按 category **自动给保底分**，所以不填也不会错到离谱；
+         但填对了能显著提升"常驻记忆"（每轮注入的那几条）的命中质量 —— 那里按 importance 排序。 */
+      importance: Type.Optional(Type.Number({ description:
+        '重要度 0~1，不填则按类型给保底。**0.9**=用户铁律/否决（"不许/必须"，违反就是错）｜'
+        + '**0.8**=已定决策/用户画像｜**0.7**=用户偏好（习惯/审美/表达）｜'
+        + '**0.6**=踩坑教训/可复用做法｜**0.4**=事实与进度（能从代码、档案、git 查到）。'
+        + '判据：下次遇到同类事，不知道它会不会做错？会→≥0.7；只是省时间→0.5~0.6；能查到→≤0.4。' })),
     }),
     async execute(_callId, params: any) {
       const result = await memoryBridge.call('memory_store', {
@@ -600,6 +659,8 @@ function buildMemoryStoreTool(): AgentTool<any> {
         category: params.category || '',
         summary: params.summary || '',
         memory_type: params.memory_type || '',
+        /* 不传就不传（让后端按类型给保底），**不要**在这里补 0.5 —— 那正是这个 bug 的成因。 */
+        ...(typeof params.importance === 'number' ? { importance: params.importance } : {}),
         source: 'ai',
       })
       /* ★ 0922z3-3（反馈「记忆重复计入：长期记忆 + 待审核各一份」）：
@@ -794,10 +855,12 @@ export function buildMemoryTools(opts?: { projectId?: string }): AgentTool<any>[
         + '【主动读纪律★0930】用户提到/询问偏好、历史决定、项目进度、教训、"上次/之前/还记得"类问题，或第一次接手某项目/任务——**先 search 再回答**，别等用户点名。'
         + '【用法规矩（0924 拍板）】结果带 pending=true 或 ⚠️待确认 的是**未确认记忆**（自动提炼/待用户审核）——只可当线索，'
       + '【口径★1010k】返回的是**本次检索命中的条数**，不是全库总量——别把命中数当库存数报给用户；要判断库多大看记忆面板。'
-        + '当事实使用前必须先与用户核实；已确认记忆可直接用。' + coreDigestLine() + '\n'
+        + '当事实使用前必须先与用户核实；已确认记忆可直接用。' + '\n'   /* ★1014n：原此处拼 coreDigestLine()，已迁到本轮用户消息尾部（见 server.ts） */
         + '· store：写入长期记忆（content=简洁陈述句）。**写入必须归类（category）**：preference=用户偏好/明确要求、'
         + 'decision=重要决定、lesson=踩过的坑/教训、pattern=可复用做法/规律、fact=项目事实与进度、profile=用户是谁（称呼/长期画像）；'
-        + 'summary=一句话摘要（≤60 字，进检索索引层；不填取首句）。只在用户明确表达、被纠正/踩坑或你确认重要时调用。\n'
+        + 'summary=一句话摘要（≤60 字，进检索索引层；不填取首句）；'
+        + 'importance=重要度 0~1（不填按类型给保底）：0.9 铁律/否决 0.8 已定决策/画像 0.7 偏好 0.6 教训/做法 0.4 能查到的事实。'
+        + '只在用户明确表达、被纠正/踩坑或你确认重要时调用。\n'
         + '· delete：id 精确删（hard=true 物理删，缺省=软删）或 query 按内容删匹配。\n'
         + '· distill：同主题散碎记忆合并成主题记忆草案（进待确认）——记忆条目多而碎时用；少或没同主题就不用调。\n'
         + memoryLocationHint(),

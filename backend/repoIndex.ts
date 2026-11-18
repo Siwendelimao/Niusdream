@@ -7,7 +7,7 @@ import path from 'node:path'
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.nis-history', 'target', '__pycache__', '.venv', 'venv', 'coverage', '.next', '.cache', 'toolchain', '.turbo', '.parcel-cache'])
 /* ★1010c：构建产物/缓存目录**常有别名**（dist2、dist-probe-1012、.vite-mcptest）—— 精确匹配漏掉它们，
-   实测 NIS 仓库被 toolchain/codex(2127 文件)、frontend/.vite*(738)、dist2/dist-probe-1012(369) 吃掉预算，
+   实测 NiusDream 仓库被 toolchain/codex(2127 文件)、frontend/.vite*(738)、dist2/dist-probe-1012(369) 吃掉预算，
    索引 truncated 而真源码反而没扫全。这里补"前缀式"判断（这些名字本身就是构建/依赖语义）。 */
 const skipDirName = (name: string): boolean =>
   SKIP_DIRS.has(name) || /^(dist|build|out)[-._0-9]/i.test(name) || /^\.vite/.test(name) || /^\.turbo/.test(name)

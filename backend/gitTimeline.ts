@@ -238,7 +238,7 @@ export async function resetToCommit(cwd: string, hash: string): Promise<GitReset
     const dirtyLines = dirtyOut.trim() ? dirtyOut.trim().split('\n') : []
     const trackedDirty = dirtyLines.filter(l => !l.startsWith('??')).length
     const untrackedKept = dirtyLines.length - trackedDirty
-    /* ★1012 修（老大实测）：原先只比 HEAD —— 只要目标提交正好是当前 HEAD 就**一律**拒绝，
+    /* ★1012 修（实测）：原先只比 HEAD —— 只要目标提交正好是当前 HEAD 就**一律**拒绝，
        于是"HEAD 就在这个提交 + 工作区还有未提交改动"这种**最需要它干活**的场景被挡回去了：
        点回溯只弹「已经在这个提交上了，不用回」，工作区纹丝没动。
        正确判据：HEAD 相同**且工作区也干净**才真叫"不用回"；HEAD 相同但工作区脏 ⇒ 继续往下走
@@ -320,7 +320,7 @@ async function authorArgs(wd: string): Promise<{ args: string[]; fallback: boole
   const hasMail = await run(wd, ['config', 'user.email']).then(s => !!s.trim()).catch(() => false)
   const args: string[] = []
   let fallback = false
-  if (!hasName) { args.push('-c', 'user.name=NIS'); fallback = true }
+  if (!hasName) { args.push('-c', 'user.name=NiusDream'); fallback = true }
   if (!hasMail) { args.push('-c', 'user.email=nis@local'); fallback = true }
   return { args, fallback }
 }
@@ -386,9 +386,63 @@ interface GitRevertResult {
   error?: string
 }
 
+interface GitUndoLastResult {
+  ok: boolean
+  /** 撤销后新的 HEAD 短号 */
+  short?: string
+  /** 被撤销的那个提交的短号（撤销前 HEAD） */
+  undone?: string
+  /** 被撤销提交的说明（给用户确认"撤的是哪一条"） */
+  undoneSubject?: string
+  /** 还有多少个提交可以继续撤（0 = 已经是第一个提交了） */
+  remaining?: number
+  error?: string
+}
+
+/**
+ * ★1109（需求）：**撤销最近一次提交** —— `git reset --soft HEAD~1`。
+ *
+ * 为什么改掉原来的 revert：老板的原话是「未提交前我有5个待提交，我提交了变成0，
+ * 我点撤销就回到5个待提交的状态」。`git revert` 生成的是**反向提交**（历史 +1、工作区干净），
+ * 跟他要的"回到未提交"完全不是一回事。`reset --soft` 才是：HEAD 退一格，改动**原样留在暂存区/工作区**，
+ * 一个字节都不丢。
+ *
+ * 连续撤销：撤完最新一条后 HEAD 已前移，**再点一次就撤下一条** —— 不需要额外设计，
+ * 这就是"连续 pop 提交栈"。更早的历史用「回溯」(reset --hard) 处理。
+ *
+ * 安全：`--soft` 不碰工作区与索引内容（只移动 HEAD 指针），所以**不可能丢文件**。
+ * 唯一的失败场景是"这是第一个提交"（没有父提交），此时如实报错并引导用「回溯」。
+ */
+export async function undoLastCommit(cwd: string): Promise<GitUndoLastResult> {
+  const wd = String(cwd || '').trim()
+  if (!wd) return { ok: false, error: '没有目标目录' }
+  try {
+    const head = (await run(wd, ['rev-parse', 'HEAD'])).trim()
+    if (!head) return { ok: false, error: '这个仓库还没有任何提交' }
+    /* HEAD~1 存在吗 —— 先探一下，避免 reset 报一堆底层英文 */
+    const parent = await run(wd, ['rev-parse', '--verify', '--quiet', 'HEAD~1']).then(s => s.trim()).catch(() => '')
+    if (!parent) {
+      return { ok: false, error: '这是第一个提交，没有更早的提交可退。想拆掉它可以手动 `git update-ref -d HEAD`（会保留文件）' }
+    }
+    const undone = (await run(wd, ['rev-parse', '--short', 'HEAD'])).trim()
+    const subject = (await run(wd, ['log', '-1', '--pretty=%s', 'HEAD']).catch(() => '')).trim()
+    await run(wd, ['reset', '--soft', 'HEAD~1'])
+    const short = (await run(wd, ['rev-parse', '--short', 'HEAD'])).trim()
+    /* 还能继续撤几个：HEAD 之前的提交数（不含 HEAD 本身） */
+    const remaining = Number((await run(wd, ['rev-list', '--count', 'HEAD']).catch(() => '0')).trim()) || 0
+    return { ok: true, short, undone, undoneSubject: subject.slice(0, 120), remaining: Math.max(0, remaining - 1) }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e).slice(0, 400) }
+  }
+}
+
 /**
  * 撤销某次提交：`git revert`（生成一条**反向提交**，历史保留、事后还能再撤销）。
  * 冲突时**先 `revert --abort` 回到操作前**，再把冲突如实报给用户 —— 绝不留下半截的合并状态。
+ *
+ * ⚠️ 1109：**前端已不再调用它**（老板改成"撤销最近一次提交 = reset --soft"，见 undoLastCommit）。
+ * 保留实现是因为 `git.revert` RPC 仍在（远程/脚本可能用），且删掉会让历史提交完全没有补救路径。
+ * 若将来确认无人使用，应连同 RPC 与 i18n 一起删除，而不是留着当死代码。
  */
 export async function revertCommit(cwd: string, hash: string): Promise<GitRevertResult> {
   const wd = String(cwd || '').trim()

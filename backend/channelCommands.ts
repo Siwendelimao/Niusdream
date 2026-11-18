@@ -110,7 +110,7 @@ export function commandList(): Array<{ name: string; params: string; desc: strin
    不必回到 PC 设置页 —— 手机场景下这是唯一入口。
    ═══════════════════════════════════════════════════════════════════════ */
 
-type ChannelPermMode = 'self_audit' | 'full_access' | 'confirm'
+type ChannelPermMode = 'confirm' | 'high_only' | 'full_access'
 
 interface PermOption {
   value: ChannelPermMode
@@ -119,10 +119,19 @@ interface PermOption {
   desc: string
 }
 
+/** ★1034：`self_audit` 撤档，换成 `high_only`（语义正交：问全部 / 只问高危 / 不问）。
+ *  ⚠️ **序号必须与原顺序对齐**（这是 IM 里最常用的写法，`/perm 1` 不能突然换意思）：
+ *     原：1=self_audit(审计)  2=full_access(完全访问)  3=confirm(每次确认)
+ *     新：1=high_only        2=full_access          3=confirm
+ *     ⇒ `/perm 1` 从"全放行"变成"仅高危问"，是**收紧**，不会误放行；
+ *       `/perm 2` `/perm 3` 语义完全不变。
+ *  ⚠️ **存量兼容**：用户在 IM 里仍可能发 `/perm 审计`（旧习惯）——
+ *     `parsePermMode` 把"审计/self_audit"映射到 `high_only` 并**照常生效**，
+ *     不做报错（IM 端没法像 PC 那样弹迁移提示，报错只会让人以为命令坏了）。 */
 export const PERM_OPTIONS: PermOption[] = [
-  { value: 'self_audit', label: '审计模式', desc: '放行所有操作，但全程留痕（推荐）' },
-  { value: 'full_access', label: '完全访问', desc: '不再拦截任何操作，最快' },
-  { value: 'confirm', label: '每次确认', desc: '高风险操作需你确认后才执行（手机上点按钮即可）' },
+  { value: 'high_only', label: '仅高危确认', desc: '只有删除/杀进程这类高危操作问你，其余放行但留痕（推荐）' },
+  { value: 'full_access', label: '完全访问', desc: '不再拦截任何操作，全部放行但留痕' },
+  { value: 'confirm', label: '每次确认', desc: '所有需授权的操作都要你确认后才执行（手机点按钮或回「允许」）' },
 ]
 
 /** 档位 → 中文名（未知值原样返回） */
@@ -132,23 +141,27 @@ export function permLabel(mode: string): string {
 
 /**
  * 解析用户输入 → 权限档位。
- * 支持三种写法：序号（1/2/3）、英文名（self_audit / full_access / confirm）、中文名（审计/完全访问/确认）。
+ * 支持三种写法：序号（1/2/3）、英文名（high_only / full_access / confirm）、中文名（高危/完全访问/确认）。
+ * 兼容旧档位名：`self_audit` / `审计` → `high_only`（★1034；不报错，IM 端只求能用）。
  * @returns 无法识别返回 null
  */
 export function parsePermMode(arg: string): ChannelPermMode | null {
   const a = String(arg || '').trim().toLowerCase()
   if (!a) return null
 
-  // 序号：1 审计 / 2 完全访问 / 3 每次确认（与 PERM_OPTIONS 顺序一致）
+  // 序号：1 仅高危确认 / 2 完全访问 / 3 每次确认（与 PERM_OPTIONS 顺序一致；序号语义与旧版对齐）
   if (/^[123]$/.test(a)) return PERM_OPTIONS[Number(a) - 1].value
 
-  if (a === 'self_audit' || a === 'audit' || a === 'selfaudit') return 'self_audit'
+  /* ★1034：旧档位 self_audit / 审计 一律映射到 high_only（撤档迁移，不报错） */
+  if (a === 'self_audit' || a === 'audit' || a === 'selfaudit') return 'high_only'
+  if (a === 'high_only' || a === 'highonly' || a === 'high') return 'high_only'
   if (a === 'full_access' || a === 'full' || a === 'fullaccess') return 'full_access'
   if (a === 'confirm' || a === 'ask') return 'confirm'
 
   // 中文（去掉空格便于匹配「完全 访问」这类输入）
   const zh = a.replace(/\s+/g, '')
-  if (zh === '审计' || zh === '审计模式' || zh === '自审计') return 'self_audit'
+  if (zh === '审计' || zh === '审计模式' || zh === '自审计') return 'high_only'   // ★1034 旧名映射
+  if (zh === '仅高危确认' || zh === '高危' || zh === '仅高危') return 'high_only'
   if (zh === '完全访问' || zh === '完全' || zh === '放行') return 'full_access'
   if (zh === '每次确认' || zh === '确认' || zh === '逐次确认') return 'confirm'
 

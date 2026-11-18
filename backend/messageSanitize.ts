@@ -5,18 +5,39 @@
  *  - image_url 空 base64 → 400「url cannot be empty」
  *  - 非图片 mime（svg/bmp/pdf/octet-stream 伪装的 data:）→ 400「图片输入格式/解析错误」
  * 真实截图 PNG/JPEG（含 234KB/698×332 尺寸）均 200。
- * NIS 现行代码不产生 file 块，但 transcript 可从旧数据/外部注入回填 _state.messages，
+ * NiusDream 现行代码不产生 file 块，但 transcript 可从旧数据/外部注入回填 _state.messages，
  * 一旦带病入库，每轮请求都 400 且重试循环全灭（0909 03:51 实锤：6 连败直到轮末）。
  * 故发送前统一消毒：user/toolResult 消息的内容块只保留合法 text/image，
  * 其余替换为文本占位（模型可读、网关可收），并返回被剥离清单供日志定位来源。
  */
 interface SanitizeReport { stripped: string[] }
 
+/* ★1013：上游工具调用标记（<｜｜DSML｜｜ …）识别与剔除 —— 见 upstreamLeak.ts 的模块头注释 */
+import { isUpstreamLeakText, stripUpstreamLeak } from './upstreamLeak.ts'
+
 const IMAGE_MIME_RE = /^image\/(png|jpe?g|webp|gif)$/i
 
 export function sanitizeRequestMessages(messages: any[]): { messages: any[]; report: SanitizeReport } {
   const stripped: string[] = []
   const out = messages.map((m: any) => {
+    /* ★1013（上游工具调用标记泄漏 · 防"自我污染"）——
+       上游没把模型的工具调用解析成结构化调用时，原始标记（<｜｜DSML｜｜ invoke …）会落在 assistant
+       正文里。这条坏消息**留在历史里**的下场是模型照抄自己的坏格式（实测连漏 2~5 轮，不会自愈），
+       所以出站副本里把它整块剔成占位，只留一句"那一步没执行"。
+       ⚠️ 只改**出站副本**：会话里存的原样保留（回看/排查照旧），与上面"孤儿工具结果只剔出站副本"同口径。 */
+    if (m?.role === 'assistant' && Array.isArray(m.content)) {
+      let touchedA = false
+      const contentA = m.content.map((c: any) => {
+        if (!c || c.type !== 'text' || typeof c.text !== 'string') return c
+        if (!isUpstreamLeakText(c.text)) return c
+        const r = stripUpstreamLeak(c.text)
+        if (!r.removed) return c
+        touchedA = true
+        stripped.push(`assistant:上游工具调用标记×${r.removed}行${r.toolNames.length ? `(${r.toolNames.join(',')})` : ''}`)
+        return { ...c, text: r.text }
+      })
+      return touchedA ? { ...m, content: contentA } : m
+    }
     if (!m || (m.role !== 'user' && m.role !== 'toolResult') || !Array.isArray(m.content)) return m
     let touched = false
     const content = m.content.flatMap((c: any) => {

@@ -88,7 +88,7 @@ interface QqStreamFrameOptions {
   inputState: 1 | 10
   /** 首帧响应里拿到的 id；后续帧必须原样带上 */
   streamMsgId?: string
-  /** 正文类型（NIS 现有回推是纯文本，默认 text） */
+  /** 正文类型（NiusDream 现有回推是纯文本，默认 text） */
   contentType?: 'text' | 'markdown'
 }
 

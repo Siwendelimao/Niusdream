@@ -1,7 +1,7 @@
 /**
- * 通道会话映射（QQ / 微信共用）—— `channelKey` ↔ NIS `sessionId`
+ * 通道会话映射（QQ / 微信共用）—— `channelKey` ↔ NiusDream `sessionId`
  *
- * 为什么需要映射：IM 侧的对端标识（QQ openid / 微信 from_user_id）不是 NIS 会话 id，
+ * 为什么需要映射：IM 侧的对端标识（QQ openid / 微信 from_user_id）不是 NiusDream 会话 id，
  * 同一个人连发多条消息必须落到**同一个会话**（否则上下文断裂、右侧栏会刷出一堆会话）。
  *
  * channelKey 组成（对齐官方 per-account-channel-peer 隔离策略）：
@@ -106,6 +106,18 @@ function persist(): void {
   } catch (e) {
     console.error('[channelSessionMap] 落盘失败:', e)
   }
+}
+
+/**
+ * ★1013：让内存映射作废，下次访问重新读盘。
+ *
+ * 为什么必须补这个函数：load() 有内存 cache，而「导入数据包 → 通道与远程接入」会**整份换掉**
+ * 磁盘上的 channels/sessions.json —— 不清 cache 就还是按导入前的旧表列通知目标，
+ * 表现为「界面上明明导入成功了，定时任务的『完成后通知』里却还是选不到微信 / QQ」
+ * （与 channelsStore 的 cache 同一个坑，那边有 invalidateChannelsCache 兜着）。
+ */
+export function invalidateSessionMapCache(): void {
+  cache = null
 }
 
 export function makeChannelKey(channel: string, botId: string, peerId: string): string {

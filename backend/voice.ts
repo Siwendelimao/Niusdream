@@ -11,7 +11,7 @@
  * ⚠️ 与「供应商 / 环境」两套体系的区别：语音模型**只落 `<envDir>/voice/`**，
  *    既不跟"存储目录"（storagePath）走，也不进 `%APPDATA%`——它是本机能力，换机器要重装。
  *
- * 为什么不用 npm 装运行时：NIS 打包版里没有 npm/pnpm，也不该为用户机器装 Node 工具链。
+ * 为什么不用 npm 装运行时：NiusDream 打包版里没有 npm/pnpm，也不该为用户机器装 Node 工具链。
  * 直接把 npm registry 上那两个包（纯 js 包 + 平台 .node/.dll 包）下下来解到本地即可，
  * 目录结构正好命中 sherpa 自己的 `addon-static-import.js` 查找表（`./node_modules/sherpa-onnx-<平台>/sherpa-onnx.node`）。
  */
@@ -515,7 +515,7 @@ interface DlTarget { url: string; dest: string; size: number }
 function httpGet(url: string, redirects = 0): Promise<http.IncomingMessage> {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https:') ? https : http
-    const req = mod.get(url, { headers: { 'User-Agent': 'NIS-Voice/1.0' }, timeout: 30000 }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'NiusDream-Voice/1.0' }, timeout: 30000 }, (res) => {
       const code = res.statusCode || 0
       if (code >= 300 && code < 400 && res.headers.location) {
         res.resume()

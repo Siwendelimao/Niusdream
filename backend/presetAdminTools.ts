@@ -6,15 +6,16 @@
  *
  * 落盘：backend/data/agent-presets/<id>/preset.json（每预设一个文件夹，可拆装）。
  */
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 import { Type as TbType } from 'typebox'
-import { currentLlmConfig } from './providers.ts'
+import { currentLlmConfig, proxiedFetch } from './providers.ts'
+import { buildResponsesRequest, parseResponsesReply } from './responsesProtocol.ts'
 import { validateAgentPreset, readAgentPreset, writeAgentPreset, deleteAgentPreset, PRESETS_DIR } from './agentPresetsStore.ts'
 import { TOOL_CATALOG, type ToolRegistryEntry } from './toolCatalog.ts'
 
 /** 系统提示词组装：与前端 composeSystem 三层结构对齐的精简版（smoke 测试用） */
 function smokeSystem(role: string): string {
-  return `你是 NIS 的一个 Agent。你的角色与专长：${role.trim() || '（未设定）'}`
+  return `你是 NiusDream 的一个 Agent。你的角色与专长：${role.trim() || '（未设定）'}`
 }
 
 /** smoke 运行时检查：用当前全局模型真实调用一次 LLM，验证 role 自洽且可产出 */
@@ -37,6 +38,13 @@ async function smokeTest(preset: { name: string; role: string }): Promise<{ pass
     max_tokens: 500,
   }
   try {
+    if (cfg.protocol === 'openai-responses') {
+      const req = buildResponsesRequest(cfg, smokeSystem(preset.role), body.messages[1].content, 500)
+      const res = await proxiedFetch(cfg.proxyUrl, req.url, { method: 'POST', headers: req.headers, body: req.body, signal: AbortSignal.timeout(30000) })
+      if (!res.ok) return { pass: false, reply: '', detail: `HTTP ${res.status}` }
+      const reply = parseResponsesReply(await res.text()).text.trim()
+      return reply ? { pass: true, reply, detail: `模型 ${cfg.model} 自检通过` } : { pass: false, reply: '', detail: '模型返回空回复' }
+    }
     const res = await fetch(`${cfg.base}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: cfg.apiKey ? `Bearer ${cfg.apiKey}` : '' },
@@ -61,7 +69,7 @@ export function buildPresetAdminTools(getRegistry?: () => ToolRegistryEntry[]): 
   const listToolsTool: AgentTool<any> = {
     name: 'list_tools',
     label: '列出可用工具',
-    description: '列出 NIS 系统中全部可用工具（名称+说明）。创建/修改预设时，预设的 tools 字段只能从这里选择。',
+    description: '列出 NiusDream 系统中全部可用工具（名称+说明）。创建/修改预设时，预设的 tools 字段只能从这里选择。',
     parameters: TbType.Object({}),
     async execute() {
       const cat = listCatalog()

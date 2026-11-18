@@ -12,8 +12,9 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { buildResponsesRequest, parseResponsesReply } from './responsesProtocol.ts'
 import { loadJsonOrBackup, writeJsonAtomic } from './jsonStore.ts'
-import { DPAPI_PREFIX, decryptDpapiBatch, decryptKey, decryptWithPassphrase, encryptDpapi, encryptWithPassphrase, isEncrypted, keyHint, passphraseWeak } from './secretbox.ts'
+import { DPAPI_PREFIX, decryptDpapiBatch, decryptDpapiBatchAsync, decryptKey, decryptWithPassphrase, encryptDpapi, encryptWithPassphrase, isEncrypted, keyHint, passphraseWeak } from './secretbox.ts'
 
 /** ★ 0930 内存解密缓存 —— **这不是可选优化，是必须**：
  *  解密要 spawn 一次 PowerShell（实测 0.3~0.5s），而 currentLlmConfig 是**每次 LLM 调用都走**的热路径。
@@ -83,7 +84,7 @@ export interface ProviderModel {
   outputModalities?: string[]
   /** 特性开关（与模态正交：reasoning=支持思考强度参数，不与 capabilities 的 'reasoning' 字符串混用优先级） */
   supports?: { reasoning?: boolean; vision?: boolean }
-  /** ── 0910 推理挡位按模型声明：该模型接受的思考强度挡位（NIS 内部 id：fast/deep/heavy/burning）。
+  /** ── 0910 推理挡位按模型声明：该模型接受的思考强度挡位（NiusDream 内部 id：fast/deep/heavy/burning）。
    *  缺省（undefined）= 未声明，走 resolveModelEfforts 的兜底推导；[]= 明确"不支持思考"。
    *  用户在 ✎ 编辑面板勾选落库=权威，发送时按此钳位（越界取最近可用挡），前端下拉只列这些挡。 ── */
   efforts?: string[]
@@ -103,7 +104,7 @@ interface ProviderConfig {
   proxyUrl?: string
   /** 0910 协议扩展：请求走哪套适配器。缺省 openai-completions（全站旧行为零变化）。
    *  anthropic-messages / google-generative-ai 用 pi-ai 自带适配器直连官方原生协议。 */
-  protocol?: 'openai-completions' | 'anthropic-messages' | 'google-generative-ai'
+  protocol?: 'openai-completions' | 'openai-responses' | 'anthropic-messages' | 'google-generative-ai'
 }
 
 interface ProviderState {
@@ -128,13 +129,14 @@ interface ProviderState {
 }
 
 import { DATA_ROOT } from './paths.ts'
-import { lookupDevCapsSync, lookupDevCapsBatch } from './modelsDev.ts'
+import { lookupDevCapsSync, lookupDevCapsBatch, listDevProviderCatalog, ensureDevRegistry } from './modelsDev.ts'
+import type { DevCatalogEntry } from './modelsDev.ts'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 
 /* ── 0906 体检 P2#11 修复：供应商配了 proxyUrl 时，拉模型列表/测试连接也走代理
  *  （此前只影响 LLM 主调用，代理供应商拉模型/测连接直连必失败） ── */
 const proxyAgents = new Map<string, ProxyAgent>()
-function proxiedFetch(proxyUrl: string | undefined, url: string, init: any = {}) {
+export function proxiedFetch(proxyUrl: string | undefined, url: string, init: any = {}) {
   if (!proxyUrl) return fetch(url, init)
   let a = proxyAgents.get(proxyUrl)
   if (!a) { a = new ProxyAgent(proxyUrl); proxyAgents.set(proxyUrl, a) }
@@ -144,16 +146,16 @@ function proxiedFetch(proxyUrl: string | undefined, url: string, init: any = {})
 const STATE_FILE = path.join(DATA_ROOT, 'providers.json')
 
 /** 默认供应商表（OpenAI 兼容 base；**全部默认关闭、默认没有模型**）
- *  0917 用户拍板：出厂一律 enabled:false —— 此前 LongCat/DeepSeek/OpenAI/智谱 默认开启，
+ *  0917 需求：出厂一律 enabled:false —— 此前 LongCat/DeepSeek/OpenAI/智谱 默认开启，
  *  新装用户根本没配 Key 却看到「已启用」，一发消息就报「供应商「LongCat」未填写 API Key」
  *  （被误判成「两个后端串台/我没开过 LongCat」）。要用的自己开。
  *  0911 安全修（D1）：LongCat 的出厂默认 Key 不再硬编码——改读环境变量 NIS_LONGCAT_API_KEY。
  *  运行时优先级：用户 providers.json 里保存的 Key（设置页填写）> 环境变量 > 空（不可用）。
- *  ★ 0920 用户拍板（第二条）：**出厂也一律不带预置模型** —— 见下方每个 `models: []` 的注释。
+ *  ★ 0920 需求（第二条）：**出厂也一律不带预置模型** —— 见下方每个 `models: []` 的注释。
  */
 const DEFAULT_PROVIDERS: ProviderConfig[] = [
   /* ★ 0920：出厂模型表全部清空（原来 Agnes 预置 3 个、LongCat 1 个、DeepSeek/OpenAI/智谱/Anthropic 各 2 个）。
-   * 为什么清：全新装好的 NIS 在设置里显示「3 个模型 / 1 个模型」，但那**一个模型都没获取过**，
+   * 为什么清：全新装好的 NiusDream 在设置里显示「3 个模型 / 1 个模型」，但那**一个模型都没获取过**，
    * 用户会以为"我什么都没配，怎么就 3 个模型了"（用户 0919 实测反馈）。
    * 现在的口径：列表里的「N 个模型」只反映**用户自己拉取/添加**的模型 ——
    * 全新安装一律 0；填好 Key 点「获取模型」（或「添加自定义模型」）才开始有。
@@ -174,6 +176,20 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   {
     id: 'opencode-zen', name: 'OpenCode Zen', base: 'https://opencode.ai/zen/v1', enabled: false,
     apiKey: process.env.NIS_OPENCODE_ZEN_API_KEY || 'public',
+    models: [],
+    logo: '/providers-logo/opencode-zen.svg',
+  },
+  /* ★1015（需求）：OpenCode Go 通道（opencode.ai/zen/go/v1，OpenAI 兼容）——
+   * 与上面 Zen 免费档**同一网关**，但走订阅/付费档（模型名不带 -free，如 deepseek-v4.1-flash）。
+   * 1015 实测要点：该端点**要求稳定的会话头**（缺 x-opencode-session 直接 HTTP 400；
+   * 换 session id ⇒ prompt 缓存归零）。NiusDream 经 pi-ai 已在发 session_id /
+   * x-client-request-id / x-session-affinity，实测该端点认它（25 轮跑通、无 400）⇒ 开箱可用。
+   * 官方文档（opencode.ai/docs/go）把它列为"优化路由与 prompt 缓存"的手段，并把 Pi 列为
+   * 「已验证客户端」、把 DeepSeek Harness 列为「Known problematic clients」。
+   * 出厂口径沿用 0920：**不带 Key、不带预置模型**（Key 由用户在设置页自填，"获取模型"再拉）。 */
+  {
+    id: 'opencode-go', name: 'OpenCode Go', base: 'https://opencode.ai/zen/go/v1', enabled: false,
+    apiKey: process.env.NIS_OPENCODE_GO_API_KEY || '',
     models: [],
     logo: '/providers-logo/opencode-zen.svg',
   },
@@ -206,7 +222,7 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
     models: [],
     logo: '/providers-logo/zhipu.png',
   },
-  /* ── 0917：Agnes 拆成国际版 / 国内版两条（用户要求「默认一个国际版一个国内版」）。
+  /* ── 0917：Agnes 拆成国际版 / 国内版两条（需求「默认一个国际版一个国内版」）。
    *  国际版沿用 id 'agnes'（老用户已配的 Key 平滑继承），国内版新 id 'agnes-cn'。
    *  两版模型表相同——同一个网关的不同入口，模型名一致。── */
   {
@@ -256,6 +272,45 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
     id: 'AMD', name: 'AMD', base: 'https://developer.amd.com.cn/radeon/api/v1', enabled: false,
     models: [],
     logo: '/providers-logo/amd.png',
+  },
+  /* ★1116（老板："补齐，错的能不能修正？"）：把前端出厂清单里**后端还没有的 14 家**补齐。
+     为什么必须补：前端 stores/providers.ts 的 DEFAULT_PROVIDERS 才是用户看到的出厂清单（32 家），
+     后端此前只有 18 家 ⇒ 用户点这些家时走 providers.add 现场建档（地址取前端值）、
+     `isBuiltinProvider()` 判假（logo / 抓图守卫与真内置不一致）。两份清单必须逐条一致。
+     地址来源：**2026-11-16 逐家端点实测**（带假 key 打 GET /models + POST /chat/completions）——
+     401/400 = 端点存在且是 OpenAI 兼容口；标注「未实测」的 4 家因本机网络被挡（Cloudflare/超时），
+     按各自官方文档保留，别当成已验证。 */
+  /* 实测 401（端点存在） */
+  { id: 'tongyi', name: '通义千问', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', enabled: false, models: [], logo: '/providers-logo/tongyi.svg' },
+  { id: 'moonshot', name: '月之暗面', base: 'https://api.moonshot.cn/v1', enabled: false, models: [], logo: '/providers-logo/moonshot.svg' },
+  { id: 'stepfun', name: '阶跃星辰', base: 'https://api.stepfun.com/v1', enabled: false, models: [], logo: '/providers-logo/stepfun.png' },
+  { id: 'minimax', name: 'MiniMax', base: 'https://api.minimax.chat/v1', enabled: false, models: [], logo: '/providers-logo/minimax.svg' },
+  /* ★1116 修正：原来叫「魔搭 (ModelScope)」、地址填成通义 dashscope —— id / 名字 / 地址三重错乱。
+     实测 api.deepbricks.ai/v1 返回 401 invalid api key = 真实端点（DeepBricks 是中转站）。 */
+  { id: 'deepbricks', name: 'DeepBricks', base: 'https://api.deepbricks.ai/v1', enabled: false, models: [], logo: '/providers-logo/deepbricks.svg' },
+  /* 未实测（本机被 Cloudflare 挡 403 / 超时），按官方文档：Together / xAI / Perplexity / Mistral */
+  { id: 'together', name: 'Together AI', base: 'https://api.together.xyz/v1', enabled: false, models: [], logo: '/providers-logo/together.png' },
+  { id: 'grok', name: 'xAI (Grok)', base: 'https://api.x.ai/v1', enabled: false, models: [], logo: '/providers-logo/grok.png' },
+  { id: 'perplexity', name: 'Perplexity', base: 'https://api.perplexity.ai', enabled: false, models: [], logo: '/providers-logo/perplexity.svg' },
+  { id: 'groq', name: 'Groq', base: 'https://api.groq.com/openai/v1', enabled: false, models: [], logo: '/providers-logo/groq.png' },
+  { id: 'mistral', name: 'Mistral AI', base: 'https://api.mistral.ai/v1', enabled: false, models: [], logo: '/providers-logo/mistral.png' },
+  /* 实测 401（火山方舟 / 腾讯混元 / 百度千帆 v2 都是官方 OpenAI 兼容口） */
+  { id: 'doubao', name: '豆包 (火山引擎)', base: 'https://ark.cn-beijing.volces.com/api/v3', enabled: false, models: [], logo: '/providers-logo/doubao.png' },
+  /* ★1116 修正：原填 hunyuan.tencentcloudapi.com 是**腾讯云签名 API**（实测返回 200 + MissingParameter 错误体，
+     根本不是 OpenAI 格式）。官方兼容口是 api.hunyuan.cloud.tencent.com/v1（实测 401 Incorrect API key）。 */
+  { id: 'hunyuan', name: '腾讯混元', base: 'https://api.hunyuan.cloud.tencent.com/v1', enabled: false, models: [], logo: '/providers-logo/hunyuan.png' },
+  /* ★1116 修正：原填 aip.baidubce.com/rpc/2.0/... 是**百度老签名接口**（实测 Unsupported openapi method）。
+     千帆 v2 才是 OpenAI 兼容口：qianfan.baidubce.com/v2（实测 401 invalid_iam_token）。 */
+  { id: 'ernie', name: '百度文心', base: 'https://qianfan.baidubce.com/v2', enabled: false, models: [], logo: '/providers-logo/ernie.png' },
+  { id: 'siliconflow', name: '硅基流动', base: 'https://api.siliconflow.cn/v1', enabled: false, models: [], logo: '/providers-logo/siliconflow.png' },
+  /* ★1116：补上 UnifyLLM —— 1115 老板需求的前端出厂条目（frontend/src/stores/providers.ts）**漏了后端**：
+     前端有、后端没有 ⇒ 新装用户在前端点它时走 providers.add 现场创建（地址取前端的值），
+     且 isBuiltinProvider('unifyllm') 为假（logo/抓取守卫行为与内置不一致）。
+     两边清单必须逐条对齐，否则"后端唯一源"就是句空话。 */
+  {
+    id: 'unifyllm', name: 'UnifyLLM', base: 'https://api.unifyllm.top/v1', enabled: false,
+    models: [],
+    logo: '/providers-logo/unifyllm.webp',
   },
 ]
 
@@ -381,6 +436,15 @@ function load(): ProviderState {
         return m
       })
       return { ...def, ...saved, models: savedModels.length > 0 ? savedModels : def.models,
+        /* ★1116：**内置供应商的图标永远取出厂值**（放在 ...saved 之后覆盖它）。
+           存档里的 logo 只可能是两种脏值：
+             ① 历史「获取 logo」抓来的 `data:image/x-icon;base64,…` —— 实测 unifyllm 存档里就是
+                一坨 20KB 的 data URI，把老板给的原图（/providers-logo/unifyllm.webp）整个盖住，
+                这就是「dev 和安装版 logo 都不对」的真正原因；
+             ② 旧版自绘 / 旧扩展名路径（如 unifyllm.svg，1115 换原图时已删）⇒ 404 ⇒ 显示首字母。
+           两种情况都不该赢过出厂表；UI 对内置供应商本来就隐藏了「获取 logo」入口（用户无从主动改它）。
+           顺带好处：体积大的 data URI 不会再滞留在 providers.json 里被 providers.list 反复传输。 */
+        logo: def.logo,
         /* ★1003 批次4 4.33：''（用户**主动清空**）≠ 字段缺失（旧数据升级）—— 原 `saved.apiKey || def.apiKey`
          * 把用户清掉的 key 复活（0925b"空串回落"好意办坏事：请求带着用户以为已删除的 key 出门）。
          * 现在：属性存在就以用户值为准（含空串）；缺失才回落默认表。 */
@@ -471,14 +535,53 @@ export function activeModelId(): string {
   return p.models.find(x => x.enabled !== false)?.id || ''
 }
 
+/** ★1116：**base 形态的唯一口径** —— 各协议下 base 应该长什么样，只在这里定义。
+ *
+ *  为什么要收口：同一件事（"base 带不带版本段"）原来**在 8 处各写一遍判断**
+ *  （本文件取模型/测连接各 2 处、server.ts 标题生成/回访裁决各 2 处），而**真实对话那条路径一处都没做**
+ *  —— base 原样交给 pi-ai，由各家 SDK 自己拼路径。于是：
+ *    · Anthropic SDK 硬编码 POST `/v1/messages`（@anthropic-ai/sdk/resources/messages/messages.js:36）
+ *      ⇒ base 填成官方文档常见的 `https://api.anthropic.com/v1` 就变成 /v1/v1/messages 必 404；
+ *        而"取模型/测连接"因为各自有守卫会显示成功 ⇒ **"测连接通过、一发消息就挂"的确切成因**。
+ *    · Gemini 适配器把 apiVersion 置空（pi-ai google-generative-ai.js:274，注释写明
+ *      "baseUrl already includes version path, don't append"）⇒ base 必须自带版本段，
+ *      否则 /models/xxx:generateContent 少 v1beta。
+ *    · OpenAI 两套协议由 SDK 拼 `{base}/chat/completions`、`{base}/responses`
+ *      ⇒ base 必须是**含**版本段的 API 根，只去尾斜杠。
+ *
+ *  **幂等**：已归一化的值再喂进来不变（所以边界处重复调用安全）。
+ *  **不迁移数据**：providers.json 仍存用户原文，归一化只发生在"拿它发请求/取模型"的那一刻 ——
+ *    用户切换协议后同一份 base 依然可用，存档里也不留改写痕迹。
+ */
+export function endpointBase(base: string, protocol?: ProviderConfig['protocol'] | string): string {
+  let b = String(base || '').trim().replace(/\/+$/, '')
+  if (!b) return ''
+  /* ★1116：**没有协议头时补协议头** —— 这是 URL 的语法必需项，不是猜服务商。
+     来源是实测踩到的真故障（用户反馈 UnifyLLM 第一次填 key 就报
+     `Failed to parse URL from api.unifyllm.top/v1/responses`）：前端出厂预设的 base 是
+     **不带 http(s):// 的写法**（输入框失焦时 normalizeProviderBase 才补），
+     而引导页/取模型/发消息这些路径不经过输入框 ⇒ 裸 base 原样落进 providers.json，
+     后端 fetch 直接抛 "Failed to parse URL"（Node fetch 不接受相对 URL）。
+     判据：本地回环按 http（Ollama 等不开 TLS），其余一律 https。 */
+  if (!/^https?:\/\//i.test(b)) {
+    b = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(b) ? `http://${b}` : `https://${b}`
+  }
+  const proto = protocol || 'openai-completions'
+  // Anthropic：SDK 自己拼 /v1/messages ⇒ 版本段必须剥掉
+  if (proto === 'anthropic-messages') return b.replace(/\/v\d+[a-z]*$/i, '')
+  // Gemini：适配器不补版本段 ⇒ 缺了就补 v1beta（Gemini 当前稳定版本，与 Google SDK 默认一致）
+  if (proto === 'google-generative-ai') return /\/v\d+[a-z]*$/i.test(b) ? b : `${b}/v1beta`
+  return b
+}
+
 /** 当前 LLM 调用配置（provider/base/apiKey/model/proxy/protocol/effort） */
-export function currentLlmConfig(): { providerId: string; providerName: string; base: string; apiKey: string; model: string; proxyUrl: string; protocol: 'openai-completions' | 'anthropic-messages' | 'google-generative-ai'; effort?: string | null } {
+export function currentLlmConfig(): { providerId: string; providerName: string; base: string; apiKey: string; model: string; proxyUrl: string; protocol: 'openai-completions' | 'openai-responses' | 'anthropic-messages' | 'google-generative-ai'; effort?: string | null } {
   const p = activeProvider()
   const model = activeModelId()
   return {
     providerId: p.id,
     providerName: p.name,
-    base: (p.base || '').replace(/\/+$/, ''),
+    base: endpointBase(p.base, p.protocol),
     apiKey: plainKey(p),
     model,
     proxyUrl: (p as any).proxyUrl || '',
@@ -505,7 +608,7 @@ export function setBackgroundModel(providerId: string, modelId: string, effort?:
     调用方看 `configured`：false ⇒ 别调 LLM，直接把 `reason` 报给用户 + 提醒去设置里选。 */
 type BackgroundLlmConfig = {
   providerId: string; providerName: string; base: string; apiKey: string; model: string
-  proxyUrl: string; protocol: 'openai-completions' | 'anthropic-messages' | 'google-generative-ai'
+  proxyUrl: string; protocol: 'openai-completions' | 'openai-responses' | 'anthropic-messages' | 'google-generative-ai'
   effort?: string | null
   /** true = 配好了、可用；false = 未配置 / 所指供应商不存在·被停用·缺 Key（此时各字段为空串） */
   configured: boolean
@@ -527,7 +630,7 @@ export function backgroundLlmConfig(): BackgroundLlmConfig {
   return {
     providerId: p.id,
     providerName: p.name,
-    base: (p.base || '').replace(/\/+$/, ''),
+    base: endpointBase(p.base, p.protocol),
     apiKey: plainKey(p),
     model: bgMid,
     proxyUrl: (p as any).proxyUrl || '',
@@ -609,7 +712,7 @@ export function resolveModelCaps(providerId: string, modelId: string): ModelCaps
 
 
 /* ── 0910 推理挡位按模型声明：全站唯一解析口（前端展示/后端发送共用同一语义）──
- * NIS 内部挡位 id 固定四挡序：fast(Low)<deep(Mid)<heavy(High)<burning(Max)。
+ * NiusDream 内部挡位 id 固定四挡序：fast(Low)<deep(Mid)<heavy(High)<burning(Max)。
  * 优先级：providers.json 显式 efforts（用户在 ✎ 面板勾过=权威）> 网关族兜底推导：
  *  - 非推理模型 → []（无思考概念，前端整个强度入口隐藏，后端不发 reasoning_effort）
  *  - zai 系（bigmodel.cn/api.z.ai）推理模型 → 去 deep（探针实锤 medium 400「始终思考，
@@ -681,14 +784,28 @@ interface SuggestedCaps {
   maxOutput?: number
   /** 来源标签：manual=你已存的手写能力 / dev=models.dev / inferred=名字推断 */
   source: 'manual' | 'dev' | 'inferred'
+  /** ★1022：models.dev 目录价（美元/百万 token）；input/output 全 0 = 官方标免费。
+   *  只做展示/排序提示，不进任何计费口径。 */
+  cost?: { input: number; output: number }
+  /** ★1022b：是否免费 —— **后端算好给前端**，全站唯一口径（别让前端各算一套）：
+   *  ① 目录有明确价格 → input/output 全 0 才算免费；
+   *  ② 目录没这家（自建/中转，如 commandcode.ai）→ 按 id 的免费后缀认：`-free` / `:free`。 */
+  free?: boolean
 }
-function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string, { context?: number; maxOutput?: number }>): SuggestedCaps[] {
+/** 免费后缀：`beam-free`、`minimax/minimax-m3.1-flash:free`（实测 commandcode 用冒号写法）。
+ *  不匹配 freedom / free-tier 这种"free 只是词的一部分"。 */
+const FREE_SUFFIX_RE = /(?:^|[-_:])free$/i
+function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string, { context?: number; maxOutput?: number }>, catalog?: Map<string, DevCatalogEntry>): SuggestedCaps[] {
   const p = state.providers.find(x => x.id === providerId)
   return ids.map(id => {
     const existing = p?.models?.find(x => x.id === id)
     const arr = existing?.capabilities
     const gwCtx = Number(gw?.[id]?.context) || 0
     const gwOut = Number(gw?.[id]?.maxOutput) || 0
+    /* ★1022：目录价单独取（不依赖 modalities —— 有些模型目录里有价、没写模态，
+       免费标记不能因为这个丢）。三种来源（manual/dev/inferred）都带上。 */
+    const cost = catalog?.get(id)?.cost
+    const free = cost ? (cost.input === 0 && cost.output === 0) : FREE_SUFFIX_RE.test(id)
     if (existing && ((existing.inputModalities) || (existing.supports) || (arr && arr.length))) {
       const c = resolveModelCaps(providerId, id) // manual：直接取权威解析
       return {
@@ -697,6 +814,8 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
         context: existing.maxContext || gwCtx || undefined,
         maxOutput: existing.maxOutput || gwOut || undefined,
         source: 'manual' as const,
+        ...(cost ? { cost } : {}),
+        free,
       }
     }
     const dev = lookupDevCapsSync(id, providerId)
@@ -711,6 +830,8 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
         context: gwCtx || dev.context,
         maxOutput: gwOut || dev.maxOutput,
         source: 'dev' as const,
+        ...(cost ? { cost } : {}),
+        free,
       }
     }
     return {
@@ -722,6 +843,8 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
       context: gwCtx || undefined,
       maxOutput: gwOut || undefined,
       source: 'inferred' as const,
+      ...(cost ? { cost } : {}),
+      free,
     }
   })
 }
@@ -817,7 +940,7 @@ export function sealPortableKeys(json: any, passphrase: string): { sealed: numbe
   /* ★ 0930 自测抓到：口令太弱时 encryptWithPassphrase 会抛错，而下面那个 catch 会把它**静默吞掉**
      （只 failed.push）—— 结果包照样导出成功、密钥却没带上，用户还以为带上了。
      所以弱口令必须在**入口**就硬拒，让用户当场知道，而不是等包做完才发现。*/
-  /* ★1011（老大要求）：弱口令不再拦截 —— 照常加密进包，风险由前端强度条明确提示。
+  /* ★1011（需求）：弱口令不再拦截 —— 照常加密进包，风险由前端强度条明确提示。
      （旧行为：弱口令直接 throw ⇒ 这两份密钥整个不进包 ⇒ 用户填了口令却没带密钥，还没提示。） */
   const failed: string[] = []
   let sealed = 0
@@ -872,7 +995,8 @@ const revealedCache = new Map<string, { apiKey: string; locked: boolean }>()
  *  病根见 secretbox.decryptDpapiBatch 头注：逐把解 = 每把一次 powershell.exe（本机实测 ~565ms），
  *  16 把 ≈ **9 秒**，且 execFileSync 同步阻塞事件循环 ⇒ 前端 3s ping 超时 ⇒ 界面按"未连接"渲染
  *  （用户 1004 实报"一打开 CPU 就 100%，供应商信息也没了"）。批量后 16 把 = 1 次 spawn ≈ 0.6s。 */
-function warmRevealedCache(): void {
+/** 需要预热哪些（缓存里没有的 dpapi 密文）—— 同步/异步两个入口共用同一份收集逻辑 */
+function needRevealWarm(): Array<{ sealed: string; name: string }> {
   const need: Array<{ sealed: string; name: string }> = []
   for (const p of state.providers) {
     const s = p.apiKey
@@ -880,8 +1004,11 @@ function warmRevealedCache(): void {
     if (!s.startsWith(DPAPI_PREFIX)) continue      // 明文老数据 / pwd 口令副本走各自的单条路径
     need.push({ sealed: s, name: p.name || p.id })
   }
-  if (!need.length) return
-  const res = decryptDpapiBatch(need.map(n => n.sealed))
+  return need
+}
+
+/** 把批量解密结果填进缓存 —— 同步/异步两个入口共用（同一套"瞬时失败不缓存"口径） */
+function applyRevealedResults(need: Array<{ sealed: string; name: string }>, res: Array<any>): void {
   need.forEach((n, i) => {
     const r = res[i]
     if (r && r.ok) {
@@ -890,16 +1017,45 @@ function warmRevealedCache(): void {
       if (owner) plainKeyCache.set(owner.id, r.value || '')   // 顺手喂热路径缓存，别让发送链路再解一次
     } else if (r?.transient) {
       /* ★1005 诚实性修复：**瞬时故障不许进永久缓存** ——
-         原来无论什么原因失败都写 `{locked:true}` 且**没有任何失效路径** ⇒ 一次 PowerShell 抖动就
-         让**全进程所有 key 显示"解不开"**（看起来跟"密钥全丢"一模一样），只有重启后端才能恢复。
-         现在：只记日志、不缓存 ⇒ 下次 providers.list 自动重试。
-         （真解不开的 key 会由 decryptDpapiBatch 以 transient:false 报回，只有那条才配得上"永久解不开"语义。） */
+         原来无论什么原因失败都写 locked:true 且**没有任何失效路径** ⇒ 一次子进程抖动就
+         让全进程所有 key 显示"解不开"（看起来跟"密钥全丢"一模一样），只有重启后端才能恢复。
+         现在：只记日志、不缓存 ⇒ 下次 providers.list 自动重试。 */
       console.warn(`[providers] 「${n.name}」的 API Key 本次批量解密失败（瞬时故障，未缓存，下次会重试）：${r.reason || '未知'}`)
     } else {
       revealedCache.set(n.sealed, { apiKey: '', locked: true })
       console.warn(`[providers] 「${n.name}」的 API Key 在本机解不开：${r?.reason || '未知'}（换机导入属预期）`)
     }
   })
+}
+
+/** 同步预热（运行期热路径用：那时缓存基本已热，不会真的拉进程） */
+function warmRevealedCache(): void {
+  const need = needRevealWarm()
+  if (!need.length) return
+  applyRevealedResults(need, decryptDpapiBatch(need.map(n => n.sealed)))
+}
+
+/** ★P114：**异步预热** —— 启动时调它，2~3 秒的子进程编译不再冻住整个后端。
+ *  同一时刻只跑一份（Promise 复用）；首屏 RPC 先 await 它，拿到的是热缓存，不会重复拉进程。
+ *  失败不缓存 Promise（置回 null），下次调用重试 —— 与"瞬时失败不进永久缓存"同一口径。 */
+let _keysWarmPromise: Promise<void> | null = null
+export function ensureProviderKeysWarmed(): Promise<void> {
+  if (_keysWarmPromise) return _keysWarmPromise
+  _keysWarmPromise = (async () => {
+    try {
+      const need = needRevealWarm()
+      if (!need.length) return
+      const t0 = Date.now()
+      const res = await decryptDpapiBatchAsync(need.map(n => n.sealed))
+      applyRevealedResults(need, res)
+      const ms = Date.now() - t0
+      if (ms > 500) console.log(`[providers] 密钥异步预热完成：${need.length} 把 / ${ms}ms（期间未阻塞事件循环）`)
+    } catch (e: any) {
+      console.warn('[providers] 密钥异步预热失败（不缓存，下次调用重试）：', String(e?.message || e))
+      _keysWarmPromise = null
+    }
+  })()
+  return _keysWarmPromise
 }
 
 /** ★ 0930（B 方案）：providers.list 回填前端时用 —— 返回**明文**，前端交互一点不变。
@@ -1091,9 +1247,9 @@ function httpStatusHint(status: number): string {
   }
 }
 
-/** ★ 0930：失败时把**供应商自己说的原因**捞出来透传 —— 它比 NIS 的任何猜测都准。
+/** ★ 0930：失败时把**供应商自己说的原因**捞出来透传 —— 它比 NiusDream 的任何猜测都准。
  *  实测（tokenrhythm.studio，key 失效时）：`{"code":"UNAUTHORIZED","message":"未认证或登录已过期"}`
- *  「未认证或登录已过期」这句原话，正是当时 NIS 报 CORS、把人带偏的真正原因。 */
+ *  「未认证或登录已过期」这句原话，正是当时 NiusDream 报 CORS、把人带偏的真正原因。 */
 async function readErrSnippet(res: any): Promise<string> {
   try {
     const raw = await res.text()
@@ -1114,18 +1270,20 @@ export async function fetchModelsRemote(providerId: string): Promise<{ ok: boole
   if (!p) return { ok: false, models: [], caps: [], msg: '供应商不存在' }
   if (!p.apiKey) return { ok: false, models: [], caps: [], msg: '未填 API Key' }
   const key = plainKey(p)                                                    // ★ 0930 加密后取明文（解不开会抛明确错，不会静默发空 key）
-  const base = (p.base || '').replace(/\/+$/, '')
   const proto = p.protocol || 'openai-completions'
+  // ★1116：取模型与真实对话**用同一个 base 口径**（原来各自一套守卫 → "取得到模型、发不出消息"）
+  const base = endpointBase(p.base, proto)
   try {
+    /* ★1022d：确保 models.dev 快照就绪 —— 候选清单虽然只信官方 /models，
+       但价格/免费标记要读目录，没有快照就只剩后缀推断。 */
+    await ensureDevRegistry()
     let ids: string[] = []
     /** 0923：网关亲口给的上限（context_length / max_completion_tokens 等），有就优先用 */
     let gw: Record<string, { context?: number; maxOutput?: number }> = {}
     if (proto === 'anthropic-messages') {
       // Anthropic 原生 /v1/models：x-api-key + anthropic-version；返回 {data:[{id,display_name}]}
-      // 0910 反馈12：base 已带版本段（https://api.anthropic.com/v1，用户照官方文档填的常见形态）时
-      // 不能再拼 /v1（旧实现拼出 /v1/v1/models 必 404 → 前端静默降级成"本地表 + OpenRouter"列表，
-      // 用户看到"anthropic 协议也能取到模型"的假象）。与 testConnection 同一守卫。
-      const root = /\/v\d/.test(base) ? base : `${base}/v1`
+      // ★1116：base 已由 endpointBase 剥掉版本段（SDK 契约），这里直接拼 /v1。
+      const root = `${base}/v1`
       const res = await proxiedFetch(p.proxyUrl, `${root}/models?limit=100`, {
         headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
       })
@@ -1135,8 +1293,8 @@ export async function fetchModelsRemote(providerId: string): Promise<{ ok: boole
       gw = readGatewayLimits(j.data || [])
     } else if (proto === 'google-generative-ai') {
       // Gemini 原生 list models：x-goog-api-key；返回 {models:[{name:'models/xxx'}]}
-      // base 约定含版本段（如 https://generativelanguage.googleapis.com/v1beta），与 pi-ai 适配器一致
-      const root = /\/v\d/.test(base) ? base : `${base}/v1beta`
+      // ★1116：base 已由 endpointBase 保证含版本段（pi-ai 适配器 apiVersion="" 的约定）。
+      const root = base
       const res = await proxiedFetch(p.proxyUrl, `${root}/models?pageSize=200`, { headers: { 'x-goog-api-key': key } })
       if (!res.ok) return { ok: false, models: [], caps: [], msg: `${httpStatusHint(res.status)}（获取模型端点：${root}/models）${await readErrSnippet(res)}` }
       const j = await res.json()
@@ -1164,37 +1322,49 @@ export async function fetchModelsRemote(providerId: string): Promise<{ ok: boole
     ids = uniq
     // 0907：实时拉 models.dev 快照（失败静默降级到名字推断），再按来源优先级给每个候选模型出建议能力
     try { await lookupDevCapsBatch(ids, providerId) } catch { /* 无网络/超时→下面 suggestCaps 自动走 inferred */ }
-    const caps = suggestCapsForIds(providerId, ids, gw)
+    /* ★1022d（需求"口径 2"）：候选清单**只信官方 /models**。
+       models.dev 目录退到旁边做工（只补价格 / 免费标记），不再往里塞模型 ——
+       因为目录会混进网关已摘或已下架的条目（实测 longcat-2.5-preview-free：目录有、网关 402，
+       官网文档却还写着"套餐包含"）。少极个别真想要的，用户自己「添加模型」手动加就行。 */
+    const catMap = new Map(listDevProviderCatalog(providerId).map(c => [c.id, c]))
+    const caps = suggestCapsForIds(providerId, ids, gw, catMap)
     return { ok: true, models: ids, caps, msg: `拉取到 ${ids.length} 个模型` }
   } catch (e: any) {
     return { ok: false, models: [], caps: [], msg: `无法连接：${e?.message || e}` }
   }
 }
 
-/** 代理测试连接（发 1-token 最小请求，按协议选端点） */
+/** 代理测试连接（按协议选端点；Responses 输出预算最小 16，其它沿用旧值） */
+/* ★1027g：OpenCode 网关的会话头已抽到独立模块（providers 与 responsesProtocol 都要用，避免循环依赖）。
+   server.ts 从这里再导出，保持既有 import 不变。 */
+import { opencodeGatewayHeaders } from './opencodeGateway.ts'
+export { opencodeGatewayHeaders }
+
+
 export async function testConnectionRemote(providerId: string, modelId?: string): Promise<{ ok: boolean; msg: string }> {
   const p = state.providers.find(x => x.id === providerId)
   if (!p) return { ok: false, msg: '供应商不存在' }
   if (!p.apiKey) return { ok: false, msg: '该供应商未填写 API Key' }
   const key = plainKey(p)                                                    // ★ 0930 同 fetchModelsRemote：解不开就抛明确错
   const model = modelId || activeModelId()
-  const base = (p.base || '').replace(/\/+$/, '')
   const proto = p.protocol || 'openai-completions'
+  // ★1116：与取模型、真实对话同一口径（原来这里自己一套守卫，导致"测连接通过但发文 404"）
+  const base = endpointBase(p.base, proto)
 
   const build = (): { url: string; headers: Record<string, string>; body: string } => {
+    if (proto === 'openai-responses') return buildResponsesRequest({ base, model, apiKey: key }, '', 'ping', 16)
     if (proto === 'anthropic-messages') {
-      // Anthropic 原生：/v1/messages + x-api-key + anthropic-version
+      // Anthropic 原生：/v1/messages + x-api-key + anthropic-version（base 已剥版本段）
       return {
-        url: /\/v\d/.test(base) ? `${base}/messages` : `${base}/v1/messages`,
+        url: `${base}/v1/messages`,
         headers: { 'content-type': 'application/json', 'x-api-key': key!, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] }),
       }
     }
     if (proto === 'google-generative-ai') {
-      // Gemini 原生：{base}/models/{model}:generateContent + x-goog-api-key
-      const root = /\/v\d/.test(base) ? base : `${base}/v1beta`
+      // Gemini 原生：{base}/models/{model}:generateContent + x-goog-api-key（base 已含版本段）
       return {
-        url: `${root}/models/${encodeURIComponent(model)}:generateContent`,
+        url: `${base}/models/${encodeURIComponent(model)}:generateContent`,
         headers: { 'content-type': 'application/json', 'x-goog-api-key': key! },
         body: JSON.stringify({ contents: [{ parts: [{ text: 'ping' }] }] }),
       }
@@ -1202,7 +1372,7 @@ export async function testConnectionRemote(providerId: string, modelId?: string)
     // base 已是「含版本前缀」的 API 根（如 /v1、/v4），直接拼 /chat/completions（不再二次拼 /v1）
     return {
       url: `${base}/chat/completions`,
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...opencodeGatewayHeaders(base) },
       body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
     }
   }
@@ -1210,13 +1380,23 @@ export async function testConnectionRemote(providerId: string, modelId?: string)
   const attempt = async (): Promise<{ ok: boolean; msg: string; aborted?: boolean }> => {
     const { url, headers, body } = build()
     const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), 10000)
+    /* ★1117：超时 10s → 30s。原来的 10 秒对慢站（实测 UnifyLLM 的 gpt-6.1-sol
+       单次请求 3.4~57 秒、还出现过 >120s）必然超时，用户只看到一句英文
+       「This operation was aborted」，既不知道是超时也不知道该等多久。
+       30 秒覆盖绝大多数慢站；真超时也要说人话（见下面的 catch）。 */
+    const timeoutMs = 30000
+    const t = setTimeout(() => ctrl.abort(), timeoutMs)
     try {
       const t0 = Date.now()
       const res = await proxiedFetch(p.proxyUrl, url, { method: 'POST', headers, body, signal: ctrl.signal })
-      clearTimeout(t)
       const ms = Date.now() - t0
-      if (res.ok) return { ok: true, msg: `连通（${model} · ${ms}ms）` }
+      if (res.ok) {
+        if (proto === 'openai-responses') {
+          const raw = await res.text()
+          parseResponsesReply(raw)
+        }
+        return { ok: true, msg: `连通（${model} · ${ms}ms）` }
+      }
       if (res.status === 401 || res.status === 403) {
         /* ★ 0925e：透传服务端真实原因 —— FreeTierError"仅限 OpenCode 客户端内"/
          * RegionError"地区不可用"/key 无效是三种完全不同的病，原来一刀切报
@@ -1242,9 +1422,19 @@ export async function testConnectionRemote(providerId: string, modelId?: string)
       }
       return { ok: false, msg: `返回 ${res.status}` }
     } catch (e: any) {
-      clearTimeout(t)
       const am = String(e?.message || e)
-      return { ok: false, msg: `无法连接：${am}`, aborted: /aborted|timeout/i.test(am) }
+      const aborted = /abort|timeout/i.test(am)
+      /* ★1117：超时说人话。原样透传 Node 的 "This operation was aborted" 等于没说 ——
+         用户既不知道是超时、也不知道超了多少、更不知道该等还是该换。 */
+      return {
+        ok: false,
+        msg: aborted
+          ? `测连接超时：${timeoutMs / 1000} 秒内没有响应（该供应商响应慢，或网络/代理不通）`
+          : `无法连接：${am}`,
+        aborted,
+      }
+    } finally {
+      clearTimeout(t)
     }
   }
 
@@ -1258,7 +1448,7 @@ export async function testConnectionRemote(providerId: string, modelId?: string)
   return r1
 }
 
-/* ── ★ 0925e（需求要求"打开 NIS 自动获取 zen 的 free 模型"）────────────────────────
+/* ── ★ 0925e（需求要求"打开 NiusDream 自动获取 zen 的 free 模型"）────────────────────────
  * 启动后自动同步 OpenCode Zen 公共档的免费模型：
  *   /models 筛 -free 后缀 → 逐个 1-token 探活 → **只把活着的**合入模型表（enabled）。
  * 已入库但探活挂的置 enabled:false —— 免费档按周轮换、热门款挂"仅限 OpenCode 客户端"闸，

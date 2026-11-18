@@ -61,12 +61,12 @@ function ctxAddToolText(
 /** 图片块的字符当量（≈900 token）：base64 长度 ≠ token 数，按固定当量粗算，总比算 0 强 */
 const CTX_IMAGE_CHAR_EQUIV = 2000
 /** 单条消息总字符（供压缩阈值估算 estimateMsgTokens 用；分布明细另用 ctxMsgBuckets 分栏）
- *  ★ 0921 修（实测）：原来只认 NIS 自己产的块名 text/thinking/toolCall/toolResult，
+ *  ★ 0921 修（实测）：原来只认 NiusDream 自己产的块名 text/thinking/toolCall/toolResult，
  *  而**从别的 Agent 导入的会话**块名是 anthropic 风格 reasoning/tool_use/tool_result（+image）
  *  → 203 个 tool_use + 169 个 reasoning + 203 个 tool_result 全被算成 0：
  *  同一会话估算 22,777 token / 供应商实收 655,955 token，**少算 28.8 倍**。
  *  后果：① 圆环显示 10% 让人误以为安全；② 压缩判断只看到 2% 永远不触发 → 直接撞 400。
- *  这里补齐两套命名（NIS 原生 + anthropic），image 按固定当量计。 */
+ *  这里补齐两套命名（NiusDream 原生 + anthropic），image 按固定当量计。 */
 /* ★0926 降负提速「少算」（B1/B2）：估算结果缓存 —— 治"每请求全量重扫 4~5 遍"（DSH tokenMeter 增量 fold 同款思路）。
  *  ① 消息级：key=content **数组引用**（整体替换=WeakMap 自动失效）；value 带「数组长度+块类型串」双校验
  *     （push/splice 原地改 → 校验不符 → 重算；块文本原地改且长度不变的极端情况残留极小误差，会被 usage 锚点拉回）。

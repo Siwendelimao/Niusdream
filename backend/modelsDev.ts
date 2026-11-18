@@ -1,7 +1,7 @@
 /**
  * models.dev 集成（0907 供应商 C 方案）——社区模型能力"答案卷"，opencode/Hermes/ZCode 同源。
  *
- * - 每次"获取模型"实时拉 https://models.dev/api.json（用户拍板：实时优先，非缓存）
+ * - 每次"获取模型"实时拉 https://models.dev/api.json（需求：实时优先，非缓存）
  * - 按 modelId 查 { input[], output[], context }；provider 内命中优先（id 精确），再全局兜底
  * - 网络失败/超时 → 返回 null，调用方降级到名字推断（绝不阻塞、不抛错）
  * - 仅作"建议能力 + 列表默认勾选"来源，resolveModelCaps 里排在"显式 capabilities"之后
@@ -29,9 +29,23 @@ interface DevModelCaps {
 }
 
 interface RawModel {
+  name?: string
   modalities?: { input?: string[]; output?: string[] }
   limit?: { context?: number; output?: number }
   reasoning?: boolean
+  /** ★1022：models.dev 的价格（美元/百万 token）。input/output 全 0 = 官方标免费 */
+  cost?: { input?: number; output?: number }
+}
+
+/** ★1022：目录条目（"池子里有什么"）——与「能力建议」分开：能力靠 modalities，池子只靠存在性 + 价格 */
+export interface DevCatalogEntry {
+  id: string
+  name?: string
+  cost?: { input: number; output: number }
+  /** models.dev 状态：'deprecated' = 目录侧标为下架。
+   *  ★1022d 口径 2 之后它**不参与候选过滤**（候选只信官方 /models）；保留字段仅作信息/未来展示用。
+   *  别拿它当"已下架"的断言 —— 实测与官网文档矛盾（longcat-2.5-preview-free）。 */
+  status?: string
 }
 interface RawRegistry { [providerId: string]: { models?: Record<string, RawModel> } }
 
@@ -43,7 +57,7 @@ let curRegistry: RawRegistry | null = null
 let aggIndex: Map<string, DevModelCaps> | null = null
 let lastFetchAt = 0
 let inflight: Promise<boolean> | null = null
-// 用户拍板"实时拉"：仅 60s 内的连续查询共享同一次拉取（一次 fetchModels 多模型不重复下载）
+// 需求"实时拉"：仅 60s 内的连续查询共享同一次拉取（一次 fetchModels 多模型不重复下载）
 const MEM_TTL = 60_000
 const norm = (s: string) => s.toLowerCase().replace(/[_\s]+/g, '-')
 
@@ -197,7 +211,43 @@ export function lookupDevCapsSync(modelId: string, preferProviderId?: string): D
   return capsFromRegistry(modelId, preferProviderId)
 }
 
+/** ★1022（需求："池子里有就要让他进来，用不用是用户的事"）：
+ *  列出某个供应商在 models.dev 目录里的**全部模型**（含官方 /models 端点没列的：目录残留、
+ *  区域未开放、已下架……都算"池子里有"）。只读内存快照，不碰网络。
+ *  目录里没这家（自建/中转站）→ 返回 []，调用方行为不变。
+ *
+ *  ⚠️ 这里只回答"有没有"，不回答"能不能调通"——可用性由使用方（用户）决定，
+ *  调用失败时供应商自己会报原因，NiusDream 不替平台做预筛。 */
+export function listDevProviderCatalog(providerId: string): DevCatalogEntry[] {
+  const reg = curRegistry
+  if (!reg || !providerId) return []
+  // 供应商 id 偶有大小写/下划线差异（opencode-go / opencode_go）：精确命中优先，再归一化兜底
+  const key = reg[providerId] ? providerId : Object.keys(reg).find(k => norm(k) === norm(providerId))
+  const models = key ? reg[key]?.models : undefined
+  if (!models) return []
+  const out: DevCatalogEntry[] = []
+  for (const id of Object.keys(models)) {
+    const m = models[id]
+    const inp = typeof m?.cost?.input === 'number' ? m.cost.input : NaN
+    const outp = typeof m?.cost?.output === 'number' ? m.cost.output : NaN
+    const hasCost = m?.cost && (Number.isFinite(inp) || Number.isFinite(outp))
+    out.push({
+      id,
+      ...(typeof m?.name === 'string' ? { name: m.name } : {}),
+      ...(hasCost ? { cost: { input: Number.isFinite(inp) ? inp : 0, output: Number.isFinite(outp) ? outp : 0 } } : {}),
+      ...(typeof m?.status === 'string' ? { status: m.status } : {}),
+    })
+  }
+  return out
+}
 
+
+
+/** ★1022：确保 models.dev 快照可用（TTL 内不重复拉网络）。
+ *  用途：官方 /models 失败的兜底路径也要能读到目录，否则刚启动/断网时"池子"是空的。 */
+export async function ensureDevRegistry(): Promise<void> {
+  try { await refreshDevRegistry(false) } catch { /* 拉不到就用现有快照（可能为空） */ }
+}
 
 /** 批量（获取模型弹窗）：一次刷新 + 逐个查 */
 export async function lookupDevCapsBatch(modelIds: string[], providerId?: string): Promise<Record<string, DevModelCaps>> {

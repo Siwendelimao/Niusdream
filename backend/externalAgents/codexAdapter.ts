@@ -1,5 +1,5 @@
-/* codexAdapter.ts —— 外部预设打样：codex exec --json 事件流 → NIS 契约（骨架版 1001）
- * 图纸：D:\nis0924\docs\外部预设-codex事件映射-1001.md（含实测修正）
+/* codexAdapter.ts —— 外部预设打样：codex exec --json 事件流 → NiusDream 契约（骨架版 1001）
+ * 图纸：<dev仓库>\docs\外部预设-codex事件映射-1001.md（含实测修正）
  * 纪律：spawn stdin 必须 'ignore'（否则 codex 干等输入）；windowsHide；shell:false；超时杀进程。
  * 记账口径：usage 只记 codex 自报的量，进 token 面板标「外部口径」。
  */
@@ -8,18 +8,17 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { EXT_AGENTS_DIR } from './registry.ts'
 
-const FALLBACK_CODEX_BIN = 'D:\\nis0924\\toolchain\\codex\\codex_cli_bin\\bin\\codex.exe'
-
-/** ★1001：优先用「外部 agent 安装器」装到固定文件夹的 codex（external-agents\codex\）；
- *  找不到再回落手工安装的 toolchain 路径。 */
-export function resolveCodexBin(): string {
+/** ★1001：只认「外部 agent 安装器」装到固定文件夹并记账的 codex（external-agents\codex\）。
+ *  ★开源整理批：删掉原来写死的回落路径（`<dev仓库>\toolchain\codex\...`）—— 那是作者本机路径，
+ *  别人机器上 spawn 必然 ENOENT，还会把"根本没装"伪装成"跑失败"。找不到就返回 null，由调用方明说。 */
+export function resolveCodexBin(): string | null {
   try {
     const j = JSON.parse(fs.readFileSync(path.join(EXT_AGENTS_DIR, 'codex', 'install.json'), 'utf8'))
     if (j?.entry && fs.existsSync(String(j.entry))) return String(j.entry)
   } catch { /* 未装/账本缺失 */ }
-  return FALLBACK_CODEX_BIN
+  return null
 }
-/** 归一事件（NIS 侧消费的最小契约面） */
+/** 归一事件（NiusDream 侧消费的最小契约面） */
 type NisExternalEvent =
   | { kind: 'turn_start'; threadId?: string }
   | { kind: 'text'; text: string }                                   // agent_message → 正文
@@ -101,10 +100,10 @@ interface CodexTurnOpts {
   threadId?: string          // 有则 resume 续聊（exec resume <id>）
   resumeLast?: boolean       // 或 --last
   model?: string             // -m
-  apiKey?: string            // 跟随NIS档：CODEX_API_KEY 内联给本次运行
+  apiKey?: string            // 跟随NiusDream档：CODEX_API_KEY 内联给本次运行
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   timeoutMs?: number         // 默认 10min 硬上限（cancel 兜底同款口径）
-  extraEnv?: Record<string, string>   // 跟随NIS档：CODEX_HOME（自定义服务商配置）/ 服务商 env_key 钥匙
+  extraEnv?: Record<string, string>   // 跟随NiusDream档：CODEX_HOME（自定义服务商配置）/ 服务商 env_key 钥匙
   ignoreRules?: boolean      // 跳过 execpolicy .rules（Windows 上默认策略会拦 shell 命令，1001 实测）
   signal?: AbortSignal       // 取消（session.cancel → 杀子进程）
 }
@@ -112,6 +111,8 @@ interface CodexTurnOpts {
 /** 跑一轮 codex，事件流逐行翻译后回调。返回线程 id 与最终 ok。 */
 export function runCodexTurn(opts: CodexTurnOpts, onEvent: (e: NisExternalEvent) => void): Promise<{ ok: boolean; threadId?: string; reason?: string }> {
   return new Promise((resolve) => {
+    const bin = resolveCodexBin()
+    if (!bin) { resolve({ ok: false, reason: '未检测到 codex：请先在 设置 → 外部 Agent 里安装（不再假定某个写死的安装路径）' }); return }
     const args: string[] = []
     if (opts.threadId) args.push('exec', 'resume', opts.threadId)
     else if (opts.resumeLast) args.push('exec', 'resume', '--last')
@@ -123,9 +124,9 @@ export function runCodexTurn(opts: CodexTurnOpts, onEvent: (e: NisExternalEvent)
     args.push(opts.prompt)
 
     const env = { ...process.env }
-    if (opts.apiKey) env.CODEX_API_KEY = opts.apiKey   // 跟随NIS档；不给=用它自己的登录态
+    if (opts.apiKey) env.CODEX_API_KEY = opts.apiKey   // 跟随NiusDream档；不给=用它自己的登录态
     if (opts.extraEnv) Object.assign(env, opts.extraEnv)
-    const child = spawn(resolveCodexBin(), args, {
+    const child = spawn(bin, args, {
       windowsHide: true,     // 弹窗纪律（0930 硬规矩）
       shell: false,
       env,

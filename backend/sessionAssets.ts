@@ -88,6 +88,21 @@ export class SessionAssetStore {
     return ref
   }
 
+  /** ★1030r-fix：**内存态图片 → ref**（幂等，内容寻址天然去重）。
+   *  为什么需要它：磁盘上 image 块是 `{type:'image', asset:'<sha>'}`（stripSessionAssets 写盘时改写），
+   *  而**内存**里是 `{type:'image', data:'<纯 base64>', mimeType}`（restoreSessionAssets 还原态，
+   *  没有 asset 字段）⇒ 只判 `c.asset` 在运行时**永远不成立**（实测 101 轮 prompt.images 全空）。
+   *  `data` 可以是 data URL 或纯 base64；写盘失败返回 null（调用方保留原值，不造悬空引用）。 */
+  ensureFromBase64(mime: string, data: string): string | null {
+    const s = String(data || '')
+    if (!s) return null
+    const m = s.match(/^data:([^;]+);base64,([\s\S]+)$/)
+    const mime2 = m ? m[1] : String(mime || 'image/png')
+    const b64 = (m ? m[2] : s).replace(/\s+/g, '')
+    if (!b64) return null
+    return this.save(b64, mime2)
+  }
+
   /** ref → { base64, mime }；非法 ref 或读失败返回 null */
   read(ref: string): { b64: string; mime: string } | null {
     const p = parseRef(ref)

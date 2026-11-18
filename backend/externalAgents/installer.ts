@@ -1,6 +1,6 @@
 /* installer.ts —— ★1001 外部 agent 可拆装安装器（类似"软件环境"的安装/卸装）
  * 装：按配方渠道序尝试（GitHub Releases → PyPI/npm 备用；本机 GitHub CDN 间歇被墙会自动落备用渠道），
- *     解包到 NIS 根目录\external-agents\<id>\，扫描入口二进制 → install.json 记账 → 注册预设（可拆装）。
+ *     解包到 NiusDream 根目录\external-agents\<id>\，扫描入口二进制 → install.json 记账 → 注册预设（可拆装）。
  * 拆：删安装目录 + 删注册的预设（一键还原干净）。
  * 进度：live 带 percent（下载按字节报真进度；pip 无总量走阶段文案）；UI 轮询 externalAgents.list。
  * 凭据（★1001二批）："用它的 API"档：① 登录（spawn 它自己的 login，浏览器 OAuth）② 直填 API Key
@@ -373,13 +373,13 @@ export function startInstall(id: string): { ok: boolean; error?: string } {
           const version = ch.kind === 'github-release' ? 'latest' : ch.kind === 'pypi-pip' ? 'PyPI 最新' : 'npm 最新'
           fs.writeFileSync(path.join(dir, 'install.json'), JSON.stringify({
             id, version, channel: ch.kind, entry, installedAt: Date.now(),
-            note: '由 NIS 外部 agent 安装器落盘；卸载=删本目录+删预设',
+            note: '由 NiusDream 外部 agent 安装器落盘；卸载=删本目录+删预设',
           }, null, 2), 'utf8')
           /* 以我们可用的格式接入：注册预设（可拆装——卸载一并删）。
              role 必填（后端校验"role 不能为空"）：外部 agent 的人设由它自己决定，这里如实备注。 */
           const reg = writeAgentPreset({
             id, name: recipe.name, description: recipe.desc,
-            role: `（外部 agent「${recipe.name}」：能力与人设由它自己的配置决定，NIS 负责调度与显示。）`,
+            role: `（外部 agent「${recipe.name}」：能力与人设由它自己的配置决定，NiusDream 负责调度与显示。）`,
             avatar: EXT_LOGOS[id],   // ★1001：预设头像=它应用的 logo
             engine: recipe.engine as any, modelSource: 'nis', builtin: false,
           })

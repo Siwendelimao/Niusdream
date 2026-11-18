@@ -2,7 +2,7 @@
  * 背景（实测"从设置/浏览器页启动浏览器会弹一个命令行窗"，已抓现行）：
  *   playwright 拉起的 `chrome-headless-shell.exe` 是【控制台子系统】的 exe，而 playwright-core
  *   的 spawnOptions 不带 windowsHide ⇒ 后端主进程没有控制台，每次拉起都会弹一个可见控制台窗
- *   （Windows Terminal 标签=exe 全路径，即截图里被截断的 `D:\nis0924\backend\data\env…`）。
+ *   （Windows Terminal 标签=exe 全路径，即截图里被截断的 `<dev仓库>\backend\data\env…`）。
  * 做法：node_modules 不可持久改（重装/升级即丢），于是在进程入口给 child_process 全家上兜底——
  *   凡没显式指定 windowsHide 的 spawn/spawnSync/execFile/execFileSync/exec/execSync/fork
  *   一律强制 windowsHide: true。显式传 windowsHide: false 的（比如真要弹窗）不拦。

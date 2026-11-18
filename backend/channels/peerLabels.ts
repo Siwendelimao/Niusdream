@@ -55,7 +55,7 @@ function load(): StoreShape {
 
 /**
  * 二十一批迁移：历史数据里同一机器人的多个私聊都叫「私聊」——
- * 列表/通知位置里出现两个一模一样的条目（用户实测）。这里给**自动命名**的重复项重新编号：
+ * 列表/通知位置里出现两个一模一样的条目（实测）。这里给**自动命名**的重复项重新编号：
  * 最早的保持「私聊」，其余按 firstAt 依次「私聊2」「私聊3」…（手填名不动）。
  */
 function dedupeAutoPrivateLabels(data: StoreShape): void {
@@ -102,7 +102,7 @@ function key(channel: string, botId: string, peerId: string): string {
 
 /** 自动分配：群聊 → 群A/群B…；私聊 → 私聊/私聊2/私聊3…（都跳过已占用，永不复用）
  *  ⚠️ 私聊必须编号（二十一批修）：同一机器人可能有多个私聊对端，
- *  全都叫「私聊」时列表/通知位置里会出现两个一模一样的「QQ · Nis · 私聊」（用户实测反馈）。 */
+ *  全都叫「私聊」时列表/通知位置里会出现两个一模一样的「QQ · Nis · 私聊」（实测反馈）。 */
 function autoLabel(data: StoreShape, channel: string, botId: string, kind?: string): string {
   const sameBot = (k: string, v: PeerLabel) => k.startsWith(`${channel}:`) && k.includes(`:${botId || '-'}:`) && v
   if (kind !== 'group' && kind !== 'channel') {

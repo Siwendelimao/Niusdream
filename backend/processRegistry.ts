@@ -58,7 +58,7 @@ function baseName(p: string): string {
 }
 const clip = (s: string, n = 240): string => (s.length > n ? s.slice(0, n) + '…' : s)
 
-/** 登记一个"由 NIS 拉起"的进程；返回注册 id（pid 非法时返回 null） */
+/** 登记一个"由 NiusDream 拉起"的进程；返回注册 id（pid 非法时返回 null） */
 export function procRegister(pid: number, meta: { exe?: string; cmdline?: string; cwd?: string; origin: ProcOrigin }): string | null {
   const n = Number(pid)
   if (!n || n <= 0) return null

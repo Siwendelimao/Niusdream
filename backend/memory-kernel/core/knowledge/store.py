@@ -132,7 +132,7 @@ class KnowledgeStore:
         if not entry:
             return None
 
-        allowed = {"title", "content", "summary", "entry_type", "tags", "source_url", "source_label", "parent_id", "attachments"}
+        allowed = {"project_id", "title", "content", "summary", "entry_type", "tags", "source_url", "source_label", "parent_id", "attachments"}
         set_clauses = []
         params = []
         for key, value in changes.items():

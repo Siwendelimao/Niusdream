@@ -18,5 +18,5 @@ export const SKILLS_ROOT = process.env.NIS_SKILLS_DIR
   ? path.resolve(process.env.NIS_SKILLS_DIR)
   : path.join(BACKEND_DIR, 'skills')
 
-/** 项目根（自我修改用）：backend 的父目录。开发态 = E:/nis0812；打包态为资源目录内（只读源码无意义，self-modify 工具集此时退化） */
+/** 项目根（自我修改用）：backend 的父目录。开发态 = <旧dev仓库>；打包态为资源目录内（只读源码无意义，self-modify 工具集此时退化） */
 export const PROJECT_ROOT = path.resolve(BACKEND_DIR, '..')

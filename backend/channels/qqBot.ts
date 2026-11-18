@@ -69,13 +69,13 @@ interface QqMessageEvent {
   senderRole?: string
   /** 这条消息里 @ 了谁（不含 @机器人 自身）—— 平台在群聊事件里下发 */
   mentions?: Array<{ id?: string; name?: string }>
-  /** 0913 串台修复：全量消息里「@ 的是**别的机器人**」—— 不回复（只记背景）；插嘴仍按配置照常（用户拍板：提到它就搭腔"挺有意思"，保留） */
+  /** 0913 串台修复：全量消息里「@ 的是**别的机器人**」—— 不回复（只记背景）；插嘴仍按配置照常（需求：提到它就搭腔"挺有意思"，保留） */
   mentionsOtherBot?: boolean
   /**
    * 0912 二十二批：**富媒体附件**（官方 `attachments[]`）——
    * 实测/文档：QQ 图片**不在 content 的 `<image>` 标签里**，而是走 attachments：
    *   { url(预签名下载地址), filename, content_type: image/jpeg|image/png|image/gif|video/mp4|voice|file, size, width, height }
-   * 之前只认 content 标签 → 私聊发图整条被丢（用户实测「他直接不理我」）。
+   * 之前只认 content 标签 → 私聊发图整条被丢（实测「他直接不理我」）。
    */
   attachments?: QqAttachment[]
   /**
@@ -102,7 +102,7 @@ interface QqAttachment {
 }
 
 interface QqBotHandlers {
-  /** 收到用户消息 → 交给上层（转 NIS session.prompt） */
+  /** 收到用户消息 → 交给上层（转 NiusDream session.prompt） */
   onMessage: (botId: string, ev: QqMessageEvent) => void
   /**
    * 旁听到的**群内全量消息**（0912 十五批）—— 只在群主把群设置改成
@@ -114,7 +114,7 @@ interface QqBotHandlers {
    * 机器人**被拉进群**（0912 十六批）—— 事件 `GROUP_ADD_ROBOT`。
    *
    * 为什么要处理：在此之前，被拉进群不会产生任何反应 —— 没人 @ 它就不会有会话，
-   * 用户在 PC 端看不到这个群，容易误以为「几个群合并了 / 没生效」（用户实测提出过）。
+   * 用户在 PC 端看不到这个群，容易误以为「几个群合并了 / 没生效」（实测提出过）。
    * 现在收到即主动打招呼（用 event_id 走**事件被动回复**，不占主动消息额度）。
    */
   onGroupAdded?: (botId: string, ev: { groupOpenid: string; operatorId?: string; eventId?: string; timestamp: number }) => void
@@ -408,7 +408,7 @@ async function handlePacket(c: BotConn, pkt: any, token: string) {
        *
        * 处理方式：**默认只记流水、不回复**；但二十二批修了一个关键坑：
        * 开全量后 @机器人的消息也走这个事件（实测没有 GROUP_AT_MESSAGE_CREATE），
-       * 早期一律当背景 → 群里 @ 它完全不理（用户实测「群聊它不回复」）。
+       * 早期一律当背景 → 群里 @ 它完全不理（实测「群聊它不回复」）。
        * 现在：**@ 了机器人 → 走正常回复链路**（用本条 id 被动回复），其余仅记背景。
        *
        * 二十三批两个补丁：
@@ -538,7 +538,7 @@ function stripLeadingMentions(s: string): string {
  * 入站正文里的 `<@id>` 清洗（0913 反馈批② —— 「ai 的艾特还是乱码」根因）。
  *
  * 平台把「@某人」在**下行正文**里编码成 `<@id>`（32 位 openid）。只在**行首**的会被
- * `stripLeadingMentions` 剥掉；**中段/尾部**的一直原样投射到 NIS 界面（引用块/背景流水）
+ * `stripLeadingMentions` 剥掉；**中段/尾部**的一直原样投射到 NiusDream 界面（引用块/背景流水）
  * 和 AI 上下文 —— 用户截图里「看不见这是好事啊<@9164D2F2…>」就是这么来的。
  * 规则：@机器人自身 → `@<机器人昵称>`；成员目录命中 → `@<目录标签>`；本条 mentions 带名字 → `@<名字>`；
  * 都不认识 → `@某人`（不再透出裸 id 乱码）。
@@ -792,7 +792,7 @@ function emitMessage(c: BotConn, ev: QqMessageEvent) {
   /**
    * 0912 二十一批/二十二批：图片消息不再整条丢弃。
    *
-   * 图片两条来源都要收（用户实测 + 官方文档）：
+   * 图片两条来源都要收（实测 + 官方文档）：
    *   ① `attachments[]`（**主力**）：{ url, content_type: image/png|image/jpeg|image/gif, filename, size }
    *   ② content 里的 `<image url="…"/>` 标签（老形态，保留兼容）
    * 非图片附件（file/video/voice）落盘后记成一条 `[文件：xxx]` 说明，让 AI 知道对方发了什么、文件在哪。
@@ -1013,7 +1013,7 @@ export async function sendQqMedia(
   else if (opts.buffer && opts.buffer.length) upBody.file_data = opts.buffer.toString('base64')
   else throw new Error('媒体源为空（需要 buffer 或 url）')
   /**
-   * 二十二批（用户实测「发过去的 html 显示成『未命名』」）：
+   * 二十二批（实测「发过去的 html 显示成『未命名』」）：
    * file_type=4（文件）必须带 `file_name`，否则 QQ 拿不到名字 → 手机上显示「未命名」。
    * 图片/视频/语音不需要（平台自己按内容类型处理）。
    */

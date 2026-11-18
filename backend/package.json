@@ -5,8 +5,8 @@
   "type": "module",
   "main": "server.ts",
   "scripts": {
-    "start": "node --import tsx/esm server.ts",
-    "dev": "node --import tsx/esm --watch server.ts"
+    "start": "node --import tsx/esm dataMergeBootstrap.mjs",
+    "dev": "node --import tsx/esm --watch dataMergeBootstrap.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/codex-acp": "^2.1.1",

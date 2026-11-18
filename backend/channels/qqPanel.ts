@@ -1,5 +1,5 @@
 /**
- * QQ 指令面板同步 —— 把 NIS 机器人已有的命令注册到 QQ 开放平台，
+ * QQ 指令面板同步 —— 把 NiusDream 机器人已有的命令注册到 QQ 开放平台，
  * 让用户在 QQ 里「看得见、点得到」，不用背命令。
  *
  * 官方接口（bot.q.qq.com/wiki/develop/api-v2/server-inter/menu-panel/）：
@@ -127,7 +127,7 @@ export async function syncQqPanel(
   }
 
   const token = await fetchQqAccessToken(appId, secret)
-  const panel = { items, remark: opts.remark || 'NIS 指令面板', version: 1 }
+  const panel = { items, remark: opts.remark || 'NiusDream 指令面板', version: 1 }
 
   const existing = await listQqPanels(token, scope)
   const hit = existing.find((p) => String(p?.scope || scope) === scope && p?.panel_id)

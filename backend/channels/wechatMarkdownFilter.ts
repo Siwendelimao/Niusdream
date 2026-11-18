@@ -5,7 +5,7 @@
  *       @tencent-weixin/openclaw-weixin，MIT；本仓库移植先例：出站媒体 CDN 上传）。
  * 为什么要搬：官方 SDK 自己发消息时会套这道过滤（CHANGELOG.zh_CN「外发文本由原先
  *       markdownToPlainText 整段剥离，改为流式逐字符过滤；对 Markdown 从完全不支持变为部分支持」），
- *       而 NIS 的微信通道是自实现 HTTP（channels/wechatBot.ts）——不搬就等于把
+ *       而 NiusDream 的微信通道是自实现 HTTP（channels/wechatBot.ts）——不搬就等于把
  *       `#####`、包裹中文的 `*斜体*`、`![x](url)` 这些裸标记直接甩给用户。
  * 规则摘要（详见下面官方头部注释）：
  *       · 原样保留：代码围栏 ```、行内代码、表格 |…|、水平线、**粗体**、非中文斜体
@@ -380,7 +380,7 @@ class StreamingMarkdownFilter {
 /* ─── ↑↑↑ 官方源码原文结束 ─── */
 
 /**
- * 一次性过滤（NIS 的微信出站是**整段发**，非流式 ⇒ feed 全文 + flush 即可）。
+ * 一次性过滤（NiusDream 的微信出站是**整段发**，非流式 ⇒ feed 全文 + flush 即可）。
  * 官方流式用法是逐块 feed、结束时 flush，语义与这里一致。
  */
 export function filterWechatMarkdown(text: string): string {

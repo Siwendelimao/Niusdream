@@ -1,7 +1,7 @@
 /**
  * 通道配置存储（0912 接入批）
  *
- * 通道 = NIS 对外的消息入口（微信 / QQ / 远程访问）。本模块只管**配置**，
+ * 通道 = NiusDream 对外的消息入口（微信 / QQ / 远程访问）。本模块只管**配置**，
  * 不管连接实现（连接在各自通道模块里，见 docs/通道接入设计-前端与上下文-0912.md）。
  *
  * 落盘：backend/data/channels.json（原子写；通道数量固定为 3，单文件足够）
@@ -57,7 +57,9 @@ export interface ChannelBot {
   modelId?: string
   effort?: string
   presetId?: string
-  permissionMode?: 'self_audit' | 'full_access' | 'confirm'
+  /** ★1034：`self_audit` 已撤档 ⇒ 通道档位也只有三档（见 server.ts 的 PermissionMode）。
+   *  ⚠️ 读到存量 `self_audit` 由 server.ts 的 `normalizePermissionMode()` 归一（→ high_only）。 */
+  permissionMode?: 'confirm' | 'high_only' | 'full_access'
 
   /* ── 群聊「插嘴」开关（0912 二十四批；0912 晚反馈批扩展）──
    * 背景：开了「获取群内全部消息」后，群里的闲聊机器人全都看得到。
@@ -109,19 +111,19 @@ export interface ChannelConfig {
   /** 该通道新建会话使用的 Agent 预设 id（空=跟随全局默认） */
   presetId: string
   /**
-   * 该通道新建会话的权限模式（0912 二批修复）。
+   * 该通道新建会话的权限模式（0912 二批修复；★1034 三档改造）。
    *
-   * ⚠️ 这是通道场景的关键设置：默认 `self_audit`（放行但留痕）而不是 `confirm`。
-   * 原因：`confirm` 会在 PC 端弹审批卡等用户点，但用户在 IM 里**看不到这张卡** →
-   * agent 一直等（3 分钟超时才失败）→ 表现为「卡在权限卡、回复永远不来」
-   * （用户实测踩到：QQ 里发消息 → 乱调工具 → 弹权限卡 → 卡死）。
+   * ⚠️ 这是通道场景的关键设置。`confirm` 会在 PC 端弹审批卡等用户点，而 IM 端
+   * **没有按钮**（`channelHasButtons` 只对 QQ 单聊返回 true）—— 用户必须**打字回**
+   * 「允许/都允许/拒绝」（`handleChannelIncoming` 的通道通用拦截，`:13142-13156`）。
+   * ⇒ 不会"卡死"，但手机每次打字体验差 ⇒ 各通道默认值按体验分流（★1034 commit4）。
    *
-   * 通道场景的可选值：
-   *   self_audit  放行但留痕（默认，推荐 —— 通道本来就是用户对自己电脑下指令）
-   *   full_access 完全放行
-   *   confirm     弹审批卡（⚠️ 需配合 IM 审批回推才有意义，见 server.ts 的审批桥）
+   * 通道场景的可选值（三档，`self_audit` 已撤）：
+   *   confirm     所有需授权操作都问（QQ 有按钮，点了就走）
+   *   high_only   只有高危（risk==='high'）才问，其余免审但**留痕**
+   *   full_access 全部放行但**留痕**
    */
-  permissionMode: 'self_audit' | 'full_access' | 'confirm'
+  permissionMode: 'confirm' | 'high_only' | 'full_access'
   /** 通道账号标识（微信=ilink_bot_id / QQ=AppID） */
   accountId: string
   /** 账号昵称（展示用） */
@@ -144,7 +146,7 @@ export interface ChannelConfig {
   markdown?: boolean
   /* ★1011：远程访问的**访问令牌**（仅 remote 通道使用）。
      背景：原来只有环境变量 NIS_TOKEN 一条路，默认空 ⇒ 校验退化成"同源放行"，
-     同网段任何人打开 http://<局域网IP>:8766 就能完整操作 NIS（读写文件、跑命令）。
+     同网段任何人打开 http://<局域网IP>:8766 就能完整操作 NiusDream（读写文件、跑命令）。
      现在：开关打开时后端自动生成并持久化到这里，链接与二维码自动带上 ?token=。
      ⚠️ 敏感字段：绝不能出现在任何回给前端的 RPC 结果里（listChannels/getChannelRedacted 已脱敏）。 */
   remoteToken?: string
@@ -155,18 +157,40 @@ interface StoreShape { version: number; channels: Record<string, ChannelConfig> 
 
 const CHANNEL_IDS: ChannelId[] = ['wechat', 'qq', 'remote']
 
-/** 默认配置：未配置过的通道一律「未启用 + 跟随全局模型 + 自审计权限」 */
-function defaultConfig(): ChannelConfig {
+/** ★1034（需求）：**各通道的默认权限档按"审批体验"分流** ——
+ *  · `qq`     → `high_only`   QQ 单聊有审批**按钮**（`buildApprovalKeyboard`），
+ *                             点一下就走 ⇒ 让高危操作打断用户是划算的。
+ *  · `wechat` → `full_access` 微信**没有按钮**（`channelHasButtons` 只对 qq+c2c 返回 true），
+ *                             只能打字回「允许」。**不会卡死**（文字审批链路是通道通用的），
+ *                             但手机每次打字体验差 ⇒ 默认放行 + 留痕。
+ *  · `remote` → `confirm`     远程访问是"从外网操作自己电脑"，风险等级最高 ⇒ 最保守。
+ *  ⚠️ 历史纠正：我调研时曾说"微信没有审批能力、弹了就是卡死"——**那是错的**。
+ *     `server.ts:13142-13156` 是通道通用拦截，微信回「允许」一样生效。
+ *     改 wechat 默认值的理由是**体验**，不是"不可用"。
+ */
+/** ⚠️ 参数收 `string`（不是 `ChannelId`）：调用方 `resolveChannelSession(channel: string, ...)`
+ *  拿的是运行时字符串，不该为了调这个函数在调用点强转（强转会让"未知通道"静默变成某个枚举值）。 */
+export function defaultPermissionOf(id: string): ChannelConfig['permissionMode'] {
+  switch (String(id || '')) {
+    case 'qq': return 'high_only'
+    case 'wechat': return 'full_access'
+    case 'remote': return 'confirm'
+    default: return 'full_access'
+  }
+}
+
+/** 默认配置：未配置过的通道一律「未启用 + 跟随全局模型 + 按通道分流的权限档」 */
+function defaultConfig(id: ChannelId = 'wechat'): ChannelConfig {
   return {
     enabled: false, providerId: '', modelId: '', effort: '', presetId: '',
-    permissionMode: 'self_audit',
+    permissionMode: defaultPermissionOf(id),
     accountId: '', nickname: '', bots: [], updatedAt: 0,
   }
 }
 
 function emptyStore(): StoreShape {
   const channels: Record<string, ChannelConfig> = {}
-  for (const id of CHANNEL_IDS) channels[id] = defaultConfig()
+  for (const id of CHANNEL_IDS) channels[id] = defaultConfig(id)
   return { version: 1, channels }
 }
 
@@ -191,6 +215,35 @@ function load(): StoreShape {
       const saved = raw.channels[id]
       if (saved && typeof saved === 'object') {
         base.channels[id] = { ...base.channels[id], ...saved }
+      }
+      /* ★1034：**通道配置层的旧档位迁移** —— 盘上的 `self_audit` 一律视为"未配置"，
+         改用它所属通道的**分流默认值**（qq=high_only / wechat=full_access / remote=confirm）。
+         为什么"视为未配置"而不是一律迁 high_only：
+           · `self_audit` 是**撤档前的默认值**（`defaultConfig()` 写死的），
+             盘上出现的 self_audit **极大概率是默认值**、不是用户真选过；
+           · 若一律迁 high_only，微信用户会从"全放行"突变成"高危就弹卡" ——
+             而微信**没有审批按钮**，只能打字回，正是 1034 要消除的体验问题；
+           · 按通道分流则**保留了原行为**（微信原 self_audit ≈ 全放行 ≈ full_access），
+             QQ 收紧成 high_only（它有按钮）。
+         ⚠️ 与**会话层**的 `server.ts:normalizePermissionMode()` 口径不同，那里是真迁移
+            （会话的 permissionMode 是用户手动设过的，必须迁 high_only）—— 两层语义不同，别混。 */
+      const pm = String((base.channels[id] as any)?.permissionMode || '')
+      if (!['confirm', 'high_only', 'full_access'].includes(pm)) {
+        console.warn(`[channels] 通道 ${id} 权限档位 ${JSON.stringify(pm)} 已撤档 → 按通道默认值迁移为 ${defaultPermissionOf(id)}`)
+        base.channels[id].permissionMode = defaultPermissionOf(id)
+      }
+      /* ★1034：**bot 级权限档也要迁**（同一条通道下每个机器人可单独设档）。
+         漏了它的后果：`modelForChannel()` 里 `botPerm` 不在白名单 ⇒ 回落通道级（行为正确），
+         但**面板会把这个 bot 显示成"未知档位"**（前端 `pick(b.permissionMode, c...)` 取到旧值），
+         而且盘上一直留着旧枚举值，下次有人读 bots 数组就会当成真配置用。
+         迁移口径同通道级：旧默认 self_audit 视为"未配置"，用它所属通道的分流默认值。 */
+      const bots = Array.isArray((base.channels[id] as any)?.bots) ? (base.channels[id] as any).bots : []
+      for (const b of bots) {
+        const bp = String(b?.permissionMode || '')
+        if (bp && !['confirm', 'high_only', 'full_access'].includes(bp)) {
+          console.warn(`[channels] 通道 ${id} 机器人 ${String(b?.id || b?.accountId || '?')} 权限档位 ${JSON.stringify(bp)} 已撤档 → 迁移为 ${defaultPermissionOf(id)}`)
+          b.permissionMode = defaultPermissionOf(id)
+        }
       }
     }
     cache = base
@@ -267,7 +320,7 @@ export function updateChannel(id: string, patch: Partial<ChannelConfig>): Channe
   if (typeof patch.markdown === 'boolean') next.markdown = patch.markdown
   // 权限模式白名单校验（防脏值写盘）
   if (typeof patch.permissionMode === 'string'
-      && ['self_audit', 'full_access', 'confirm'].includes(patch.permissionMode)) {
+      && ['confirm', 'high_only', 'full_access'].includes(patch.permissionMode)) {
     next.permissionMode = patch.permissionMode as ChannelConfig['permissionMode']
   }
   for (const k of ['providerId', 'modelId', 'effort', 'presetId', 'accountId', 'nickname'] as const) {
@@ -342,7 +395,7 @@ export function updateBot(id: string, key: string, patch: Partial<ChannelBot>): 
   for (const k of ['providerId', 'modelId', 'effort', 'presetId'] as const) {
     if (typeof patch[k] === 'string') bot[k] = (patch[k] as string).trim() || undefined
   }
-  if (typeof patch.permissionMode === 'string' && ['self_audit', 'full_access', 'confirm'].includes(patch.permissionMode)) {
+  if (typeof patch.permissionMode === 'string' && ['confirm', 'high_only', 'full_access'].includes(patch.permissionMode)) {
     bot.permissionMode = patch.permissionMode as ChannelBot['permissionMode']
   }
   // 群聊插嘴（0912 二十四批）：布尔开关 + 门槛白名单 + 数值夹取
@@ -401,16 +454,20 @@ export function modelForChannel(id: string, botId?: string): {
 } {
   const c = getChannel(id)
   const bot = botId ? (c?.bots || []).find(b => b.id === botId || b.accountId === botId) : undefined
-  // 0914 修订（用户反馈"选跟随全局仍显示型号"）：**选中机器人时只认机器人级值**——
+  // 0914 修订（反馈"选跟随全局仍显示型号"）：**选中机器人时只认机器人级值**——
   // 空 = 跟随全局（不回落到通道级）；通道级仅作"该通道没有机器人"时的兜底默认。
   const pick = (botVal?: string, chVal?: string): string => {
     if (bot) return String(botVal || '').trim()
     return String(chVal || '').trim()
   }
   const botPerm = String(bot?.permissionMode || '').trim()
-  const perm = (['self_audit', 'full_access', 'confirm'].includes(botPerm)
+  /* ★1034：三档白名单同步（`self_audit` 已撤）。**回落值按通道分流**（`defaultPermissionOf`）——
+     原来写死 `full_access`，会让 remote 通道漏掉"更该谨慎"的默认值。
+     存量的 `self_audit` 在**会话读取侧**由 `normalizePermissionMode()` 归一成 `high_only`，
+     不在这里处理（这里是通道配置层）。 */
+  const perm = (['confirm', 'high_only', 'full_access'].includes(botPerm)
     ? botPerm
-    : (c?.permissionMode || 'self_audit')) as ChannelConfig['permissionMode']
+    : (c?.permissionMode || defaultPermissionOf(id))) as ChannelConfig['permissionMode']
   const providerId = pick(bot?.providerId, c?.providerId)
   const modelId = pick(bot?.modelId, c?.modelId)
   return {

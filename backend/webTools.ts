@@ -9,7 +9,7 @@
 import { Type } from 'typebox'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 // 0908五：网络出口可切换——proxy 档用 undici ProxyAgent（与 providers.ts 同款，Node global fetch 不吃代理）
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 
@@ -30,7 +30,7 @@ interface WebSearchConfig {
   provider: SearchProviderId
   /** 各引擎的 API key（按需填；duckduckgo 不需要） */
   apiKeys: Partial<Record<SearchProviderId, string>>
-  /** 0908五：网络出口（用户拍板可切换）——'direct'=本机 IP 直连（默认，旧行为）；
+  /** 0908五：网络出口（需求可切换）——'direct'=本机 IP 直连（默认，旧行为）；
    *  'proxy'=走下方 proxyUrl（HTTP 代理，如 Clash 的 127.0.0.1:7897）。
    *  此前 web_search/web_fetch 恒 global fetch 直连，完全不吃供应商代理=墙内必挂"fetch failed" */
   networkMode?: 'direct' | 'proxy'
@@ -500,7 +500,7 @@ function buildWebFetchTool(): AgentTool<typeof fetchParams, any> {
       if (isBlockedSsrfHost(parsed.hostname)) throw new Error(`出于安全拒绝抓取该地址：${parsed.hostname}`)
 
       const res = await fetchWithTimeout(target, {
-        headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 NIS-Agent', accept: 'text/html,application/xhtml+xml,*/*' },
+        headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 NiusDream-Agent', accept: 'text/html,application/xhtml+xml,*/*' },
         redirect: 'follow',
       })
       if (!res.ok) throw new Error(`网页响应 ${res.status} ${res.statusText}：${target}`)
@@ -549,7 +549,7 @@ function buildGithubSearchTool(): AgentTool<typeof ghParams, any> {
         order: 'desc',
         ...(params.sort && params.sort !== 'best-match' ? { sort: params.sort } : {}),
       }).toString()
-      const headers: Record<string, string> = { accept: 'application/vnd.github+json', 'user-agent': 'NIS-Agent' }
+      const headers: Record<string, string> = { accept: 'application/vnd.github+json', 'user-agent': 'NiusDream-Agent' }
       const token = params.apiKey || process.env.GITHUB_TOKEN
       if (token) headers.authorization = `Bearer ${token}`
       const res = await fetchWithTimeout(`https://api.github.com/search/repositories?${q}`, { headers })
@@ -604,7 +604,7 @@ try {
  *  本机那份是 DPAPI 密文，出了这台机器解不开 —— 但换机后搜索 key 全废也不合理（搜索是常用功能），
  *  所以导出时同样用口令包一份：换电脑输同一句口令即可恢复。*/
 export function sealPortableSearchKeys(json: any, passphrase: string): { sealed: number; failed: string[] } {
-  /* ★1011（老大要求）：弱口令不再拦截，同 providers.sealPortableKeys。 */
+  /* ★1011（需求）：弱口令不再拦截，同 providers.sealPortableKeys。 */
   const failed: string[] = []
   let sealed = 0
   const keys = (json && typeof json.apiKeys === 'object' && json.apiKeys) || {}

@@ -8,7 +8,7 @@
  *   · POST ilink/bot/sendmessage    —— 回推消息（带 context_token 才能进正确会话）
  *
  * ⚠️ 为什么必须要有长轮询：微信服务端以「是否有活跃 getupdates 连接」判定 bot 在线。
- *    只有 token 不拉取 = 服务端认为你掉线 → 手机端报「暂时无法连接」（用户实测踩到）。
+ *    只有 token 不拉取 = 服务端认为你掉线 → 手机端报「暂时无法连接」（实测踩到）。
  *
  * 凭据：bot_token 存通道配置的 `bots[].secret`（前端只看到 hasSecret 标记，不下发明文）。
  * 游标：get_updates_buf 落盘 `data/channels/wechat-sync.json`（重启续传，不丢消息）。
@@ -26,7 +26,7 @@ const APP_ID = 'bot'
 /** iLink-App-ClientVersion：major<<16 | minor<<8 | patch（官方 buildClientVersion） */
 const CLIENT_VERSION = (2 << 16) | (4 << 8) | 8
 const CHANNEL_VERSION = '2.4.8'
-const BOT_AGENT = 'NIS/1.0'
+const BOT_AGENT = 'NiusDream/1.0'
 const LONG_POLL_TIMEOUT_MS = 35_000
 const API_TIMEOUT_MS = 15_000
 const MAX_CONSECUTIVE_FAILURES = 3
@@ -488,7 +488,7 @@ function extractText(msg: WechatMessage): string {
 /* ── 0912 二十一批：入站图片（CDN 加密下载 + 解密）─────────────
  * 微信图片走 CDN：image_item.media{ encrypt_query_param, aes_key }，密文 AES-128-ECB，
  * 解密后才是图片本体。移植自官方 openclaw-weixin（MIT，见 backend/_research_wx）。
- * 用户实测反馈「微信发图给 AI，AI 看不到」——就是这条链路此前完全没接。
+ * 实测反馈「微信发图给 AI，AI 看不到」——就是这条链路此前完全没接。
  */
 
 /** 官方 CDN 基址（服务端没下发 full_url 时兜底拼接） */

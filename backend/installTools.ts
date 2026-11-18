@@ -10,7 +10,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 import { Type as TbType } from 'typebox'
 import { invalidateSkillCache, getSkills } from './skillTools.ts'
 import { DATA_ROOT, SKILLS_ROOT } from './paths.ts'
@@ -283,7 +283,7 @@ export function buildInstallTools(ctx: InstallCtx): AgentTool<any>[] {
     {
       name: 'install_skill',
       label: '安装技能',
-      description: '把技能（SKILL.md 技能包）安装到 NIS 技能目录。source 可以是本地目录路径或 git 仓库 URL；name 可指定仓库内的子目录名。安装前会先汇报元数据并询问用户确认。工具内部自动处理含空格的路径——优先直接把 URL/路径传给本工具，不要自己跑 git clone 等命令安装。',
+      description: '把技能（SKILL.md 技能包）安装到 NiusDream 技能目录。source 可以是本地目录路径或 git 仓库 URL；name 可指定仓库内的子目录名。安装前会先汇报元数据并询问用户确认。工具内部自动处理含空格的路径——优先直接把 URL/路径传给本工具，不要自己跑 git clone 等命令安装。',
       parameters: TbType.Object({
         source: TbType.String({ description: '本地目录路径 或 git 仓库 URL' }),
         name: TbType.Optional(TbType.String({ description: 'git 仓库内的技能子目录名（可选）' })),
@@ -368,7 +368,7 @@ export function buildInstallTools(ctx: InstallCtx): AgentTool<any>[] {
     {
       name: 'uninstall_skill',
       label: '卸载技能',
-      description: '从 NIS 技能目录卸载已安装的技能（只能卸载 AI 导入安装的，动不了系统内置）。',
+      description: '从 NiusDream 技能目录卸载已安装的技能（只能卸载 AI 导入安装的，动不了系统内置）。',
       parameters: TbType.Object({
         name: TbType.String({ description: '要卸载的技能名（目录名）' }),
       }),
@@ -429,7 +429,7 @@ export function buildInstallTools(ctx: InstallCtx): AgentTool<any>[] {
     {
       name: 'install_mcp',
       label: '安装 MCP 服务',
-      description: '安装一个 MCP 服务到 NIS（真实连接：clone 仓库+装依赖+启动，前缀 mcp__<服务名>__<工具名>）。工具表在会话（agent）建立时定型 ⇒ 新装的服务对**已开的会话**从下一条消息起可用（发消息时自动重建工具表），新会话立即可用。source 传 git 仓库 URL 时自动 clone 到本地并安装依赖，启动命令用相对路径即可（如 node src/index.js）。stdio 型传 command+args（如 npx -y @some/mcp-server，无需 clone）；远程型传 url。name 为短横线小写名。',
+      description: '安装一个 MCP 服务到 NiusDream（真实连接：clone 仓库+装依赖+启动，前缀 mcp__<服务名>__<工具名>）。工具表在会话（agent）建立时定型 ⇒ 新装的服务对**已开的会话**从下一条消息起可用（发消息时自动重建工具表），新会话立即可用。source 传 git 仓库 URL 时自动 clone 到本地并安装依赖，启动命令用相对路径即可（如 node src/index.js）。stdio 型传 command+args（如 npx -y @some/mcp-server，无需 clone）；远程型传 url。name 为短横线小写名。',
       parameters: TbType.Object({
         name: TbType.String({ description: 'MCP 服务名（小写短横线，如 kimi-webbridge-mcp）' }),
         source: TbType.String({ description: '来源（git 仓库 URL / 配置说明）；git URL 会自动 clone+装依赖' }),

@@ -11,10 +11,10 @@
  *        wait / scaned / need_verifycode / verify_code_blocked / expired
  *        / scaned_but_redirect / confirmed / binded_redirect
  *
- * 与原版的差异（适配 NIS 场景）：
+ * 与原版的差异（适配 NiusDream 场景）：
  *   - 原版是终端 CLI（二维码画在终端、验证码用 stdin 读）→ 这里改成**返回给前端**，
  *     二维码用 `<img src={qrcodeUrl}>` 展示，验证码由前端输入回传
- *   - 登录态由 NIS 自己保存到 channelsStore 的 wechat.bots[0]
+ *   - 登录态由 NiusDream 自己保存到 channelsStore 的 wechat.bots[0]
  */
 import crypto from 'node:crypto'
 import QRCode from 'qrcode'

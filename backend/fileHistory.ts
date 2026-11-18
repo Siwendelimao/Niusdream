@@ -21,7 +21,7 @@ import { loadJsonOrBackup, writeJsonAtomic } from './jsonStore.ts'
 
 /** 全局内容库：sha256 → { content(gzip), size, refs, lastAccess }（跨会话去重） */
 /* ★ 0924 修复（产品要求）：原用 `process.cwd()/data` 求历史库根 —— 打包版 cwd = <安装目录>/pack/backend，
-   于是历史对象落进**程序目录**（实测安装版 91.8MB 就在 D:\nIs0.1.0\NIS\pack\backend\data\file-history），
+   于是历史对象落进**程序目录**（实测安装版 91.8MB 就在 <安装目录>\pack\backend\data\file-history），
    与其它数据（DATA_ROOT = 安装目录/data，壳注入 NIS_DATA_DIR）不同源；换/重装 pack 即丢，
    也违反 0919 口径「不要有让用户看不到的地方」。现统一挂 DATA_ROOT：
    · 开发态：cwd=backend，两者本就同址 → 行为零变化；
@@ -72,7 +72,7 @@ function pruneChangesBySession(changes: HistoryChange[], sessionId: string | und
 /** 0910 磁盘治理：树快照/内容 GC 都跳过的目录（依赖/构建产物/版本库——快照它们=21GB 事故根因；
  *  且 tree 快照本就"只写不读"（restoreChange 拒绝、面板只列 kind=file），跳过零功能损失 */
 /* ★ 0924：加了 'data'。
-   事故：`project_run_command` 的工作区 = **项目根**（D:\nis0812），而项目根的 `backend\data`
+   事故：`project_run_command` 的工作区 = **项目根**（<旧dev仓库>），而项目根的 `backend\data`
    里堆着 39 万文件 / 28GB（其中一半正是本模块自己的 objects，见下方 file-history 4.1GB）。
    实测：按老名单扫一遍项目根 = **33.2 万文件 / 11GB，光 readdir+stat 就 100.8 秒**，
    而 snapshotTree 是**全同步**的（readFileSync + sha256 + gzip 写盘），事件循环被堵死几分钟
@@ -88,6 +88,13 @@ const SNAPSHOT_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.n
      也能吃掉几十秒（项目根跳掉 data 后仍要 41 秒）——用 wall-clock 直接兜死。 */
 const SNAPSHOT_MAX_FILES = 5000
 const SNAPSHOT_BUDGET_MS = 1500
+/* ★1127：每处理多少个文件让出一次事件循环（异步分片粒度）。32 是折中：
+   太大会让单次阻塞间隔变长，太小则 setImmediate 自身开销占比升高。 */
+/* ★1128：SNAPSHOT_YIELD_EVERY 已废弃 —— 让出条件从"每 N 个文件"改成"每片超过 20ms"（见 snapshotTree 内注释）。 */
+/* ★1127：**大树工作区负缓存** —— 实测工作区 >5000 文件时每次白扫 1.5 秒预算才放弃，
+   是 [eventloop] 主线程被堵 2~5 秒的直接来源之一。既然结论是"这个大、别扫"，就记 60 秒。 */
+const OVERSIZED_COOLDOWN_MS = 60_000
+const oversizedCooldownUntil = new Map<string, number>()
 
 function ensureDirs(): void {
   fs.mkdirSync(OBJECTS_DIR, { recursive: true })
@@ -101,27 +108,68 @@ function objPath(hash: string): string {
   return path.join(OBJECTS_DIR, hash.slice(0, 2), `${hash}.gz`)
 }
 
-/** 存内容块（去重）：已存在则 bump 引用与访问时间，否则 gzip 落盘 */
+/** ★1109 修复：对象读取的 **LRU 缓存**。
+ *
+ *  病（实测）：`getObject` 每次都 `existsSync` + **`utimesSync`（写文件元数据）** + `readFileSync` + `gunzipSync`。
+ *  它被 `turnSummaries` / `changeStatus` / 面板 diff 反复调用 —— 本会话 4755 条 change 一次汇总
+ *  就是近五千次「读 + 解压」，实测 `fs.history.turnSummary` 单次 **1480~3262ms**（返回仅 1.7KB）。
+ *  为什么缓存是**绝对安全**的：对象库是内容寻址（文件名 = 内容的 sha256），同一个 hash 的内容
+ *  永不改变 ⇒ 缓存不需要失效逻辑，只需要容量上限。
+ *  ⚠️ 顺带去掉每次 `utimesSync`：它只为"访问时间保活"，却在每次读时都写一遍文件元数据
+ *  （写操作比读贵一个量级）。淘汰用的是 `refs` 引用计数 + tree 时间线，不依赖 mtime，所以可以不做。 */
+const OBJ_CACHE_MAX_BYTES = 64 * 1024 * 1024
+const _objCache = new Map<string, Buffer>()
+let _objCacheBytes = 0
+function objCacheGet(hash: string): Buffer | null {
+  const hit = _objCache.get(hash)
+  if (!hit) return null
+  /* LRU：命中后移到队尾（Map 保序） */
+  _objCache.delete(hash)
+  _objCache.set(hash, hit)
+  return hit
+}
+function objCachePut(hash: string, buf: Buffer): void {
+  if (buf.length > OBJ_CACHE_MAX_BYTES / 4) return   /* 单个超大对象不进缓存，避免一次冲爆 */
+  const prev = _objCache.get(hash)
+  if (prev) { _objCacheBytes -= prev.length; _objCache.delete(hash) }
+  _objCache.set(hash, buf)
+  _objCacheBytes += buf.length
+  /* 超预算从最旧的开始丢（内容寻址 ⇒ 丢了只是下次重新解压，绝不影响正确性） */
+  while (_objCacheBytes > OBJ_CACHE_MAX_BYTES) {
+    const oldest = _objCache.keys().next()
+    if (oldest.done) break
+    const v = _objCache.get(oldest.value)
+    if (v) _objCacheBytes -= v.length
+    _objCache.delete(oldest.value)
+  }
+}
+
+/** 存内容块（去重）：已存在则直接返回，否则 gzip 落盘 */
 export function putObject(content: Buffer): { hash: string; size: number; bytesWritten: number } {
   ensureDirs()
   const hash = sha256(content)
   const target = objPath(hash)
   if (fs.existsSync(target)) {
-    try { fs.utimesSync(target, new Date(), new Date()) } catch { /* ignore */ }
+    /* ★1109：不再每次 utimesSync（见 getObject 上方注释）；顺手把内容放进缓存 */
+    objCachePut(hash, content)
     return { hash, size: content.length, bytesWritten: 0 }
   }
   fs.mkdirSync(path.dirname(target), { recursive: true })
   const gz = zlib.gzipSync(content, { level: 6 })
   fs.writeFileSync(target, gz)
+  objCachePut(hash, content)
   return { hash, size: content.length, bytesWritten: gz.length }
 }
 
 function getObject(hash: string): Buffer | null {
+  const cached = objCacheGet(hash)
+  if (cached) return cached
   const target = objPath(hash)
   if (!fs.existsSync(target)) return null
   try {
-    fs.utimesSync(target, new Date(), new Date())
-    return zlib.gunzipSync(fs.readFileSync(target))
+    const buf = zlib.gunzipSync(fs.readFileSync(target))
+    objCachePut(hash, buf)
+    return buf
   } catch {
     return null
   }
@@ -132,12 +180,34 @@ function changesFile(workDir: string): string {
   return path.join(workDir, '.nis-history', 'changes.json')
 }
 
+/* ★1109 修复：**changes.json 解析缓存**（按 mtime + size 判据）。
+   病（实测）：本会话 `changes.json` 已有 **3.7MB / 4755 条**，`loadChanges` 每次调用都整份
+   parse 一遍 ≈150ms；而 `fs.history.list` / `changed` / `turnSummary` 都被前端轮询，
+   一秒钟能调好几次 ⇒ 纯粹重复解析同一份没变的文件。
+   判据：文件 mtime+size 没变 → 直接用上次解析结果；`saveChanges` 写完立即更新缓存，
+   保证**读到的永远是最新盘上内容**。 */
+const _changesCache = new Map<string, { mtimeMs: number; size: number; list: HistoryChange[] }>()
 function loadChanges(workDir: string): HistoryChange[] {
   /* ★0927 netfix：坏档走 jsonStore —— 原实现 catch 吞掉返回 []，随后任何 saveChanges 就把
      整份历史记录覆盖成空（撤销/审查数据全丢）。现在坏档先备份 .corrupt-* 再回落，原档可捞。 */
+  const file = changesFile(workDir)
+  let st: fs.Stats | null = null
+  try { st = fs.statSync(file) } catch { /* 文件不存在 ⇒ 走 loadJsonOrBackup 的默认值 */ }
+  if (st) {
+    const hit = _changesCache.get(workDir)
+    if (hit && hit.mtimeMs === Math.round(st.mtimeMs) && hit.size === st.size) return hit.list
+  }
   try {
-    const r = loadJsonOrBackup<{ changes?: HistoryChange[] }>(changesFile(workDir), () => ({ changes: [] }))
-    return Array.isArray(r.data?.changes) ? r.data.changes : []
+    const r = loadJsonOrBackup<{ changes?: HistoryChange[] }>(file, () => ({ changes: [] }))
+    const list = Array.isArray(r.data?.changes) ? r.data.changes : []
+    if (st) {
+      if (_changesCache.size > 64) {
+        const oldest = _changesCache.keys().next()
+        if (!oldest.done) _changesCache.delete(oldest.value)
+      }
+      _changesCache.set(workDir, { mtimeMs: Math.round(st.mtimeMs), size: st.size, list })
+    }
+    return list
   } catch {
     return []
   }
@@ -146,7 +216,14 @@ function loadChanges(workDir: string): HistoryChange[] {
 export function saveChanges(workDir: string, changes: HistoryChange[]): void {
   const dir = path.join(workDir, '.nis-history')
   fs.mkdirSync(dir, { recursive: true })
+  /* ★1109：先作废再写 —— 顺序反了的话，写盘瞬间若有读请求会缓存住旧内容 */
+  _changesCache.delete(workDir)
   writeJsonAtomic(changesFile(workDir), { version: 1, changes })
+  /* 写完把**刚写进去的这份**放进缓存（附正确 mtime/size），避免紧接的轮询又解析一遍 */
+  try {
+    const st = fs.statSync(changesFile(workDir))
+    _changesCache.set(workDir, { mtimeMs: Math.round(st.mtimeMs), size: st.size, list: changes })
+  } catch { /* 放不进缓存不影响正确性 */ }
 }
 
 export interface HistoryChange {
@@ -197,17 +274,37 @@ export function resolveChangePath(workDir: string, relPath: string): string {
 
 /** 该 change 写出的版本是否仍是文件当前版本（afterHash 空=删除类：当前不存在即生效；
  *  beforeHash 也为空=新建类且 after 快照缺失：文件存在即生效） */
+/* ★1109 修复：**文件内容 sha256 缓存**（按 path + mtime + size 判据）。
+   病（实测）：`turnSummaries` 对每条 change 都调这里 —— 本会话 4755 条 change ⇒ 每次汇总
+   要**整份读 998 个当前文件并算 sha256**，实测 `fs.history.turnSummary` 单次 1480~3262ms。
+   判据用 `mtime + size`：文件没被动过就不重算（与启动索引新鲜度同一套便宜判据）。
+   进程内缓存、上限 2000 条（超过丢最旧的一半，避免会话开久了无限涨）。 */
+const _hashCache = new Map<string, { mtimeMs: number; size: number; hash: string }>()
+const HASH_CACHE_MAX = 2000
+function sha256OfFile(abs: string): string | null {
+  let st: fs.Stats
+  try { st = fs.statSync(abs) } catch { return null }
+  const hit = _hashCache.get(abs)
+  if (hit && hit.mtimeMs === Math.round(st.mtimeMs) && hit.size === st.size) return hit.hash
+  let buf: Buffer
+  try { buf = fs.readFileSync(abs) } catch { return null }
+  const hash = sha256(buf)
+  if (_hashCache.size >= HASH_CACHE_MAX) {
+    /* 简单折半清理：删最旧插入的一半（Map 保序） */
+    let drop = Math.floor(HASH_CACHE_MAX / 2)
+    for (const k of _hashCache.keys()) { if (drop-- <= 0) break; _hashCache.delete(k) }
+  }
+  _hashCache.set(abs, { mtimeMs: Math.round(st.mtimeMs), size: st.size, hash })
+  return hash
+}
+
 function versionEffective(workDir: string, change: HistoryChange): boolean {
   if (!change.relPath || change.kind !== 'file') return true
   const abs = resolveChangePath(workDir, change.relPath)
   const exists = fs.existsSync(abs)
   if (change.afterHash) {
     if (!exists) return false
-    try {
-      return sha256(fs.readFileSync(abs)) === change.afterHash
-    } catch {
-      return false
-    }
+    return sha256OfFile(abs) === change.afterHash
   }
   return change.beforeHash ? !exists : exists
 }
@@ -224,6 +321,33 @@ export function changeStatus(workDir: string, change: HistoryChange, all: Histor
   const trace = all.find(c => c.undoOf === change.id && !c.voided &&
     (c.actor === '用户撤销' || c.actor === '用户撤销(整轮)') && versionEffective(workDir, c))
   return trace ? 'undone' : 'superseded'
+}
+
+/* ★1109 修复：**undoOf 索引** —— 消除 O(n²)。
+   病（实测）：`turnSummaries` 对每条 change 调 `changeStatus`，而里面 `all.find(...)` 是全表扫描
+   ⇒ 4755 条 change = **22,610,025 次比较**（实测这一段单独 128ms；叠上读文件/解压后
+   整个 `fs.history.turnSummary` 达 1480~3262ms）。
+   现在按 `undoOf` 预建 Map（一次 O(n)），查找 O(1)。**判定逻辑一字未变**：
+   仍然要求「未作废 + actor 是用户撤销 + 其写回版本仍生效」。 */
+function buildUndoIndex(all: HistoryChange[]): Map<string, HistoryChange[]> {
+  const m = new Map<string, HistoryChange[]>()
+  for (const c of all) {
+    if (!c.undoOf || c.voided) continue
+    if (c.actor !== '用户撤销' && c.actor !== '用户撤销(整轮)') continue
+    const arr = m.get(c.undoOf)
+    if (arr) arr.push(c)
+    else m.set(c.undoOf, [c])
+  }
+  return m
+}
+/** 与 `changeStatus` 同口径，但用预建索引（turnSummaries 的批量路径用这个） */
+function changeStatusWithIndex(workDir: string, change: HistoryChange, undoIdx: Map<string, HistoryChange[]>): ChangeState {
+  if (!change.relPath || change.kind !== 'file') return 'active'
+  if (versionEffective(workDir, change)) return 'active'
+  const cands = undoIdx.get(change.id)
+  if (!cands || !cands.length) return 'superseded'
+  for (const c of cands) if (versionEffective(workDir, c)) return 'undone'
+  return 'superseded'
 }
 
 /** 轮次汇总（变更区组头一次批量算，替代前端逐条 status 往返）：
@@ -245,11 +369,13 @@ export function turnSummaries(workDir: string, sid?: string): Record<number, { u
     arr.push(c)
     byTurn.set(c.turnIndex, arr)
   }
+  /* ★1109：预建 undoOf 索引，把每条 change 的 O(n) 全表查找换成 O(1)（口径不变） */
+  const undoIdx = buildUndoIndex(all)
   for (const [ti, cs] of byTurn) {
     let undone = false
     let supersededAll = cs.length > 0
     for (const c of cs) {
-      const st = changeStatus(workDir, c, all)
+      const st = changeStatusWithIndex(workDir, c, undoIdx)
       if (st === 'undone') undone = true
       if (st !== 'superseded') supersededAll = false
     }
@@ -258,8 +384,10 @@ export function turnSummaries(workDir: string, sid?: string): Record<number, { u
   return out
 }
 
-/** 行级 diff 量统计（LCS 行数差）：展示 +N-M 用，不做逐行对齐 */
-function diffStat(before: Buffer | null, after: Buffer | null): { diffAdded: number; diffRemoved: number } {
+/** 行级 diff 量统计（LCS 行数差）：展示 +N-M 用，不做逐行对齐
+ *  ★1015：导出给 tools.ts 用 —— fs_edit 手里本就有 before/after 两份内容，
+ *  不必绕道快照库（工作区外文件不落快照，绕道就永远没有 +N-M）。 */
+export function diffStat(before: Buffer | null, after: Buffer | null): { diffAdded: number; diffRemoved: number } {
   const a = before ? before.toString('utf8').split(/\r\n|\r|\n/) : []
   const b = after ? after.toString('utf8').split(/\r\n|\r|\n/) : []
   // LCS 长度（滚动数组；快照文件上限 10MB，行数上万美元级也够快）
@@ -354,40 +482,69 @@ export function snapshotFile(opts: {
 }
 
 /** 树快照：run_command 执行前调用。整工作区 gzip 打包（排除 .nis-history 自身） */
-export function snapshotTree(opts: { workDir: string; actor: string; sessionId?: string; toolCallId?: string; turn?: { turnId: string; turnIndex: number } }): string | null {
+export async function snapshotTree(opts: { workDir: string; actor: string; sessionId?: string; toolCallId?: string; turn?: { turnId: string; turnIndex: number } }): Promise<string | null> {
   try {
     const workDir = opts.workDir
+    /* ★1127：已知过大（60 秒内判过）→ 直接跳过，不再白扫一轮预算 */
+    if (Date.now() < (oversizedCooldownUntil.get(workDir) || 0)) return null
     if (!fs.existsSync(workDir)) return null
     const files: Array<{ rel: string; hash: string }> = []
-    /* ★ 0924：到预算就**立刻停止遍历**（不是扫完再判断）—— 这一步是关键，
-       否则在大工作区上光"扫完"就已经把事件循环堵死了。 */
+    /* ★ 0924：到预算就**立刻停止遍历**（不是扫完再判断）。 */
     let overBudget = false
     const snapT0 = Date.now()
-    const walk = (dir: string) => {
+    /* ★1127：**异步分片让出** —— 每处理 N 个文件让出一次事件循环。
+       原来全同步（readdirSync + readFileSync + sha256 + gzipSync）在大工作区会连续堵主线程
+       2~5 秒，WS 心跳和 /api/ping 都发不出去，前端据此判定"后端已死"→ 反复重连（1127 实测：
+       老板看到"后端连续断好几次"，实际进程从未退出）。让出后总耗时略增，但主线程不再连续阻塞。 */
+    /* ★1128【改成按**时间**分片，不再按文件数】实测（ping 探针 + 大工作区 <dev仓库> / 1.5 万文件）：
+       一条写命令触发快照时，后端出现一次 **2808ms** 的尖峰。预算是 1500ms，但"每 32 个文件才让出"
+       遇到大文件（bundle / 字体 / 大 JSON）时，单片累积阻塞就能到几百 ms，几片叠加就顶到秒级。
+       现在：只要这一片已经连续跑了 >20ms 就让出 —— 单次阻塞上限锁在 ~20ms 量级。
+       代价是同样 1500ms 预算内扫到的文件变少（快照本来就是尽力而为，overBudget 会跳过并冷却 60s），
+       换来的是事件循环不再被长时间独占（WS 心跳 / /api/ping 不会被误判成"后端已死"）。 */
+    const SNAPSHOT_YIELD_SLICE_MS = 20
+    let sliceStartAt = Date.now()
+    const yieldIfNeeded = async (): Promise<void> => {
+      if (Date.now() - sliceStartAt < SNAPSHOT_YIELD_SLICE_MS) return
+      sliceStartAt = Date.now()
+      await new Promise<void>((r) => setImmediate(r))
+    }
+    const walk = async (dir: string): Promise<void> => {
       if (overBudget) return
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      let entries: any[]
+      try {
+        entries = await fs.promises.readdir(dir, { withFileTypes: true })
+      } catch { return }   // 目录不可读：跳过（与同步版外层 try 同义）
+      for (const e of entries) {
         if (overBudget) return
         if (Date.now() - snapT0 > SNAPSHOT_BUDGET_MS) { overBudget = true; return }
         if (e.name === '.nis-history') continue
         const full = path.join(dir, e.name)
         if (e.isDirectory()) {
-          // 0910 磁盘治理：依赖/构建产物/版本库不进树快照（cordis 会话在工作区=E:\nis0812 时
-          // 反复整仓快照堆出 21GB；tree 快照本就"只写不读"——restoreChange 拒绝、面板只列 file）
+          // 0910 磁盘治理：依赖/构建产物/版本库不进树快照
           if (SNAPSHOT_SKIP_DIRS.has(e.name)) continue
-          walk(full); continue
+          /* 1107：_ 前缀 = 任务临时产物目录，不进"撤销/审查"语义 */
+          if (e.name.startsWith('_')) continue
+          await walk(full)
+          continue
         }
         try {
-          const st = fs.statSync(full)
+          const st = await fs.promises.stat(full)
           if (st.size > SNAPSHOT_MAX_BYTES) continue
           if (files.length >= SNAPSHOT_MAX_FILES) { overBudget = true; return }
           const rel = path.relative(workDir, full).replace(/\\/g, '/')
-          files.push({ rel, hash: putObject(fs.readFileSync(full)).hash })
+          const buf = await fs.promises.readFile(full)
+          /* putObject 保持同步：它有内容缓存（同 hash 直接命中），单文件 sha256+gzip 是毫秒级；
+             真正的 IO 大头（遍历 / stat / 读文件）已经异步化。 */
+          files.push({ rel, hash: putObject(buf).hash })
         } catch { /* ignore 单文件失败 */ }
+        await yieldIfNeeded()
       }
     }
-    walk(workDir)
+    await walk(workDir)
     if (overBudget) {
-      console.warn(`[fileHistory] 工作区过大（>${SNAPSHOT_MAX_FILES} 文件，或超 ${SNAPSHOT_BUDGET_MS}ms 预算；已扫 ${files.length} 个 / 耗时 ${Date.now() - snapT0}ms）：${workDir} → 跳过本次树快照（保护事件循环，命令照常执行）`)
+      oversizedCooldownUntil.set(workDir, Date.now() + OVERSIZED_COOLDOWN_MS)
+      console.warn(`[fileHistory] 工作区过大（>${SNAPSHOT_MAX_FILES} 文件，或超 ${SNAPSHOT_BUDGET_MS}ms 预算；已扫 ${files.length} 个 / 耗时 ${Date.now() - snapT0}ms）：${workDir} → 跳过本次树快照（命令照常执行）`)
       return null
     }
     const manifest = Buffer.from(JSON.stringify({ files }), 'utf8')
@@ -524,10 +681,17 @@ export function restoreChange(workDir: string, changeId: string, opts?: { dryRun
 const GC_MIN_INTERVAL_MS = 60 * 60 * 1000  // 全库扫描不便宜：每小时最多跑一次
 let lastGcAt = 0
 /** opts.force=true：跳过 1h 限流（自动/手动清理刚裁掉记录，需要立即物理回收对象；否则要等下一小时） */
-export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): { deletedOrphans: number; freedBytes: number } {
+export async function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): Promise<{ deletedOrphans: number; freedBytes: number }> {
   const now = Date.now()
   if (!opts?.force && now - lastGcAt < GC_MIN_INTERVAL_MS) return { deletedOrphans: 0, freedBytes: 0 }
   lastGcAt = now
+  /* ★1032-TM（P110）：**分片让出**。这个 GC 是同步扫盘 + 同步删（实测回收 1775 个孤儿文件耗时 4922ms），
+     一口气把主线程堵死 ⇒ 期间所有 RPC/帧排队，界面卡住（日志自己都打「这段时间事件循环被堵住」）。
+     改成分片：每处理一批就让出一次事件循环。**删哪些、判定逻辑、引用计数全部原样** —— 只改节奏。
+     `budget` 是让出节流计数（每 64 次单位工作让出一次，避免每文件一次 setImmediate 反而拖慢总量）。 */
+  const yieldLoop = () => new Promise<void>((r) => setImmediate(r))
+  let _yieldTick = 0
+  const maybeYield = async () => { if (++_yieldTick % 64 === 0) await yieldLoop() }
   let deletedOrphans = 0, freedBytes = 0
   try {
     if (!fs.existsSync(OBJECTS_DIR)) return { deletedOrphans, freedBytes }
@@ -549,7 +713,13 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
     }
     for (const wd of (workDirs || [])) collectCf(changesFile(wd), wd)
     // NisData 兜底扫描（两层：聊天工作区 + projects/<id>）
-    const scanRoot = (root: string, depth: number) => {
+    /* ★1109 修复：**这里的分片原来是假的**。原实现循环末尾只写 `_yieldTick++`（单纯计数），
+       从未 `await` 过 —— 而注释写着"每处理一批就让出一次事件循环"。
+       后果：整个扫描（实测 538 个目录 / 126ms）是**一整块**同步执行，
+       加上第 2 步删孤儿的真分片，GC 总耗时实测 1530ms 里有 126ms 是不可打断的。
+       现在改成 async + `await maybeYield()`，与第 2 步同一套节奏（每 64 个让出一次）。
+       ⚠️ 判定逻辑一字未改：同样的 depth 上限、同样的 changesFile 判据、同样的 collectCf。 */
+    const scanRoot = async (root: string, depth: number): Promise<void> => {
       if (depth > 2) return
       let entries: fs.Dirent[]
       try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { return }
@@ -558,10 +728,11 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
         const full = path.join(root, e.name)
         const cf = path.join(full, '.nis-history', 'changes.json')
         if (fs.existsSync(cf)) collectCf(cf, full)
-        if (e.name === 'projects' || depth === 0) scanRoot(full, depth + 1)
+        if (e.name === 'projects' || depth === 0) await scanRoot(full, depth + 1)
+        await maybeYield()
       }
     }
-    scanRoot(NIS_DATA_WORKDIRS, 0)
+    await scanRoot(workdirsRootNow(), 0)
     // tree 清单 BFS 展开（清单对象引用的文件也计数；同一清单内同 hash 去重）
     const readObj = (h: string): Buffer | null => {
       const p = objPath(h)
@@ -584,6 +755,7 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
         } catch { /* ignore */ }
       }
       frontier = next
+      await yieldLoop()   // 每一层清单展开后让出一次（层数很少，代价可忽略）
     }
     // 2) 删孤儿
     let total = 0
@@ -598,6 +770,7 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
         try { fst = fs.statSync(full) } catch { continue }
         total += fst.size
         const h = f.replace(/\.gz$/, '')
+        await maybeYield()
         if (!refCount.has(h)) {
           try { fs.rmSync(full); deletedOrphans++; freedBytes += fst.size; total -= fst.size } catch { /* ignore */ }
         }
@@ -607,6 +780,7 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
     treeEntries.sort((a, b) => a.t - b.t)
     for (const te of treeEntries) {
       if (total <= GLOBAL_BUDGET_BYTES) break
+      await yieldLoop()
       const drop = (h: string | undefined) => {
         if (!h) return
         const c = refCount.get(h)
@@ -636,11 +810,26 @@ export function enforceBudget(workDirs?: string[], opts?: { force?: boolean }): 
   return { deletedOrphans, freedBytes }
 }
 
-const NIS_DATA_WORKDIRS = 'C:/Users/Administrator/Documents/NisData'
+/* ★开源整理批（2026-11）：工作区根改由 server.ts 注入。
+ *   原来写死 '<用户目录>/Documents/NisData' —— 换人换机器后恒为"不存在的目录"，
+ *   孤儿工作区盘点、历史巡检、占用统计全部静默空转（还不报错，最难查）。
+ *   口径：**不设默认值**。没注入就是编程错误，直接抛，不静默兜底。
+ *   传函数而不是传值：设置里改存储目录后，根要跟着变。 */
+let workdirsRootProvider: (() => string) | null = null
+
+/** 由 server.ts 启动时注入：返回当前存储根（= 设置→存储目录，缺省 DATA_ROOT/storage） */
+export function setWorkdirsRootProvider(fn: () => string): void {
+  workdirsRootProvider = fn
+}
+
+function workdirsRootNow(): string {
+  if (!workdirsRootProvider) throw new Error('fileHistory: 工作区根未初始化（server 启动时应调用 setWorkdirsRootProvider）')
+  return path.resolve(workdirsRootProvider())
+}
 
 /** 孤儿工作区盘点：sessions.json 里没有的工作区目录（数据管理页一键清理的对象） */
 export function listOrphanWorkdirs(liveWorkdirs: string[]): Array<{ name: string; bytes: number }> {
-  const root = NIS_DATA_WORKDIRS
+  const root = workdirsRootNow()
   const live = new Set(liveWorkdirs.map(w => path.basename(w.replace(/[\\/]+$/, ''))))
   const out: Array<{ name: string; bytes: number }> = []
   try {
@@ -668,8 +857,8 @@ export function removeWorkdir(name: string): { ok: boolean; error?: string } {
   if (!/^[\w.-]+$/.test(name)) return { ok: false, error: '非法目录名' }
   // 0906 加固补漏：上面字符类含 '.'，name='..' 能过正则 → 旧代码会 rmSync 递归删除整个 Documents。
   // 断言解析后目标真在 NisData 根内（封死 '..'、点开头目录等一切越界）
-  const rootAbs = path.resolve(NIS_DATA_WORKDIRS)
-  const full = path.join(NIS_DATA_WORKDIRS, name)
+  const rootAbs = workdirsRootNow()
+  const full = path.join(rootAbs, name)
   const fullAbs = path.resolve(full)
   if (fullAbs === rootAbs || !fullAbs.startsWith(rootAbs + path.sep)) {
     return { ok: false, error: '非法目录名（路径越界）' }
@@ -705,18 +894,85 @@ function discoverHistoryWorkdirs(extra: string[]): string[] {
       if (e.name === 'projects' || depth === 0) scan(full, depth + 1)
     }
   }
-  scan(NIS_DATA_WORKDIRS, 0)
+  scan(workdirsRootNow(), 0)
   return Array.from(out)
 }
 
-/** 占用统计（设置页展示）：totalBytes=对象库实际磁盘占用（跨工作区去重后）；
- *  workspaces=各工作区记录数/估算体积（beforeBytes 合计，未去重，仅作分布参考） */
-export function historyStats(workDirs: string[]): {
+/** 工作区发现（**异步分片版**，后台巡检用）。
+ *  与同步版逻辑**逐字一致**（同样的深度、同样的 changesFile 判据、同样的路径解析），
+ *  只是每 64 个目录让出一次事件循环 —— 实测同步版扫 538 个目录要 126ms 整块阻塞。 */
+async function discoverHistoryWorkdirsAsync(extra: string[]): Promise<string[]> {
+  const out = new Set<string>()
+  for (const wd of extra || []) { if (wd && wd.trim()) out.add(path.resolve(wd.trim())) }
+  const yieldLoop = () => new Promise<void>((r) => setImmediate(r))
+  let tick = 0
+  const scan = async (root: string, depth: number): Promise<void> => {
+    if (depth > 2) return
+    let entries: fs.Dirent[]
+    try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue
+      const full = path.join(root, e.name)
+      if (fs.existsSync(changesFile(full))) out.add(path.resolve(full))
+      if (e.name === 'projects' || depth === 0) await scan(full, depth + 1)
+      if (++tick % 64 === 0) await yieldLoop()
+    }
+  }
+  await scan(workdirsRootNow(), 0)
+  return Array.from(out)
+}
+
+/** ★1109 性能：占用统计的**缓存 + 异步分片**三件套。
+ *
+ *  病（实测）：`historyStats` 同步遍历 `objects/` 下 **6927 个文件**，耗时 **757ms**；
+ *  而 `runHistoryAutoClean` 每 **10 分钟**无条件调它一次，只为判断"要不要清理" ⇒
+ *  每 10 分钟把事件循环堵死 757ms（期间所有 RPC/SSE 帧排队）。每小时 6 次 ≈ 4.5 秒纯浪费。
+ *
+ *  三条口径：
+ *   · **设置页（RPC，用户主动打开）** → 同步版，允许一次 757ms（用户在看设置），但**先查缓存**：
+ *     后台巡检刚算过（≤ STATS_CACHE_MS）就直接命中，不重复扫。
+ *   · **后台巡检（每 10 分钟）** → 异步分片版，每 64 个文件让出一次事件循环，单块阻塞 ≈7ms；
+ *     算完写缓存，设置页随后打开即可命中。
+ *   · **并发合并**：同一时刻只允许一个计算在跑，其他人等同一份结果（不让两次扫盘叠加）。
+ *  ⚠️ 缓存只省"重复扫"，不改数字口径；`forceFresh` 可强制重算（设置页刷新按钮用）。 */
+const STATS_CACHE_MS = 5 * 60_000
+/* 缓存用 **Map（最多 4 个 key）** 而不是单槽：后台巡检传的 workDirs（活跃会话）
+   与设置页 RPC 传的（可能是全部）常常不同 —— 单槽会让两者互相顶掉，等于没缓存。
+   实测踩到：同步版写 key A、异步版写 key B，再查 A 时已失效（848ms 白扫一遍）。 */
+const STATS_CACHE_MAX = 4
+const _statsCache = new Map<string, { at: number; result: HistoryStatsResult }>()
+let _statsComputing: Promise<HistoryStatsResult> | null = null
+export interface HistoryStatsResult {
   totalBytes: number
   objectCount: number
   totalChanges: number
   workspaces: Array<{ name: string; changes: number; bytes: number }>
-} {
+}
+function statsKey(workDirs: string[]): string {
+  return (workDirs || []).slice().sort().join('\u0000')
+}
+/** 缓存命中（未过期 + 同一批 workDirs） */
+function statsCacheGet(workDirs: string[]): HistoryStatsResult | null {
+  const key = statsKey(workDirs)
+  const hit = _statsCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.at >= STATS_CACHE_MS) { _statsCache.delete(key); return null }
+  return hit.result
+}
+function statsCachePut(workDirs: string[], r: HistoryStatsResult): void {
+  const key = statsKey(workDirs)
+  _statsCache.set(key, { at: Date.now(), result: r })
+  /* 超上限：删最旧的一个（4 个 key 的量级，线性找最旧即可） */
+  if (_statsCache.size > STATS_CACHE_MAX) {
+    let oldestKey: string | null = null
+    let oldestAt = Infinity
+    for (const [k, v] of _statsCache) { if (v.at < oldestAt) { oldestAt = v.at; oldestKey = k } }
+    if (oldestKey !== null) _statsCache.delete(oldestKey)
+  }
+}
+
+/** 同步算一遍（内部实现；外部走 `historyStats` 缓存版 / `historyStatsAsync` 分片版） */
+function historyStatsSync(workDirs: string[]): HistoryStatsResult {
   let totalBytes = 0
   let objectCount = 0
   try {
@@ -751,17 +1007,84 @@ export function historyStats(workDirs: string[]): {
   return { totalBytes, objectCount, totalChanges, workspaces }
 }
 
+/** 占用统计（设置页 RPC）。**先查缓存**；未命中才同步扫（一次 757ms，用户主动动作可接受）。
+ *  `forceFresh` = 忽略缓存强制重算（设置页「刷新」用）。 */
+export function historyStats(workDirs: string[], opts?: { forceFresh?: boolean }): HistoryStatsResult {
+  if (!opts?.forceFresh) {
+    const hit = statsCacheGet(workDirs)
+    if (hit) return hit
+  }
+  const r = historyStatsSync(workDirs)
+  statsCachePut(workDirs, r)
+  return r
+}
+
+/** 占用统计（**后台巡检专用**）：异步分片，每 64 个单位让出一次事件循环。
+ *  口径与同步版**逐字一致**（同样的遍历顺序、同样的字段），只是节奏不同。 */
+export async function historyStatsAsync(workDirs: string[]): Promise<HistoryStatsResult> {
+  const hit = statsCacheGet(workDirs)
+  if (hit) return hit
+  /* 并发合并：同一时刻只算一份（两次巡检/巡检+设置页同时来，不会叠加扫盘） */
+  if (_statsComputing) return _statsComputing
+  const task = (async (): Promise<HistoryStatsResult> => {
+    const yieldLoop = () => new Promise<void>((r) => setImmediate(r))
+    let tick = 0
+    const maybeYield = async () => { if (++tick % 64 === 0) await yieldLoop() }
+    let totalBytes = 0
+    let objectCount = 0
+    try {
+      if (fs.existsSync(OBJECTS_DIR)) {
+        for (const d of fs.readdirSync(OBJECTS_DIR)) {
+          const sub = path.join(OBJECTS_DIR, d)
+          let st: fs.Stats
+          try { st = fs.statSync(sub) } catch { continue }
+          if (!st.isDirectory()) continue
+          for (const f of fs.readdirSync(sub)) {
+            try {
+              const fst = fs.statSync(path.join(sub, f))
+              if (fst.isFile()) { totalBytes += fst.size; objectCount++ }
+            } catch { /* ignore */ }
+            await maybeYield()
+          }
+        }
+      }
+    } catch { /* ignore */ }
+    let totalChanges = 0
+    const workspaces: Array<{ name: string; changes: number; bytes: number }> = []
+    for (const wd of await discoverHistoryWorkdirsAsync(workDirs)) {
+      const changes = loadChanges(wd)
+      if (!changes.length) continue
+      totalChanges += changes.length
+      workspaces.push({
+        name: path.basename(wd.replace(/[\\/]+$/, '')) || wd,
+        changes: changes.length,
+        bytes: changes.reduce((a, c) => a + (c.beforeBytes || 0), 0),
+      })
+      await maybeYield()
+    }
+    workspaces.sort((a, b) => b.bytes - a.bytes)
+    const r: HistoryStatsResult = { totalBytes, objectCount, totalChanges, workspaces }
+    statsCachePut(workDirs, r)
+    return r
+  })()
+  _statsComputing = task
+  try { return await task } finally { _statsComputing = null }
+}
+
 /** 自动/手动清理：占用超阈值（或 force）时，把全部工作区的记录按时间从旧到新裁掉 pct%——
  *  先裁元数据（changes.json），再强制 GC 物理回收对象。内容寻址去重保证安全：
  *  仍被较新记录引用的对象引用计数>0 不动，只删引用归零的；被裁记录的撤销入口随之消失（预期行为）。
  *  opts.force=true：忽略阈值（设置页「立即清理」用）。 */
-export function autoCleanHistory(
+export async function autoCleanHistory(
   workDirs: string[],
   thresholdBytes: number,
   pct: number,
   opts?: { force?: boolean },
-): { triggered: boolean; removedWorkspaces: number; removedChanges: number; freedBytes: number; totalBytes: number } {
-  const before = historyStats(workDirs).totalBytes
+): Promise<{ triggered: boolean; removedWorkspaces: number; removedChanges: number; freedBytes: number; totalBytes: number }> {
+  /* ★1109 性能：before 改用**异步分片版**（原来是同步 historyStats，757ms 整块堵）。
+     这是每 10 分钟一次的巡检，必须不阻塞；after 仍用同步版 —— 清理完对象少了很多，
+     快得多，而且"清理后立刻要精确数字回报给用户"，不能吃缓存。 */
+  const before = (await historyStatsAsync(workDirs)).totalBytes
   const over = Number.isFinite(thresholdBytes) && thresholdBytes > 0 && before > thresholdBytes
   if (!opts?.force && !over) return { triggered: false, removedWorkspaces: 0, removedChanges: 0, freedBytes: 0, totalBytes: before }
   const ratio = Math.min(90, Math.max(5, Math.floor(Number(pct) || 20)))
@@ -792,7 +1115,7 @@ export function autoCleanHistory(
     } catch { /* ignore */ }
   }
   // 强制 GC：跳过 1h 限流，立即回收引用归零的对象
-  const gc = enforceBudget(workDirs, { force: true })
+  const gc = await enforceBudget(workDirs, { force: true })
   const after = historyStats(workDirs).totalBytes
   return {
     triggered: true,

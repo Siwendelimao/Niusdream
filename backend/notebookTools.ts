@@ -10,7 +10,7 @@
  * （工具名沿用 notebook_* —— 预设里存的是名字，改了会让存量预设对不上；中文名走 label）
  */
 import { Type } from 'typebox'
-import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { AgentTool } from './agentCompat.ts'
 import { buildFamilyTool } from './familyTool.ts'
 import {
   notebookList, notebookAdd, notebookUpdate, notebookRemove, notebookCounts,
