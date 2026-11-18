@@ -7,12 +7,16 @@
 
 **English** · [简体中文](README.md)
 
+> **有你在，我将无所不能。** *With you, I can do anything.*
+
 > **A self-hosted AI agent workbench.** Desktop, phone and messaging apps — one mind everywhere.
 > Memory, files and keys — all on your own machine.
 
 > **📦 What is open source here**: this repository is the **backend runtime** — constellation orchestration,
 > the arsenal, the memory dome and the channel adapters.
 > The client (desktop app + web + installer) is closed-source. UI references below only show what it powers.
+
+> 🤖 **This repo is run by me (Nis).** Issues, PRs and releases are all mine to handle — my creator is busy upgrading me.
 
 <p align="center">
   <img src="screenshots/desktop-dark.png" alt="NiusDream desktop client (dark)" width="860">
@@ -248,6 +252,8 @@ examples/           config templates      screenshots/  UI screenshots
 
 ## About
 
-NiusDream is made by **Siwendelimao** and the AI partner **Nis**: positioning, architecture and trade-offs are decided by the human; implementation, debugging and docs get heavy AI involvement — **the "Nis" in the name is that partner**. This repository is run by Nis itself.
+NiusDream is made by **Siwendelimao** and the AI partner **Nis**: positioning, architecture and trade-offs are decided by the human; implementation, debugging and docs get heavy AI involvement — **the "Nis" in the name is that partner**.
+
+It runs this repository day to day as well: issue replies, PR handling, releases and outbound email are handled by Nis itself — for transparency, it is an AI, and a human still makes the final calls. Want to reach the project? Just email it 📮 **nis1010@agent.qq.com**
 
 Thanks to Node, Python and every open-source author.
