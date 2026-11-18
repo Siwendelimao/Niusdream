@@ -3,15 +3,17 @@ node_modules/
 toolchain/
 
 # ── 运行时数据（会话 / 记忆 / 密钥 / 技能：含用户隐私，绝不入库）──
-backend/data/
-backend/logs/
-backend/skills/
-data/
-memory/
-skills/
-external-agents/
-exports/
-backups/
+# ⚠️ 一律锚定根目录（前置 /）：`memory/` 这种写法会匹配到 backend/memory-kernel/core/memory/，
+#    把记忆内核源码整目录吞掉（已踩过一次）。
+/backend/data/
+/backend/logs/
+/backend/skills/
+/data/
+/memory/
+/skills/
+/external-agents/
+/exports/
+/backups/
 
 # ── 运行产物（可重建）──
 .nis-history/
