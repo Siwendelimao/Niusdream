@@ -1,7 +1,12 @@
-# Dependabot 配置（1013 由 NIS 提交，1013b 加 major 拦截）
+# Dependabot 配置（1013 由 NIS 提交，1013b 加 major 拦截；2026-11 收窄到只扫后端）
+#
 # 策略：① 安全更新成组（别一包一 PR）② 常规升级只放行 minor/patch 并成组
 #      ③ **大版本（major）一律不提 PR** —— 要人腾出时间测，不适合自动跟
-# 说明：安全更新由仓库设置里的 Dependabot Security Updates 触发（已开启），不受 open-pull-requests-limit 限制。
+#
+# ⚠️ 2026-11 变更：仓库开源范围收窄为「只有后端运行时」。
+#   `/frontend`、`/`（根 package.json）、`/frontend/src-tauri`、`/setup/src-tauri`
+#   这四个目录已从仓库移除，继续配置只会产生永远合并不掉的空 PR（历史上开了 6 个）。
+#   现在只扫 `/backend`；将来若把哪块加回仓库，记得在这里同步加回对应 ecosystem。
 version: 2
 updates:
   # 后端（npm，backend/package-lock.json）
@@ -17,62 +22,6 @@ updates:
       minor-and-patch:
         applies-to: version-updates
         update-types: [minor, patch]
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
-  # 前端（pnpm 锁文件；Dependabot 用 npm 生态识别）
-  - package-ecosystem: npm
-    directory: /frontend
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      security:
-        applies-to: security-updates
-        patterns: ["*"]
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
-  # 仓库根
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-    groups:
-      security:
-        applies-to: security-updates
-        patterns: ["*"]
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
-  # Tauri 壳（Rust）
-  - package-ecosystem: cargo
-    directory: /frontend/src-tauri
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-    groups:
-      all:
-        patterns: ["*"]
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
-  - package-ecosystem: cargo
-    directory: /setup/src-tauri
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-    groups:
-      all:
-        patterns: ["*"]
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
