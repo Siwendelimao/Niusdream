@@ -44,7 +44,7 @@ export const TOOL_CATALOG: ToolRegistryEntry[] = [
   // ── 文件（tools.ts buildSessionTools，cwd=会话工作区）──
   { name: 'fs_read', label: '读取文件', description: '读取工作区文件内容（可截断；支持 startLine/endLine 分段读）', group: '文件', variant: 'read', tab: 'system' },
   { name: 'list_dir', label: '列目录', description: '列出目录内容（文件/子目录+大小，毫秒级）——看结构用它，别 run_command dir', group: '文件', variant: 'read', tab: 'system' },
-  { name: 'schedule', label: '定时任务', description: '定时任务：create 建（once/hourly/daily/weekly/monthly）· list 查 · update 改/停启用 · remove 删 · run_now 立跑', group: '定时任务', variant: 'others', tab: 'system', risky: true },
+  { name: 'schedule', label: '定时任务', description: '定时任务：create 建（once/hourly/daily/weekly/monthly）· list 查 · update 改/停启用/绑对话/开关值守 · remove 删 · run_now 立跑', group: '定时任务', variant: 'others', tab: 'system', risky: true },
   { name: 'repo', label: '仓库地图', description: '仓库导航：map 结构概览 · search 按符号/概念找代码位置 · build 重建索引（与 fs_grep 互补）', group: '文件', variant: 'search', tab: 'system' },
   { name: 'fs_grep', label: '搜索文件内容', description: '按关键词/正则搜索工作区文件内容（返回 文件:行号 + 上下文），查代码引用/配置项时用它，别再拼 findstr', group: '文件', variant: 'search', tab: 'system' },
   { name: 'fs_write', label: '写入文件', description: '写入/新建文件（含多模态图片写入）', group: '文件', variant: 'write', tab: 'system', risky: true },

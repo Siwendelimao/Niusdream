@@ -28,6 +28,9 @@ import { swallowed } from './swallowed.ts'
 /* ★f1b（P0-3）：run 终态判决的唯一口径（团队路径与分身路径共用同一个函数） */
 import { judgeRunOutcome } from './runVerdict.ts'
 import type { TeamDef, TeamMember } from './teamsStore.ts'
+/* ★member-lifetime：成员用量**唯一口径**（纯聚合 + 唯一的字段映射）—— 
+   广播帧与 `blackboard.read` 必须写同一套字段，所以映射函数也共用这一份。 */
+import { mergeViewsIntoMemberTotals, type MemberUsageTotalsView } from './memberUsageAggregate.ts'
 
 // ============================================================================
 // 黑板存储（backend/data/blackboard/<sessionId>.json，按会话键控）
@@ -76,14 +79,17 @@ export function runCountsAsExecuted(run: any, step: any): boolean {
   return true                                          // done / timeout ⇒ 跑到终态了
 }
 
+function runMatchesStep(run: any, step: any): boolean {
+  return !!step?.runId && step.runId === (run?.runId || run?.id) && step.id === run?.stepId && step.owner === run?.memberId
+}
+
 export function stepHasExecutionEvidence(step: any, runs: any[] | undefined): boolean {
-  const sid = String(step?.id || '')
   /* b) 步骤停在 review —— 成员跑完上报（runStepTask 亲手写），本身就是产出证据 */
   if (String(step?.status || '') === 'review') return true
   /* c) executedAt —— 执行路径落的持久证据（runs 被封顶裁掉/被自愈覆盖也查得到） */
   if (Number(step?.executedAt || 0) > 0) return true
   /* a) runs 里有该步的终态记录（interrupted 需额外有产出，见 runCountsAsExecuted） */
-  return (runs || []).some(r => String(r?.stepId || '') === sid && runCountsAsExecuted(r, step))
+  return (runs || []).some(r => runMatchesStep(r, step) && runCountsAsExecuted(r, step))
 }
 
 /** ★gg1：审核闸门失败时的**人话解释** —— 按真实原因分支。
@@ -96,7 +102,7 @@ export function stepHasExecutionEvidence(step: any, runs: any[] | undefined): bo
 export function explainNoExecutionEvidence(step: any, runs: any[] | undefined): string {
   const id = String(step?.id || '')
   const status = String(step?.status || '')
-  const myRuns = (runs || []).filter(r => String(r?.stepId || '') === id)
+  const myRuns = (runs || []).filter(r => runMatchesStep(r, step))
   const outLen = String((step as any)?.result ?? '').trim().length
   const at = Number((step as any)?.executedAt || 0)
   const atText = at > 0 ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : ''
@@ -157,6 +163,7 @@ export interface BlackboardStep {
   artifacts?: string[]
   feedback?: string
   runId?: string
+  executedAt?: number
   /** ★nb1：**派发留痕**（team_dispatch 通过全部硬校验后写入的毫秒时间戳）。
    *  病因：step.status 在"已派出、但还在成员车道上排队"期间仍是 `pending`（车道是内存态、黑板看不出来）
    *  ⇒ 回归通知里的「下一步建议」只能把她当成"从没派过"，于是把**排队中**误报成**待派发**（实测）。
@@ -255,21 +262,44 @@ export interface MemberTokenTotal {
   /** ★r3：该成员**实际生效模型**的窗口大小（token）。按成员的模型解析结果取 ——
    *  独立模型模式用它自己配的，跟随会话模式用会话的；解析不出窗口就**不写**（不猜一个默认值）。 */
   ctxWindow?: number
-  /** ★d1：**这个数字从哪来的**（诊断字段，不参与任何运算/显示口径计算）。
+  /** ★d1/★member-lifetime：**这个数字从哪来的**（诊断字段，不参与任何运算/显示口径计算）。
    *  · `'ledger'` = 成员会话账本（`usageTotals`，**含私聊消耗**，且不受 runs 封顶影响）—— 主源
-   *  · `'runs'`   = 回退到板上 runs 累计（老逻辑）
+   *  · `'runs'`   = 回退到板上 runs 累计（该成员没有任何成员会话可读时的残值）
+   *  · `'empty'`  = 成员有会话但一段都没跑过（真 0，不是"未知"）
    *  为什么要这个字段：改了数据源之后，"为什么这个成员的数字和我预期不一样"必须能一眼查清；
-   *  没有它就只能靠猜是账本值还是 runs 残值。**只读不写进前端文案**，前端零改动。
-   *  缺省（undefined）= 本次没跑过合并（纯 `computeMemberTotals` 的原始结果）。 */
-  source?: 'ledger' | 'runs'
+   *  没有它就只能靠猜是账本值还是 runs 残值。**只读不写进前端文案**，前端零改动。 */
+  source?: 'ledger' | 'runs' | 'empty'
   /** ★f1：**当前（未归档）那一段的 token 合计** —— 卡片上显示的那个数（老板：新开对话就清 0）。
-   *  ⚠️ 与上面 `tokens`（全历史累计，其他统计还用）**不是一个口径**，两者都保留：
-   *     · `tokens`    = 该成员历史全部段 + 已退休 runs 的累计（图表/统计用）
+   *  ⚠️ 与上面 `tokens`（**全历史**：当前段 + 归档段 + 其中私聊）**不是一个口径**，两者都保留：
+   *     · `tokens`    = 该成员全部段的账本累计（图表/统计用；★member-lifetime 起真的是全历史）
    *     · `segTokens` = 当前段的累计（卡片显示用；开新段天然从 0 起）
    *  拿不到就是 `undefined`（**前端显示「—」，不许写 0 冒充"这一段用了 0"**）。 */
   segTokens?: number
   /** ★f1：当前是**第几段**（`memberSessionSeq`）。缺失/未知 = `undefined`（前端显示「—」）。 */
   segSeq?: number
+  /** ★member-lifetime：存在 >1 个未归档段（数据异常）⇒ `segTokens` 按 seq 最大取，此处明确标出 */
+  segAmbiguous?: boolean
+  /** ★member-lifetime：**累计命中率**（整数百分比）—— 唯一口径，由后端算好。
+   *  公式 = Σ缓存读 ÷ (Σ未命中 + Σ缓存读 + Σ缓存写)，**先求和再相除**；分母 = 完整输入量。
+   *  `null` = 分母为 0（三桶全 0，不可计算，显示「—」）。⛔ 前端不要再自己除一遍。 */
+  hitRate?: number | null
+  /** 命中率分母（= Σ未命中 + Σ缓存读 + Σ缓存写 = 完整输入量），让"怎么算出来的"可查 */
+  hitDenominator?: number
+  /** ★member-lifetime：累计的**完整度**：
+   *  · `complete` = 每一段都有账本（数字完整可信）
+   *  · `partial`  = 有段缺账本（`missingSegments > 0`）⇒ `tokens` 是**部分和**，不许当全量展示
+   *  · `empty`    = 有段但一段都没跑过（真 0）
+   *  · `none`     = 该成员没有任何成员会话（数字是 runs 残值） */
+  usageStatus?: 'complete' | 'partial' | 'empty' | 'none'
+  /** 缓存信号的可证明边界：hit（有过命中）/ write-only（只写未读）/ never（读写都 0）/ none（无账本段） */
+  cacheSignal?: 'hit' | 'write-only' | 'never' | 'none'
+  /** 段数 / 可读段 / 缺账段 / 重复未归档段数（排障与展示"部分数据"提示用） */
+  segments?: number
+  readableSegments?: number
+  missingSegments?: number
+  duplicateActive?: number
+  /** 当前段会话 id（与 `session.memberUsageDetail.currentSessionId` 同源） */
+  usageCurrentSessionId?: string
 }
 /** 已「退休」（被 60 条封顶裁掉）的那部分累计 —— 只增不减，随板子落盘。
  *  foldedRunIds = 已经计过的 runId：长跑成员手里的旧副本可能把已裁的 run 带回板上，
@@ -341,29 +371,6 @@ export function foldRetiredRuns(board: any, dropped: any[]): void {
   }
 }
 
-/** 两侧 retired（盘上 / 本地副本）合并：**逐成员取较大者**。
- *  累计量单调只增 ⇒ 取大的不会让数字回退；不按字段各取 max —— 那会拼出一份谁都没见过的账。 */
-export function mergeMemberRetired(a: any, b: any): Record<string, MemberRetiredTotal> {
-  const out: Record<string, MemberRetiredTotal> = {}
-  for (const src of [a, b]) {
-    if (!src || typeof src !== 'object') continue
-    for (const mid of Object.keys(src)) {
-      const cur: any = (src as any)[mid]
-      if (!cur || typeof cur !== 'object') continue
-      const cand: MemberRetiredTotal = {
-        ...pickTotal(cur),
-        foldedRunIds: Array.isArray(cur.foldedRunIds) ? cur.foldedRunIds.slice(-MEMBER_FOLDED_IDS_KEEP) : [],
-      }
-      const prev = out[mid]
-      if (!prev) { out[mid] = cand; continue }
-      const better = cand.tokens > prev.tokens
-        || (cand.tokens === prev.tokens && (cand.runs > prev.runs || (cand.runs === prev.runs && cand.llmMs > prev.llmMs)))
-      if (better) out[mid] = cand
-    }
-  }
-  return out
-}
-
 /** 成员累计的**唯一口径** = memberRetired（已被裁掉的）+ 板上现存 runs。
  *  runs 里若出现「已经计进 retired 的 runId」（旧副本复活），跳过不算 —— 否则会重复计。 */
 export function computeMemberTotals(board: any): Record<string, MemberTokenTotal> {
@@ -409,230 +416,122 @@ export function memberTotalsLine(board: any): string {
 }
 /* ══════════ h5-member-totals:end ══════════ */
 
+type BoardRun = NonNullable<Blackboard['runs']>[number]
+
+// 恢复只检查刚读到的记录。车道从领取步骤到终态落盘始终持有 runId；
+// 不存在该持有者才能认定残留，不用时间戳推断，也不知道实际中断时刻。
+function recoverBlackboard(bb: Blackboard): void {
+  for (const step of bb.steps || []) {
+    if (step.status === 'running' && step.runId && !activeRunIds.has(step.runId)) step.status = 'interrupted'
+  }
+  for (const run of bb.runs || []) {
+    const runId = run?.runId || run?.id
+    if (run?.status === 'running' && runId && !activeRunIds.has(runId)) {
+      run.status = 'interrupted'
+      run.error ||= '执行已中断：此运行没有存活的执行者'
+    }
+  }
+  recordExecutionEvidence(bb.steps || [], bb.runs || [])
+}
+
+function recordExecutionEvidence(steps: BlackboardStep[], runs: BoardRun[]): void {
+  for (const run of runs) {
+    const step = steps.find(s => runMatchesStep(run, s))
+    if (step && !step.executedAt && runCountsAsExecuted(run, step)) step.executedAt = run.startedAt || run.t
+  }
+}
+
 export function loadBlackboard(sessionId: string): Blackboard | null {
   try {
-    const raw = fs.readFileSync(bbPath(sessionId), 'utf-8')
-    const bb = JSON.parse(raw)
-    if (!bb || bb.sessionId !== sessionId) return null
-    // 冻结步骤自愈（0902 事故遗留形态：进程被杀时步骤停在 running，黑板永远显示进行中）。
-    // 写入侧修（铁律 31 允许的防御类）：读侧发现 running 步骤但其 runId 的子 agent 已不在
-    // 运行集（重启后必然不在）→ 标 interrupted，主 agent 收到后可补派
-    if (Array.isArray(bb.steps)) {
-      let changed = false
-      for (const s of bb.steps) {
-        const live = s.runId && activeRunIds.has(String(s.runId))
-        if (s.status === 'running' && !live) { s.status = 'interrupted'; changed = true }
-      }
-      // 0910 反馈4：run 记录同样自愈——进程被杀时 run 停在 'running'，读侧标 'interrupted'
-      // 并写明原因（前端气泡据此显示"被中断"，而不是空着或永远转圈）。记录本身不删，产出照旧可回看。
-      if (Array.isArray(bb.runs)) {
-        for (const r of bb.runs) {
-          if (r && r.status === 'running' && !activeRunIds.has(String(r.runId))) {
-            r.status = 'interrupted'
-            r.endedAt = r.endedAt || Date.now()
-            r.text = r.text || '（这轮执行被中断——后端在处理过程中重启/停止，产出以工作区文件为准）'
-            changed = true
-          }
-        }
-      }
-      /* ★t1x：自愈时**顺手把执行证据固化到步骤上** —— 修历史板：be4a425f 实测 51 个 review 步骤里
-         19 个的 run 终态是 interrupted（用户点停止/重启自愈写成的），旧闸门只认 done/timeout
-         ⇒ 这些步骤**永久**不能标 done。这里只记"这步真的执行过"（executedAt）这一事实，不改任何状态。 */
-      for (const r of ((bb as any).runs || [])) {
-        if (!r) continue
-        const st = (bb.steps || []).find((s: any) => String(s?.id || '') === String(r.stepId || ''))
-        /* ★f1b（P0-2）：只给**够格**的证据固化 executedAt —— interrupted 若零产出就是"跑到一半被杀"，
-           固化后 executedAt>0 会让闸门直接放行（绕过 P0-2 的产出校验）⇒ 这里必须用同一判据。 */
-        if (st && !Number((st as any).executedAt || 0) && runCountsAsExecuted(r, st)) { (st as any).executedAt = Number(r.t || 0) || Date.now(); changed = true }
-      }
-      if (changed) {
-        try {
-          bb.updatedAt = Date.now()
-          /* ★0929 P0（多窗口长任务隐患排查）：原子写 —— 裸 writeFileSync 崩溃窗口会留
-             半截 JSON，下次 loadBlackboard 直接解析失败=整板丢（#clone 板实测已达 4MB）。 */
-          /* ★e1：**自愈写盘也不许把 `memberTotals` 带下去**。
-             它是派生值（真源 = 成员会话 usageTotals + memberRetired），而这里读到的
-             `bb.memberTotals` 是**磁盘上的旧值**（老黑板里是 runs 口径的脏值）。
-             用深拷贝剔一份再写，避免 `delete` 破坏调用方手里的 `bb`（下面还要用它填内存口径）。 */
-          const _toDisk: any = { ...bb }
-          delete _toDisk.memberTotals
-          writeJsonAtomic(bbPath(sessionId), _toDisk)
-        } catch { /* ignore */ }
-      }
-    }
-      /* ★h5 **一次性迁移**（不是运行时兜底）：本次改动之前落的老板子没有 memberRetired/memberTotals
-         ⇒ 用现有 runs 现算一次，让首次读到（bb_read / blackboard.read / 广播帧）就有值。
-         ★e1 更正：这里算出的 `memberTotals` **只填内存**（回退值），**不再落盘**
-         （原注释说"下一次 saveBlackboard 会把 retired+totals 一起落盘" —— 方案 2 之后 totals 永不落盘）。 */
-      if (!(bb as any).memberRetired || typeof (bb as any).memberRetired !== 'object') (bb as any).memberRetired = {}
-      /* ★bd1 **一次性迁移**（不是运行时兜底）：本次改动之前落的老板子没有 decisions/decisionTombstones
-         ⇒ 补成空数组，让 bb_read / 广播帧 / bb_write(decision) 三处都拿到确定的数组。
-         纯读、不额外写盘（下一次 saveBlackboard 会把它们一起落盘）。 */
-      if (!Array.isArray((bb as any).decisions)) (bb as any).decisions = []
-      if (!Array.isArray((bb as any).decisionTombstones)) (bb as any).decisionTombstones = []
-      ;(bb as any).memberTotals = computeMemberTotals(bb)
-
+    const bb = readBlackboardRaw(sessionId)
+    if (!bb) return null
+    recoverBlackboard(bb)
+    bb.memberRetired ??= {}
+    bb.decisions ??= []
+    bb.decisionTombstones ??= []
+    bb.memberTotals = computeMemberTotals(bb)
     return bb
-  } catch {
+  } catch (e) {
+    console.error('[team] blackboard read failed:', e)
     return null
   }
 }
 
-function saveBlackboard(bb: Blackboard): void {
-  try {
-    bb.updatedAt = Date.now()
-    /* ★0929 P1（刀6 成员回流覆盖）：**所有板**落盘统一「盘上取最新 → 合并 → 原子写」同步临界区。
-       旧病（分身2 审计实锤）：team_dispatch execute 开头 `loadBlackboard` 持一份副本**跨整个派发期**
-       （分钟级 await Promise.all），期间【成员单聊回流 findings（2010）/ 同轮并行 bb_write·bb_goal
-       （pi 同轮工具确为 Promise.all）】写盘的成果，会被 dispatch 侧 bb_write/步骤状态回写用旧副本
-       **整板覆盖**——单聊产出白干、指挥官 done/rejected 被打回。
-       合并规则（JS 单线程：load→merge→write 之间无 await，天然互斥）：
-         · runs 按 runId/id 合并（同键本地=最新状态优先），按 t 排序、封顶 60 条
-         · steps 按 **planRev 代次**合并：更高代次（bb_goal 全量重写）整份替换；同代次按 id 取
-           updatedAt 较新者；更低代次（长跑成员手里的旧副本）只回写已有步骤、不许带回旧计划（见下方实现）
-         · findings 内容并集去重（append-only，按 t 排序）
-         · 标量字段（goal/acceptance/finalResult…）以本地为准（本地=刚被业务代码改过的对象）
-         · 合并结果回灌本地 bb —— 后续事件推进的整板写的都是同一份全量
-       注：0929 刀1 曾决定「团队板保持直写（共享对象无自丢）」——共享对象确实不丢**自己的**写，
-       但防不住**外部写者**（单聊回流/并行工具副本），本刀按分身2 P1 证据统一改为合并落盘。 */
-    const fresh: any = loadBlackboard(bb.sessionId) || {}
-    const local: any = bb as any
-    let _droppedRuns: any[] = []
-    const runs: any[] = (() => {
-      const m = new Map<string, any>()
-      for (const r of [...(fresh.runs || []), ...(local.runs || [])]) m.set(String((r as any)?.runId || (r as any)?.id || Math.random()), r)
-      const all = Array.from(m.values()).sort((a: any, b: any) => (a?.t || 0) - (b?.t || 0))
-      /* ★t1x：封顶 60 条是给文件体积用的（56 步 + 重试已经顶到上限），但**被裁掉的 run 会把
-         "这步执行过"的证据一起带走**，之后 bb_write 再也查不到 ⇒ 步骤永远停在 review。
-         ⇒ 裁之前把执行事实固化进 step.executedAt（下面 steps 合并完就写），记录可以丢，事实不丢。 */
-      _droppedRuns = all.length > 60 ? all.slice(0, all.length - 60) : []
-      return all.slice(-60)
-    })()
-    const freshRev = Number((fresh as any)?.planRev || 0)
-    const localRev = Number((local as any)?.planRev || 0)
-    const steps: any[] = (() => {
-      /* ★1104-I 计划代次决定 step 合并口径（旧实现只有"按 id 并集"，等于没有替换语义）：
-         · localRev > freshRev —— 本地是刚 bb_goal 的全新计划 ⇒ **全量替换**：只保留新计划的步骤，
-           外加盘上正在跑的旧步骤（活的 run 必须仍可在板上寻址，否则成员跑完回写状态时找不到 step）。
-           已作废的 pending/review/done/rejected 一律丢弃 —— 它们就是幽灵步骤的来源。
-         · localRev < freshRev —— 本地是长跑成员手里那份旧副本 ⇒ 只允许写回"板上已有且更晚"的状态，
-           不许把它记着的旧计划重新带回板上（否则成员一落盘就把新计划覆盖回去）。
-         · 同代次 —— 按 id 合并，updatedAt 较新者胜（bb_write / 状态回写都走这条）。 */
-      if (localRev > freshRev) {
-        const ids = new Set((local.steps || []).map((s: any) => String((s as any)?.id || '')))
-        const live = (fresh.steps || []).filter((s: any) => !ids.has(String((s as any)?.id || '')) && String((s as any)?.status || '') === 'running')
-        return [...(local.steps || []), ...live]
-      }
-      if (localRev < freshRev) {
-        const byId = new Map<string, any>((fresh.steps || []).map((s: any) => [String((s as any)?.id || ''), s]))
-        for (const s of (local.steps || [])) {
-          const id = String((s as any)?.id || '')
-          const prev = byId.get(id)
-          if (!prev) continue
-          if (Number((s as any)?.updatedAt || 0) > Number((prev as any)?.updatedAt || 0)) byId.set(id, s)
-        }
-        return Array.from(byId.values())
-      }
-      const m = new Map<string, any>()
-      for (const s of [...(fresh.steps || []), ...(local.steps || [])]) {
-        const id = String((s as any)?.id || Math.random())
-        const prev = m.get(id)
-        if (!prev || Number((s as any)?.updatedAt || 0) >= Number(prev?.updatedAt || 0)) m.set(id, s)
-      }
-      return Array.from(m.values())
-    })()
-    /* ★t1x：把被裁掉的 run 的"执行过"事实固化到**合并后**的步骤对象上（只写事实，不改状态）。 */
-    if (_droppedRuns.length) {
-      for (const r of _droppedRuns) {
-        const st = steps.find((s: any) => String(s?.id || '') === String(r?.stepId || ''))
-        /* ★f1b（P0-2）：同上，interrupted 零产出不许固化成 executedAt。 */
-        if (st && !Number((st as any).executedAt || 0) && runCountsAsExecuted(r, st)) (st as any).executedAt = Number(r?.t || 0) || Date.now()
-      }
+function saveBlackboard(local: Blackboard, run?: BoardRun): void {
+  // 同一进程的同步读-改-原子换名是唯一提交点；旧快照中的 runs/retired 没有写权限。
+  const scope = laneWrites.get(local)
+  if (scope && !activeRunIds.has(scope.runId)) throw new Error('blackboard lane owner already released')
+  if (run && (!scope || run.runId !== scope.runId || !runMatchesStep(run, scope.step))) {
+    throw new Error('blackboard run write without matching lane owner')
+  }
+  const stored = readBlackboardRaw(local.sessionId)
+  if (scope && !stored) throw new Error('blackboard removed during team execution')
+  if (stored) recoverBlackboard(stored)
+  const fresh: Partial<Blackboard> = stored || {}
+  const all = fresh.runs || []
+  if (run) {
+    const i = all.findIndex(r => r?.runId === run.runId)
+    if (i < 0) all.push(run)
+    else all[i] = run
+    // 时间戳只用于既有展示及裁剪顺序，不决定写权限。
+    all.sort((a, b) => (a?.t || 0) - (b?.t || 0))
+  }
+  const dropped: BoardRun[] = []
+  const runs = all.filter(r => {
+    if (all.length - dropped.length <= 60 || activeRunIds.has(r?.runId || r?.id || '')) return true
+    dropped.push(r)
+    return false
+  })
+  const freshRev = Number(fresh.planRev || 0)
+  const localRev = Number(local.planRev || 0)
+  const steps: BlackboardStep[] = (() => {
+    if (scope) {
+      return (fresh.steps || []).map(step => {
+        if (step.id !== scope.step.id || step.owner !== scope.step.owner) return step
+        // 认领前校验原代次和原 run；认领后只改仍归本 run 的步骤（含换计划时保留的活步骤）。
+        const claim = scope.base.runId !== scope.runId && freshRev === scope.planRev && step.runId === scope.base.runId
+        if (!claim && step.runId !== scope.runId) return step
+        const delta = Object.fromEntries(Object.entries(scope.step).filter(([key, value]) =>
+          !Object.is(value, scope.base[key as keyof BlackboardStep])))
+        return { ...step, ...delta }
+      })
     }
-    const seen = new Set<string>()
-    const findings: any[] = [...(fresh.findings || []), ...(local.findings || [])]
-      .filter((f: any) => { const k = JSON.stringify(f); if (seen.has(k)) return false; seen.add(k); return true })
-      .sort((a: any, b: any) => (a?.t || 0) - (b?.t || 0))
-    const merged: any = { ...fresh, ...local, runs, steps, findings, sessionId: local.sessionId || bb.sessionId }
-    merged.createdAt = fresh.createdAt || local.createdAt || Date.now()
-    /* ★h5 成员 token 累计（**后端唯一源**）= memberRetired（被 60 条封顶裁掉的部分）+ 板上现存 runs。
-       · retired 两侧（盘上 fresh / 本地副本 local）逐成员取较大者 —— 单调量取大不会回退；
-       · **裁 runs 之前必须 foldRetiredRuns** —— 这一步就是"数字不再往下掉"的关键：
-         被裁掉的 run 的 token 一次不落地折进 retired，之后无论裁多少次、刷新多少回都不受影响；
-       · memberTotals 每次落盘重算；前端只读它，**不许再自己 sum(runs)**（那正是回退的病根）。 */
-    merged.memberRetired = mergeMemberRetired((fresh as any)?.memberRetired, (local as any)?.memberRetired)
-    foldRetiredRuns(merged, _droppedRuns)
-    merged.memberTotals = computeMemberTotals(merged)
-    /* ★bd1：待确认清单的合并口径 —— 与 steps 的"后写覆盖"不同，**删除必须赢**：
-       · 墓碑先并集（封顶 50），凡在墓碑里的 id 一律不进结果；
-       · 剩下的按 id 求并集（同 id 以 local＝刚被业务代码改过的对象为准），按 createdAt 排序。
-       ⇒ 同轮并行 bb_write（Promise.all）各自新增的不会丢，而"删掉的"不会被盘上那份复活。 */
-    merged.decisionTombstones = mergeDecisionTombstones((fresh as any)?.decisionTombstones, (local as any)?.decisionTombstones)
-    merged.decisions = mergeDecisions((fresh as any)?.decisions, (local as any)?.decisions, merged.decisionTombstones)
-
-    /* 代次只升不降：旧副本（localRev < freshRev）不许把板子的计划代次写回旧值。 */
-    merged.planRev = Math.max(freshRev, localRev)
-    merged.updatedAt = Date.now()
-    /* ★h5：累计回灌本地内存板（bb === local）—— broadcastBB / bb_read / persistRuns 读的都是这份对象。
-       ★e1：`memberTotals` 也在这里回灌（内存要留），但**下面落盘前会从 merged 删掉**（派生值不落盘）。 */
-    ;(local as any).memberRetired = merged.memberRetired
-    ;(local as any).memberTotals = merged.memberTotals
-    ;(local as any).decisions = merged.decisions
-    ;(local as any).decisionTombstones = merged.decisionTombstones
-
-    ;(bb as any).runs = runs
-    ;(bb as any).steps = steps
-    ;(bb as any).findings = findings
-    ;(bb as any).planRev = merged.planRev
-    ;(bb as any).decisions = merged.decisions
-    ;(bb as any).decisionTombstones = merged.decisionTombstones
-    /* ★e1（需求方案 2）：**`memberTotals` 不落盘** —— 它是派生值，不是事实。
-       为什么必须去掉（上一轮 z2b 实测出来的"两个真相"）：
-         `mergeMemberUsageLedger` 在**内存/广播**上写的是账本口径（source='ledger'，m3 ≈ 7M），
-         而 `saveBlackboard` 里的 `computeMemberTotals(merged)` 又用 **runs 口径**把它重算一遍并落盘
-         ⇒ **磁盘 = runs 口径、广播 = 账本口径**（同一份数据两个写者、两个真相）。
-       真源是两样东西，都在别处、都持久：
-         · 成员会话的 `usageTotals`（server 侧读，含私聊、单调只增、不受 runs 封顶影响）
-         · `memberRetired`（**这个继续落盘**，见上：它是 runs 被 60 条封顶裁掉前折进去的，去掉就真丢数据）
-       ⇒ `memberTotals` 每次都由「账本 + memberRetired」现算：广播帧现算、`blackboard.read` 现算。
-       ⚠️ 只从**落盘副本**删，`merged` 对象本身与内存 bb 都保留（下面 bb_read / broadcastBB 还要用）。
-       ⚠️ 老黑板上的脏值：不落盘后**下一次 saveBlackboard 自然就不写了** —— 不需要迁移脚本；
-          重启后第一次保存它就消失（报告里已注明这一点）。 */
-    delete (merged as any).memberTotals
-    /* ★0929 P0 同款：原子写（tmp+rename），防崩溃留半截 JSON 丢整板 */
-    writeJsonAtomic(bbPath(bb.sessionId), merged)
-  } catch (e) {
-    console.error('[team] blackboard save failed:', e)
+    if (localRev > freshRev) {
+      const ids = new Set(local.steps.map(s => s.id))
+      const live = (fresh.steps || []).filter(s => !ids.has(s.id) && s.status === 'running')
+      return [...local.steps, ...live]
+    }
+    return localRev < freshRev ? (fresh.steps || []) : local.steps
+  })()
+  recordExecutionEvidence(steps, dropped)
+  const seen = new Set<string>()
+  const findings = [...(fresh.findings || []), ...(local.findings || [])]
+    .filter(f => { const k = JSON.stringify(f); if (seen.has(k)) return false; seen.add(k); return true })
+    .sort((a, b) => a.t - b.t)
+  const plan = (scope || localRev < freshRev) ? stored! : local
+  const merged: Blackboard = { ...fresh, ...plan,
+    runs, steps, findings, createdAt: fresh.createdAt ?? local.createdAt, updatedAt: Date.now(),
+    memberRetired: fresh.memberRetired ?? {},
   }
+  if (run) merged.usageAccounting ??= { scheme: 'run-ledger-delta', since: Date.now() }
+  foldRetiredRuns(merged, dropped)
+  merged.decisionTombstones = mergeDecisionTombstones(fresh.decisionTombstones, plan.decisionTombstones)
+  merged.decisions = mergeDecisions(fresh.decisions, plan.decisions, merged.decisionTombstones)
+  delete merged.memberTotals // 派生值只给调用方，不作为持久事实。
+  writeJsonAtomic(bbPath(local.sessionId), merged)
+  if (scope) {
+    const i = steps.findIndex(step => step.runId === scope.runId && step.id === scope.step.id && step.owner === scope.step.owner)
+    if (i >= 0) {
+      Object.assign(scope.step, steps[i])
+      scope.base = { ...scope.step }
+      steps[i] = scope.step // 成员工具/收尾仍持有同一个自己的步骤引用。
+    }
+  }
+  Object.assign(local, merged, { acceptance: merged.acceptance, memberTotals: computeMemberTotals(merged) })
 }
 
-/** ★0929 刀1 原分身板合并器——刀6 起其算法已**收口进 saveBlackboard（全板合并）**，
- *  本函数保留为兼容别名（persistRuns 的 #clone 分流仍按名调用，语义不变）。 */
-function saveBlackboardRunsMerged(bb: Blackboard): void {
-  saveBlackboard(bb)
-}
-
-/** ★L5：run 账本的**唯一落盘实现**（原来是 `runSubAgent` 里的局部闭包）。
- *  抽出来的原因：`runMemberTurn` 也要写同一种记录 —— 复制一份就是两套口径
- *  （裁 60 条 / 折 retired / 重算 memberTotals / #clone 分流，少一步就少一份真相）。
- *  纯函数式：只依赖传进来的 bb。 */
-function persistBoardRuns(bb: Blackboard): void {
-  /* ★tw1s：**口径切换点**（只写一次）—— 从此以后 run.usage = 会话账本差值（run 增量法，含全部跳）；
-     此前的历史 runs **不重算**（它们只含最后一跳，是旧口径，数字偏小）。排查看"从哪一刻开始可信"读它。 */
-  if (!(bb as any).usageAccounting) (bb as any).usageAccounting = { scheme: 'run-ledger-delta', since: Date.now() }
-  if ((bb as any).runs.length > 60) {
-    /* ★h5：**裁之前先折**（被裁 run 的 token 进 memberRetired 永久保留）—— 否则长任务跑着跑着，
-       成员 token 累计会随每一次 slice(-60) 往下掉。 */
-    foldRetiredRuns(bb, (bb as any).runs.slice(0, (bb as any).runs.length - 60))
-    ;(bb as any).runs = (bb as any).runs.slice(-60)
-  }
-  /* ★h5：内存板的累计跟着更新（broadcastBB / bb_read 直接读这份对象） */
-  ;(bb as any).memberTotals = computeMemberTotals(bb)
-
-  /* ★0929 P1 分流：分身板（`${sessionId}#clone`）各 run 各持副本跨 await 互写 ⇒ 走合并落盘；
-     团队板是共享对象，保持原直写。 */
-  if (String((bb as any).sessionId || '').endsWith('#clone')) saveBlackboardRunsMerged(bb)
-  else saveBlackboard(bb)
+function persistBoardRuns(bb: Blackboard, run: BoardRun): void {
+  saveBlackboard(bb, run)
 }
 
 /** 会话删除时清理黑板落盘 */
@@ -642,19 +541,23 @@ export function clearBlackboard(sessionId: string): void {
   } catch { /* ignore */ }
 }
 
-/** 只读黑板原始 JSON（不触发热路径自愈）：bb_goal 取上一版 planRev / 保留 runs 用 */
-function readBlackboardRaw(sessionId: string): any | null {
+// 读失败不能变成空板参与提交，只有 ENOENT 是不存在。
+function readBlackboardRaw(sessionId: string): Blackboard | null {
   try {
     const bb = JSON.parse(fs.readFileSync(bbPath(sessionId), 'utf-8'))
-    return bb && bb.sessionId === sessionId ? bb : null
-  } catch {
-    return null
+    if (bb?.sessionId !== sessionId || (bb.steps != null && !Array.isArray(bb.steps)) || (bb.runs != null && !Array.isArray(bb.runs))) {
+      throw new Error('invalid blackboard: ' + sessionId)
+    }
+    return bb
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw e
   }
 }
 
-/** 本进程内**正在跑**的 run（派发 + 单聊共用）：读侧自愈必须跳过它们——否则前端随手
- *  读一次黑板就会把"正在执行的步骤/成员"误标成 interrupted（自愈只该处理上一个进程留下的残留）。 */
 const activeRunIds = new Set<string>()
+// 非持久写权限，不保留整板镜像；base 仅用来识别本步骤的变更字段。
+const laneWrites = new WeakMap<Blackboard, { runId: string; step: BlackboardStep; base: BlackboardStep; planRev: number }>()
 
 // ============================================================================
 // 子 agent 生命周期跟踪（session.cancel / session.delete 时中止）+ 看门狗
@@ -1524,27 +1427,26 @@ export interface TeamCtx {
    *     因为前端要靠两者算百分比，缺一个就没意义（宁可不显示，不给半个真相）；
    *   · 绝不在 server 侧编默认窗口（比如硬编码 128K）—— 那会让进度条显示一个假的分母。 */
   memberCtxUsage?: (memberId: string) => { ctxUsed: number; ctxWindow: number } | null
-  /** ★d1（需求）：**成员用量累计以"成员会话账本"为主源**（含私聊消耗、不受 runs 封顶影响）。
+  /** ★member-lifetime（替代原 `memberUsageLedgerTotal`）：**该父会话下每个成员的全历史累计**。
    *
-   *  为什么做成注入而不是在 `computeMemberTotals` 里直接读会话：
-   *    `computeMemberTotals(board)` 是**纯函数**（只读 board）—— 那是好设计（可单测、合并落盘时不串台），
-   *    必须保住。所以和 r3 的 `memberCtxUsage` 同一个模式：teamRuntime 决定"何时合"，
-   *    server 负责"怎么算"（它才有 `findMemberSession` 与成员会话对象）。
+   *  一次返回整张 Map（键 = 真实存在成员会话的 memberId），而不是"逐成员回调"：
+   *   · 一帧只遍历一次会话表（原来每个成员各遍历一次，O(成员数 × 会话数)）；
+   *   · **键集合由账本决定**，所以"只私聊过、没有 bb.runs 记录"的成员也能出现
+   *     （原来 `mergeMemberUsageLedger` 只遍历 `memberTotals` 已有的键 ⇒ 这种成员永远不显示）。
    *
-   *  返回 `null` = 拿不到 ⇒ 调用方**保持 runs 累计**（并标 `source:'runs'`），不写 0 冒充。
-   *  三种拿不到（server 侧负责识别并返回 null）：成员从没跑过 / 会话已归档或回收 / `sessions.get` 升级失败。 */
-  memberUsageLedgerTotal?: (memberId: string) => {
-    promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheWriteTokens: number
-    tokens: number; llmMs: number; runs: number
-  } | null
+   *  口径在 `memberUsageAggregate.ts`（纯函数，可单测）：全历史 = 当前段 + 归档段 + 其中私聊；
+   *  命中率 = Σ缓存读 ÷ (Σ未命中 + Σ缓存读 + Σ缓存写)，分母 = 完整输入量（三桶互斥相加）。
+   *
+   *  返回空 Map = 该父会话没有任何成员会话 ⇒ 调用方保持 runs 残值（标 `source:'runs'`），不写 0 冒充。 */
+  memberUsageHistory?: () => Map<string, MemberUsageTotalsView>
   /** ★f1（需求）：**成员当前（未归档）那一段的用量** —— 卡片上显示的数（新开对话天然从 0 起）。
    *
    *  为什么按段而不是靠"清零"：每段都是独立 session，各自有 `usageTotals`
    *  ⇒ 开新段就是新账本，**不需要任何清零逻辑**（零状态、不会漏清也不会清错）。
    *
-   *  与上面 `memberUsageLedgerTotal` 的分工：
-   *   · `memberUsageLedgerTotal` = **全历史累计**（其他统计/图表还在用，保持不动）
-   *   · `memberSegTotal`         = **当前段**（卡片显示）
+   *  与上面 `memberUsageHistory` 的分工（**两个口径，别混**）：
+   *   · `memberUsageHistory` = **全历史累计**（`tokens` / 命中率 / 完整度）
+   *   · `memberSegTotal`     = **当前段**（卡片显示 / 团队运行预算继续用它，口径不变）
    *
    *  返回 `null` = 拿不到（成员没跑过 / 这一段还没入账）⇒ 调用方**不写** `segTokens`/`segSeq`
    *  ⇒ 前端显示「—」，**绝不写 0 冒充"这一段用了 0"**。 */
@@ -1552,6 +1454,7 @@ export interface TeamCtx {
     segTokens: number; segSeq: number
     promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheWriteTokens: number
     llmMs: number; runs: number
+    ambiguous: boolean
   } | null
   /** ★g1：**成员当前段的运行体征**（给 `team_info` 暴露"这段是不是该换了"的依据）。
    *
@@ -1594,11 +1497,11 @@ export interface TeamCtx {
    *  分身一直没登记 → 刷新/黑板被清后分身气泡无从恢复。server.ts 接线；不设=不登记（老行为）。 */
   registerSubRuns?: (toolCallId: string, runs: any[]) => void
   /** ★1036-S36（**派活不阻塞**）：一批成员跑完后，把结果送回主会话的唯一入口。
-   *  实现 = server.ts 的 `injectSessionNotice`（与"分身回归"同一条通路：忙则 steer 并入当前轮、
-   *  闲则开新一轮、失败转待办）。`team_dispatch` 改成异步后靠它"回来"。
+   *  团队汇总携带派发批次 ID；服务端只在主会话接纳对应消息时确认投递。
+   *  结算异常仍走普通通知，不冒充已结算批次。
    *  ⚠️ 不设 = 走同步老行为？不 —— 不设就没有回程，派发结果会丢。所以这是**必需**能力，
    *     只是保留可选类型以便老测试壳编译。 */
-  notifyDone?: (text: string, meta?: { memberIds?: string[] }) => void
+  notifyDone?: (text: string, meta?: { memberIds?: string[] } & ({ reason: 'team-summary'; batchId: string } | { reason?: never })) => void
   /** ★1036-S37：**本会话全部 run 的全量快照**（= `session.subRuns` 按 callId 展开）。
    *  为什么需要：`sub_read` 原来只读黑板 `bb.runs`，而 `persistRuns()` 有 `slice(-60)` 上限
    *  ⇒ 20 个成员跑几轮，早期子任务被挤出窗口，主 agent 回看不到自己派过什么。
@@ -1624,7 +1527,8 @@ export interface TeamCtx {
   /** 成员会话的 **agent**（★L5：中断表/看门狗要拿它 —— `session.stopMember` 靠它真的停得下来）。 */
   ensureMemberAgent?: (sessionId: string) => any | null
   /** **跑一轮** = 会话 `agent.prompt`（等本轮真结束才返回）。忙时照 `__busyPolicy` 处理。 */
-  runPromptCore?: (sessionId: string, p: Record<string, unknown>) => Promise<{ ok?: boolean; queued?: boolean; turnFailed?: boolean; error?: string } & Record<string, any>>
+  laneActivity?: (memberId: string, runId: string, queued: boolean) => void
+  runPromptCore?: (sessionId: string, p: Record<string, unknown>, activityTurnId: string) => Promise<{ ok?: boolean; queued?: boolean; turnFailed?: boolean; error?: string } & Record<string, any>>
   /** 等会话真空闲（返回 false = 等到上限仍忙/仍在排队 ⇒ 调用方必须如实记未完成）。 */
   waitSessionIdle?: (sessionId: string, maxMs?: number) => Promise<boolean>
   /** ★1032（P44）：整段运行（思考/工具/正文）落进成员会话，窗口与主对话流同形 */
@@ -1972,6 +1876,9 @@ function mergeMemberSegUsage(ctx: TeamCtx, bb: Blackboard): void {
     /* 段号未知（0）就**不写** segSeq —— 让前端显示「—」，而不是编一个"第 0 段" */
     if (Number.isFinite(sq) && sq > 0) rec.segSeq = Math.round(sq)
     else delete rec.segSeq
+    /* ★member-lifetime：>1 个未归档段（数据异常）⇒ 明确标出，别让"当前段"看起来毫无歧义 */
+    if (got.ambiguous) rec.segAmbiguous = true
+    else delete rec.segAmbiguous
   }
 }
 
@@ -1989,59 +1896,36 @@ function broadcastBB(ctx: TeamCtx, bb: Blackboard): void {
   } catch { /* ignore */ }
 }
 
-/** ★d1（需求）：**把「成员会话账本」的用量合进 `memberTotals`** —— 数据源切换的主入口。
+/** ★d1/★member-lifetime：**把「成员会话账本」的全历史用量合进 `memberTotals`** —— 唯一数据源入口。
  *
- *  病（实测）：m3 的会话账本里明明有 6.6M token（`usageTotals`），但 `memberTotals.m3.tokens = 0`。
- *  根因：`computeMemberTotals` **只累加 `bb.runs`**，而 m3 那条 run 的 `usage = {}`（当时会话读不到，
- *  后被 u1/x1 修好） ⇒ 整张卡 0。
- *  这个坑会随"成员越多、单成员跑得越少"而放大：
- *   · 成员只跑一次且那次没记账 ⇒ 改前整张卡 0，改后有数
- *   · 成员在窗口里**私聊** ⇒ 改前完全不计，改后计入（老板要的口径）
- *   · runs 被 60 条封顶裁掉 ⇒ 改前靠 memberRetired 补（易漏），改后不受影响
+ *  病（实测两次，两个不同的坑）：
+ *   ① m3 的会话账本有 6.6M token，但 `memberTotals.m3.tokens = 0` —— 因为只累加 `bb.runs`，
+ *      而那条 run 的 `usage = {}`；私聊更是一分都不计（私聊不走 `runMemberTurn`、不写 bb.runs）。
+ *   ② 改成读账本后仍然只读 `findMemberSession`（**未归档段**）⇒ 归档段的消耗全丢
+ *      （实测 m4：当前段 280.9M，全部段 732.9M，漏 61.7%）——"全历史"是假的。
+ *
+ *  现在的口径（唯一，纯函数在 `memberUsageAggregate.ts`）：
+ *   · `tokens` = 该成员**全部段**（当前 + 归档 + 其中私聊）的 `usageTotals` 相加；
+ *   · `hitRate` = Σ缓存读 ÷ (Σ未命中 + Σ缓存读 + Σ缓存写)，先求和再相除，分母 = 完整输入量；
+ *   · `usageStatus` 明确 complete / partial（有缺账段，合计是部分和）/ empty（真 0）；
+ *   · **键集合 = 账本里的成员**（并入 `memberTotals`），所以"只私聊过、没有 run 记录"的成员也会出现。
  *
  *  为什么放在这一层（和 r3 的 mergeMemberCtxUsage 完全同一个模式）：
  *   `computeMemberTotals(board)` 是纯函数（只读 board、可单测），必须保住；
- *   "读成员会话账本"需要 server 的能力（`findMemberSession` + 会话对象）⇒ 由 `ctx.memberUsageLedgerTotal` 注入。
+ *   "读成员会话账本"需要 server 的能力（会话对象 + 骨架升级）⇒ 由 `ctx.memberUsageHistory` 注入。
  *
- *  **字段映射**（与现有语义严格一致 ⇒ 前端零改动）：
- *    usageTotals.uncached   → promptTokens
- *    usageTotals.cacheRead  → cacheReadTokens
- *    usageTotals.cacheWrite → cacheWriteTokens
- *    usageTotals.output     → completionTokens
- *    usageTotals.llmMs      → llmMs
- *    tokens = uncached + cacheRead + cacheWrite + output
- *    runs   = 优先 usageTotals.turns；为 0/缺失时保留原来的 runs 条数（比编一个数诚实）
- *
- *  拿不到账本（返回 null）⇒ **什么都不改**，只把 `source` 标成 `'runs'`，
- *  让 `computeMemberTotals` 的 runs 累计原样留着 —— 这样排查时能一眼分清"真值"与"只有 runs 的残值"。 */
+ *  拿不到（空 Map）⇒ **什么都不改**，只把 `source` 标成 `'runs'`、`usageStatus='none'`，
+ *  让 `computeMemberTotals` 的 runs 残值原样留着 —— 排查时一眼分清"真值"与"只有 runs 的残值"。 */
 function mergeMemberUsageLedger(ctx: TeamCtx, bb: Blackboard): void {
-  const probe = ctx.memberUsageLedgerTotal
+  const probe = ctx.memberUsageHistory
   if (typeof probe !== 'function') return      // 未注入 ⇒ 保持原样（不标 source，等同"没跑过合并"）
+  let views: Map<string, MemberUsageTotalsView> | null = null
+  try { views = probe() } catch { views = null }
+  if (!views) return
   const totals: any = (bb as any)?.memberTotals
-  if (!totals || typeof totals !== 'object') return
-  for (const mid of Object.keys(totals)) {
-    const rec: any = totals[mid]
-    if (!rec || typeof rec !== 'object') continue
-    let got: ReturnType<NonNullable<TeamCtx['memberUsageLedgerTotal']>> = null
-    try { got = probe(mid) } catch { got = null }
-    if (!got) { rec.source = 'runs'; continue }     // 拿不到 ⇒ 保留 runs 累计，只标来源
-    /* 五项都必须是有限非负数才算拿到 —— 任何一个不是数就整体放弃（绝不写 NaN/Infinity 出去，
-       也不"部分采用"：部分采用会得到一份既不是账本也不是 runs 的第三口径，那比 0 更难排查）。 */
-    const p = Number(got.promptTokens), c = Number(got.completionTokens)
-    const cr = Number(got.cacheReadTokens), cw = Number(got.cacheWriteTokens)
-    const tk = Number(got.tokens), lm = Number(got.llmMs), rn = Number(got.runs)
-    if (![p, c, cr, cw, tk, lm, rn].every(v => Number.isFinite(v) && v >= 0)) { rec.source = 'runs'; continue }
-    rec.promptTokens = Math.round(p)
-    rec.completionTokens = Math.round(c)
-    rec.cacheReadTokens = Math.round(cr)
-    rec.cacheWriteTokens = Math.round(cw)
-    rec.tokens = Math.round(tk)
-    rec.llmMs = Math.round(lm)
-    /* runs：账本有 turns 就用它（口径是"这个成员总共跑过几轮"，含私聊）；
-       为 0 说明账本没记轮数（老会话），保留原 runs 条数 —— 不拿 0 覆盖掉真实条数。 */
-    if (rn > 0) rec.runs = Math.round(rn)
-    rec.source = 'ledger'
-  }
+  if (!totals || typeof totals !== 'object' || Array.isArray(totals)) return
+  /* 补键 + 覆盖 + 残值标记只有一份实现（纯函数，已单测）。 */
+  mergeViewsIntoMemberTotals(totals, views)
 }
 
 /** 步骤依赖环检测（Kahn）：有环直接拒绝建计划 */
@@ -2444,8 +2328,7 @@ if (memberSkillList.length > 0 && tools.some(t => t.name === 'use_skill')) {
   // 现在：①开工写 status='running' ②订阅里节流增量更新（工具轨迹/分段/计划）③正常/看门狗/异常
   // 三条结束路径都**就地更新同一条记录** ④读侧 loadBlackboard 把残留 running 自愈成 'interrupted'
   // （带原因）——任何时刻进程被杀，都还留着"这个成员干了什么"。
-  if (!Array.isArray((bb as any).runs)) (bb as any).runs = []
-  const runRec: any = {
+  const runRec: BoardRun = {
     runId, stepId: step.id, memberId: member.id, memberName: mName,
     /* ★1036-S4：**派发任务原文**随 run 快照一起存 —— 标签页要显示"主 agent 派了什么活"，
        这是唯一的权威来源（原来只有 transcript 里 tool 参数有，前端得反解工具参数才能拿到）。
@@ -2464,20 +2347,15 @@ if (memberSkillList.length > 0 && tools.some(t => t.name === 'use_skill')) {
     timing: { llmMs: 0 }, usage: undefined,
     t: Date.now(), startedAt: Date.now(),
   }
-  ;(bb as any).runs.push(runRec)
   /* ★by1（乙案）：**终点信号随 run 一起落盘** —— `finalized` 只有 bb_write(finish:true) 才为 true，
      `interim` 是中途汇报（run 进度），**不是**交付产出。
-     落盘不需要白名单：saveBlackboard 合并 runs 时是**整对象**取新（:405-424），新子字段跟着 run 走；
-     f1a 的坑只在"会话级字段"（session.plan 那类手工逐字段搬的），与 runs 无关 —— 已核实。
+     落盘按车道权限写本 run 整对象，新增子字段随本 run 一起提交。
      老黑板里的 runs 没有 finalized 字段 ⇒ 读侧（judgeRunOutcome）把 undefined 当"自然结束"，语义与改造前一致。 */
   const runFinishFields = () => ({
     finalized: reportState.finalized,
     ...(reportState.interim.length ? { interim: reportState.interim.slice(-8) } : {}),
   })
-  activeRunIds.add(runId)
-  /* ★L5：落盘实现已抽到模块级 `persistBoardRuns`（runMemberTurn 共用同一份）——
-     这里只是别名，调用点一个没动，行为逐字不变。 */
-  const persistRuns = () => persistBoardRuns(bb)
+  const persistRuns = () => persistBoardRuns(bb, runRec)
   persistRuns()
 
   // bb_write 限流：正常完成 2~3 次足够（result + 途中 finding）。刷屏 = 模型误解纪律，
@@ -2706,8 +2584,7 @@ if (memberSkillList.length > 0 && tools.some(t => t.name === 'use_skill')) {
   } finally {
     watchdog.disarm()
     inspector.disarm()
-    /* ★1032（P19）：两张冗余表已删，注销只剩 watchdog.disarm()（它自己会把 entry 摘掉）。 */
-    activeRunIds.delete(runId)
+    // runId 的写权限由车道持有到最终落盘，这里只清理 agent 资源。
     // 0911 反馈③：run 收尾释放文件写锁（含击杀/异常路径，finally 必到）
     releaseFileLocks(runId)
     ac.abort()
@@ -2971,7 +2848,10 @@ function buildMemberTaskMessage(ctx: TeamCtx, bb: Blackboard, step: BlackboardSt
 
 /** 等"排队中的这一轮"真的跑完（★L5 §2.4）。
  *  `queued:true` 只代表"消息进了队列"，**不代表执行过** —— 把它当跑完就是假报完成。
- *  返回 false = 等不到（调用方必须如实记失败，不许当成跑过）。 */
+ *  返回 false = 等不到（调用方必须如实记失败，不许当成跑过）。
+ *  ★m6-member-model（二审①）：判据从"锚点之后任意 assistant"收窄到 **本轮范围内的 assistant**
+ *  （`thisTurnMessages`：本轮 user → 下一条 user 之前）。原写法会把**上一轮遗留的 assistant**
+ *  或**同段后续私聊轮**的产出当成"我们这轮跑完了" —— 轮次身份不能靠车道串行来保证。 */
 async function waitMemberTurnRan(ctx: TeamCtx, ms: any, beforeLen: number, userMsgId: string, maxMs: number): Promise<boolean> {
   const deadline = Date.now() + Math.max(1000, maxMs)
   let startedAt = 0
@@ -2985,7 +2865,7 @@ async function waitMemberTurnRan(ctx: TeamCtx, ms: any, beforeLen: number, userM
       const idle = ctx.waitSessionIdle ? await ctx.waitSessionIdle(String(ms.id), 60_000) : true
       if (idle) {
         const after: any[] = (() => { try { return Array.isArray(ms.messages) ? ms.messages : [] } catch { return [] } })()
-        const got = sliceRunMessages(after, beforeLen, userMsgId).slice.some((m: any) => String(m?.role || '') === 'assistant')
+        const got = thisTurnMessages(after, beforeLen, userMsgId).some((m: any) => String(m?.role || '') === 'assistant')
         if (got) return true
         /* 起了但暂时没有 assistant：给 5 秒宽限（同一轮可能先写工具），仍没有就按"跑完但无产出"返回，
            让提取环节如实报"没有产出正文" —— 不在这里编一个成功。 */
@@ -2995,6 +2875,46 @@ async function waitMemberTurnRan(ctx: TeamCtx, ms: any, beforeLen: number, userM
     if (Date.now() >= deadline) return false
     await new Promise((r) => setTimeout(r, 500))
   }
+}
+
+/** ★m6-member-model（二审①）：**本轮**的消息范围 —— 以本轮 user 消息（`clientMessageId` 锚点）为起点，
+ *  遇到**下一条 user 消息**就停（那是下一轮：同段私聊 / 队列里的另一轮，绝不能算进来）。
+ *  找不到锚点（老数据）⇒ 从 `beforeLen` 起、同样在下一个 user 前停。
+ *  ⚠️ 为什么不复用 `sliceRunMessages`：那个的语义是"从本轮 user 之后**取到末尾**"（够用于产出提取），
+ *     而"本轮用了哪个模型"必须**严格绑定本轮** ⇒ 边界必须是"下一条 user 之前"。
+ *  ⚠️ 导出只为**隔离实测**（真实现 + 合成消息序列），不是给别的模块用的公共 API。 */
+export function thisTurnMessages(msgs: any[], beforeLen: number, userMsgId: string): any[] {
+  const arr = Array.isArray(msgs) ? msgs : []
+  let start = -1
+  if (userMsgId) {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (String(arr[i]?.id || '') === userMsgId) { start = i; break }
+    }
+  }
+  if (start < 0) start = Math.max(0, Number(beforeLen) || 0) - 1
+  let end = arr.length
+  for (let j = start + 1; j < arr.length; j++) {
+    if (String(arr[j]?.role || '') === 'user') { end = j; break }
+  }
+  return arr.slice(start + 1, end)
+}
+
+/** ★m6-member-model（二审①）：**本轮真正请求过的模型名** —— 取自本轮 assistant 消息上的 `model`
+ *  （`message_start` 由真实请求写进消息；见 server.ts 的 `TurnAccumulator.model` / `DSHMessage.model`）。
+ *  绑定 = `clientMessageId`（本轮那条 user 消息的持久 id）+ "下一条 user 之前"的边界 ⇒ 不受同段后续轮影响。
+ *  没有证据（没跑起来 / 老消息无该字段 / provider 只回 'unknown'）⇒ 返回空 = **未知**：
+ *  不拿 `session.model`（结束时的会话值）、不拿 `ctx.team`（快照/配置）、不拿 `lastUsage` 顶。
+ *  ⚠️ 这个值可能是 provider 回包名（带厂商前缀），它就是"实际回包事实"；不做名字美化。
+ *  ⚠️ 导出只为**隔离实测**。 */
+export function turnModelFromMessages(msgs: any[], beforeLen: number, userMsgId: string): string {
+  const turnMsgs = thisTurnMessages(msgs, beforeLen, userMsgId)
+  for (let i = turnMsgs.length - 1; i >= 0; i--) {
+    const m: any = turnMsgs[i]
+    if (String(m?.role || '') !== 'assistant') continue
+    const v = String(m?.model || '').trim()
+    if (v && v !== 'unknown') return v
+  }
+  return ''
 }
 
 /** ★L5：把一次派发跑在**成员会话**里（一个普通会话的一轮）。
@@ -3025,23 +2945,24 @@ export async function runMemberTurn(
   /* ② 任务单（全放 message，不碰 system） */
   const taskMessage = buildMemberTaskMessage(ctx, bb, step, member, taskText, acceptance)
 
-  /* ③ 模型：独立模型必须显式下发 —— 走会话以后模型由「成员会话」决定，
-     不下发就等于"团队里设了独立模型却不生效"（静默降级，正是要避免的那类）。 */
-  let modelArg: Record<string, string> | undefined
-  let modelFallback = false
-  if (String((member as any).modelMode || '') === 'independent') {
-    const ov = ctx.resolveMemberModel(member)
-    if (ov) modelArg = { provider: ov.providerId, model_id: ov.model, base: ov.base }
-    else {
-      modelFallback = true
-      ctx.log('warn', 'session', `[团队] 成员 ${mName} 独立模型（${member.modelId}）解析失败，本次用成员会话自己的模型`)
-    }
-  }
+  /* ③ 模型：**不在这里解析、也不下发** —— 成员会话的模型由后端**唯一决策点**决定：
+     `server.ts` 的 `memberTurnPlanFor` / `applyResolvedMemberTurnModel`（在 `runPromptCore` 的
+     队列/忙闸门之后、发送前预估之前只读解析，预估通过后落库，即"这一轮真正取得执行权"那一刻），
+     派活/私聊/真正出队的队列项/新段全都走它同一个口径。
+     为什么从这里撤掉：这里拿到的是 `ctx.team`（建 agent 时的 team.json 快照）——
+       ① 排队项/下一轮会拿旧配置派活（队列提交 A、开跑时配置已是 B）；
+       ② 私聊根本不经过这里，两边不可能同口径；
+       ③ 独立模型解析失败时原来只记 `modelFallback` 然后跑成员会话自己的模型 = 静默降级。
+     ⚠️ **这里不写 run.model**（打回点2）：配置意图不是"实际用了什么"，写进去就是让状态消费者
+        把意图当事实。run.model 在本轮真正跑过之后、按成员段上真正生效的模型回填（见 ⑦ 收尾）。
+     日志里只报"配置"（配置模型 X / 跟随会话模型），措辞明确不是实际。 */
+  const memberModelConfigured = String((member as any).modelMode || '') === 'independent'
+    ? String((member as any).modelId || '').trim()
+    : ''
 
   /* ④ 黑板 run 记录：开工即落盘（后端权威）。★L5 瘦身：只留元数据，
         过程数据（思考/工具/正文）已经在成员会话里，再抄一份就是两份真相。 */
-  if (!Array.isArray((bb as any).runs)) (bb as any).runs = []
-  const runRec: any = {
+  const runRec: BoardRun = {
     runId, stepId: step.id, memberId: member.id, memberName: mName,
     task: String(taskText || ''),
     callId: callId || undefined,
@@ -3049,19 +2970,16 @@ export async function runMemberTurn(
     status: 'running',
     /* 用户点成员窗口看到的就是这一轮 —— 这个字段是"去哪儿看"的唯一指针 */
     memberSessionId: sid,
-    model: modelArg ? String(modelArg.model_id) : (String(ctx.sessionModel?.() || '') || undefined),
-    modelFallback: modelFallback || undefined,
+    /* model **不在这里写**：这一刻还没开跑，唯一知道的是 ctx.team 快照里的配置意图。
+       写了就是"意图冒充实际"（二审①）。真值在收尾时按**本轮 assistant 消息的元数据**取（⑦）。 */
     t: Date.now(), startedAt: Date.now(),
   }
-  ;(bb as any).runs.push(runRec)
-  persistBoardRuns(bb)
-  /* ★L5：登记"这批 run 还活着" —— `memberRunLive`（派发时判"要不要排队"）与 server 侧的
-     `countLiveSubRuns`（判"会话还有没有子在跑"）都读这张表。不登记的话：前者会把"排队中"算成
-     "立即开工"，后者会在成员还在跑时把父会话判成空闲（后台通知就会插进正在跑的轮次里）。 */
-  activeRunIds.add(runId)
+  persistBoardRuns(bb, runRec)
 
-  /* ⑤ 派发 */
-  ctx.log('info', 'session', `[团队] 派发 ${step.id} → ${mName}（走成员会话 ${sid.slice(0, 8)}${modelArg ? `，模型 ${modelArg.model_id}` : ''}）`)
+  /* ⑤ 派发（模型不在这里定：`runPromptCore` 真正开跑时由唯一决策点定型，
+        这里只报"配置意图"，避免把快照当成请求证据） */
+  ctx.log('info', 'session', `[团队] 派发 ${step.id} → ${mName}（走成员会话 ${sid.slice(0, 8)}`
+    + `${memberModelConfigured ? `，配置模型 ${memberModelConfigured}` : '，跟随会话模型'}）`)
   const ac = new AbortController()
   let killedReason: string | null = null
   /* 中断/看门狗/单次上限都靠这张**唯一登记表**（watchdogs）：
@@ -3123,14 +3041,18 @@ export async function runMemberTurn(
        成员跑活弹了 4.5 分钟授权卡。 */
     const _depth = ctx.enterDispatchTurn(String(sid))
     ctx.log('info', 'approval', `[团队] ${mName} 进入派活轮（会话 ${sid.slice(0, 8)}，当前派活深度 ${_depth}）`)
+    /* ★m6-member-model（二审①）：这里**不再记"有没有开跑"的布尔** ——
+       run.model 的准入判据改成**本轮消息里有没有真实的 assistant.model**（见收尾），
+       布尔 + 读变字段（ms.model）会被同段后续轮污染：等待返回前私聊轮把段模型改成 C，
+       收尾再读就记成 C（打回那条复现）。 */
     const r: any = await ctx.runPromptCore(sid, {
       message: taskMessage,
       /* 这条 user 消息的**持久 id**（server 把它当消息 id）—— 提取产出的精确定位锚点 */
       clientMessageId: userMsgId,
       /* 忙就等，不许"排进队列就返回"当跑完（§2.4） */
       __busyPolicy: 'wait',
-      ...(modelArg ? { model: modelArg } : {}),
-    })
+      /* 不带 model：模型由 runPromptCore 内的唯一决策点在"真正开跑"时定型（见本函数 ③） */
+    }, userMsgId)
     if (r?.queued) {
       const ran = await waitMemberTurnRan(ctx, ms, beforeLen, userMsgId, 10 * 60_000)
       if (!ran) throw new Error('成员会话 10 分钟仍未把这一轮跑完（消息可能还在队列里）——本轮未完成')
@@ -3144,7 +3066,6 @@ export async function runMemberTurn(
   } finally {
     /* ★L5：**先读**"是不是用户停的"（下面 ac.abort() 是清理，会把 signal 置成 aborted） */
     abortedBySignal = ac.signal.aborted
-    try { activeRunIds.delete(runId) } catch { /* ignore */ }
     /* ★m1p：**离开派活轮**（计数 −1，归零才算这一轮真结束）。与上面的 enter 成对，必达。 */
     try {
       const _left = ctx.leaveDispatchTurn(String(sid))
@@ -3210,9 +3131,20 @@ export async function runMemberTurn(
   /* ★L5：**中止优先**。用户点停止时 prompt 也会抛（abort 异常），不能因为"有异常"就记成 error ——
      这一趟的成因是"用户停的"，不是"跑坏了"（两者在回归通知里的说法完全不同）。 */
   const status = aborted ? 'interrupted' : (fatal ? 'error' : (lastText.trim() ? 'done' : 'error'))
+  /* ★m6-member-model（二审①）：**run.model 只写"本轮真正请求过的模型"** ——
+     来源 = **本轮 assistant 消息上的 `model`**（message_start 由真实请求写进消息），
+     范围 = 本轮 user 消息（`clientMessageId`）到**下一条 user 之前**（同段私聊/队列的另一轮不算）。
+     ⇒ 按轮绑定：等待返回前同段私聊把会话字段改成 C，这里仍取本轮那条 assistant 的 B；
+       没跑起来（预检拦下/模型不可用）本轮范围内没有 assistant ⇒ **空 = 未知**，不拿会话字段/配置顶。
+     另外**不再写 `modelSource`**：来源已由"消息元数据"唯一确定，多一个标记就是给消费者多一个可误读的字段。 */
+  const usedModel = turnModelFromMessages(
+    (() => { try { return Array.isArray(ms.messages) ? ms.messages : [] } catch { return [] } })(),
+    beforeLen, userMsgId,
+  )
   Object.assign(runRec, {
     status,
     endedAt: Date.now(),
+    ...(usedModel ? { model: usedModel } : {}),
     usage: usageRes.usage,
     ...(usageRes.source ? { usageSource: usageRes.source } : {}),
     /* 中断/看门狗 → 明确标"没有终点声明"：让 `judgeRunOutcome` 判 partial，
@@ -3223,7 +3155,7 @@ export async function runMemberTurn(
     ...(aborted ? { finalized: false, stopReason: killedReason ? 'watchdog' : 'user', error: String(killedReason || '用户已停止') } : {}),
     ...(status === 'error' && !fatal && !aborted ? { error: '成员这一轮没有产出正文（既没发正文，也没说话）' } : {}),
   })
-  persistBoardRuns(bb)
+  persistBoardRuns(bb, runRec)
   broadcastBB(ctx, bb)
   /* 终态必须走**运行中同一条通道**（pushRunSnapshot），否则卡片停在 running。 */
   try {
@@ -3477,8 +3409,18 @@ export function buildFreshSessionHandoff(p: {
   return parts.join('\n')
 }
 
-async function runStepTask(ctx: TeamCtx, bb: Blackboard, t: any, callId: string): Promise<any> {
+async function runStepTask(ctx: TeamCtx, bb: Blackboard, t: any, callId: string, runId: string): Promise<any> {
   const step = bb.steps.find(s => s.id === String(t.stepId || ''))!
+  laneWrites.set(bb, { runId, step, base: { ...step }, planRev: Number(bb.planRev || 0) })
+  activeRunIds.add(runId)
+  try {
+    return await executeStepTask(ctx, bb, step, t, callId, runId)
+  } finally {
+    activeRunIds.delete(runId) // WeakMap 标记随副本回收，迟到回调不能把旧板当主控写入。
+  }
+}
+
+async function executeStepTask(ctx: TeamCtx, bb: Blackboard, step: BlackboardStep, t: any, callId: string, runId: string): Promise<any> {
   const member = ctx.team.members.find(m => m.id === String(t.memberId || ''))!
   const mName = memberName(ctx.team, member.id)
 
@@ -3490,7 +3432,6 @@ async function runStepTask(ctx: TeamCtx, bb: Blackboard, t: any, callId: string)
     }
   }
 
-  const runId = crypto.randomUUID()
   step.attempts += 1
   step.runId = runId
   step.status = 'running'
@@ -3550,9 +3491,7 @@ async function runStepTask(ctx: TeamCtx, bb: Blackboard, t: any, callId: string)
     }
   }
   try {
-    /* ★L5（心脏手术）：**派活 = 往成员会话发一条消息**（`runMemberTurn`）。
-       旧的私有 Agent 路径（`runSubAgent`）一行没删 —— `NIS_MEMBER_VIA_SESSION=0` 立刻切回。
-       分身（cloneRuntime）只走 `runSubAgent`，与本开关无关、不受影响。 */
+    /* 默认走持久成员会话；`NIS_MEMBER_VIA_SESSION=0` 走一次性团队 Agent。现代分身不写黑板。 */
     if (memberViaSessionEnabled()) {
       await runMemberTurn(ctx, bb, step, member, runId, String(t.task || ''), String(t.acceptance || ''), callId)
     } else {
@@ -3643,7 +3582,7 @@ async function runStepTask(ctx: TeamCtx, bb: Blackboard, t: any, callId: string)
    回归通知按**调用**（callId）结算 ⇒ 排队的活跟着它前一批一起回归，两件事不会搅成一件。
    ⚠️ "忙"只认事实：车道在跑（`running`）或 黑板里该成员有存活 run（`activeRunIds` 命中）。
       不另设标志位，也就没有"标志忘了清"这种病。 */
-type LaneItem = { task: any; callId: string }
+type LaneItem = { task: any; callId: string; runId: string }
 type MemberLane = { running: boolean; queue: LaneItem[] }
 type CallSettle = { left: number; results: any[]; overlapWarn: string | null }
 
@@ -3680,7 +3619,9 @@ function lanePush(ctx: TeamCtx, callId: string, task: any): void {
   const key = laneKey(ctx.sessionId, String(task?.memberId || ''))
   const lane = memberLanes.get(key) || { running: false, queue: [] }
   memberLanes.set(key, lane)
-  lane.queue.push({ task, callId })
+  const runId = crypto.randomUUID()
+  lane.queue.push({ task, callId, runId })
+  ctx.laneActivity?.(String(task?.memberId || ''), runId, true)
   if (!lane.running) void lanePump(ctx, key)
 }
 
@@ -3696,6 +3637,7 @@ async function lanePump(ctx: TeamCtx, key: string): Promise<void> {
       const stepId = String(item?.task?.stepId || '?')
       /* 每件活都**重新读一次黑板**：派活/排队可能横跨几分钟，拿调用处的旧副本写盘会把别人的成果整板覆盖
          （0929 P1 那个病的同款入口）。 */
+      try {
       const bb = loadBlackboard(ctx.sessionId)
       if (!bb) {
         /* 黑板被清空 = 这件活没有落点。如实结算为失败，不假装跑过。 */
@@ -3732,9 +3674,8 @@ async function lanePump(ctx: TeamCtx, key: string): Promise<void> {
       ctx.log('info', 'session', `[团队] 车道开跑 步骤 ${stepId} → ${memberName(ctx.team, mid)}（本车道还剩 ${lane.queue.length} 项排队）`)
       let r: any
       try {
-        const pending = runStepTask(ctx, bb, item.task, item.callId)
-        /* **派出即见卡**：`runStepTask` 会同步跑到 `runSubAgent` 内的 `bb.runs.push` 才挂起 ⇒
-           此刻 `bb.runs` 里已经有本 run，按 callId 全量登记一次（与原来分批登记是同一份数据、同一时刻）。 */
+        const pending = runStepTask(ctx, bb, item.task, item.callId, item.runId)
+        /* 两条执行路径都在首次挂起前提交本 run；从同一已提交快照登记，立刻可见。 */
         try {
           const started = (Array.isArray(bb.runs) ? bb.runs : []).filter((x: any) => String(x?.callId || '') === item.callId)
           if (started.length) ctx.registerSubRuns?.(item.callId, started)
@@ -3746,6 +3687,7 @@ async function lanePump(ctx: TeamCtx, key: string): Promise<void> {
         ctx.setMemberState(mid, 'error', { unread: true })
       }
       settleCall(ctx, item.callId, r)
+      } finally { ctx.laneActivity?.(mid, item.runId, false) }
     }
   } finally {
     lane.running = false
@@ -4068,7 +4010,7 @@ function settleCall(ctx: TeamCtx, callId: string, r: any): void {
       : briefRegressionText(call.results.length, _pendingLeft, _hint, call.overlapWarn)
     ctx.notifyDone(
       _text,
-      { memberIds: call.results.map((x: any) => String(x?.memberId || '')).filter(Boolean) },
+      { memberIds: call.results.map((x: any) => String(x?.memberId || '')).filter(Boolean), reason: 'team-summary', batchId: callId },
     )
     if (_tier.tier === 'full') {
       ctx.log('warn', 'session', `[团队] 回归走 A 档（逐项展开）：${_tier.reasons.slice(0, 3).join('；')}`)
@@ -4545,10 +4487,7 @@ export function buildTeamTools(ctx: TeamCtx): AgentTool<any>[] {
         }
         const cycle = detectCycle(steps)
         if (cycle) throw new Error(`计划存在循环依赖：${cycle}`)
-        // 0910 反馈6：重写计划时保留已有 runs——旧实现全量替换 blackboard 对象，把成员执行记录
-        // 一起抹掉（刷新后子 agent 气泡无法从 transcript.subRuns 恢复的另一半根因）。
         const prevBb = readBlackboardRaw(ctx.sessionId)
-        const prevRuns = Array.isArray(prevBb?.runs) ? prevBb.runs : []
         const bb: Blackboard = {
           sessionId: ctx.sessionId,
           teamId: ctx.team.id,
@@ -4562,7 +4501,6 @@ export function buildTeamTools(ctx: TeamCtx): AgentTool<any>[] {
              没有它，saveBlackboard 的按 id 合并会把旧计划的步骤永久留在板上（幽灵步骤）。 */
           planRev: Number(prevBb?.planRev || 0) + 1,
         }
-        if (prevRuns.length) (bb as any).runs = prevRuns
         /* ★bd1：bb_goal 是"全量替换**计划**"—— 待确认清单**不属于计划**，必须原样带过来。
            否则每重写一次计划就把用户还没答的问题静默抹掉（观感＝问题自己消失了）。 */
         const prevTombs = mergeDecisionTombstones((prevBb as any)?.decisionTombstones, undefined)

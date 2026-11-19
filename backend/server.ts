@@ -15,11 +15,13 @@ import { isReadablePath, allowedReadRoots, readRootsDenyMessage } from './readRo
    两者都是**纯新增模块**（不 import server.ts），且只在 NIS_WS=1 时才真正挂载（见文件末尾），
    不设该环境变量 = 该路由不存在 = 行为与接线前完全一致。 */
 import { WsHub } from './wsHub.ts'
-import type { DownFrame } from './wsHub.ts'
+import type { DownFrame, HubConnection } from './wsHub.ts'
 import { attachWs, type Attached } from './wsAttach.ts'
 import { PROTOCOL_V } from './wsProtocol.ts'
 import { mapToWsFrame, type MuxFrameLike } from './wsMap.ts'
 import { noteFrame, readProbe, resetProbe, probeEnabled, setProbeEnabled, noteEmitCost } from './wsProbe.ts'
+import { createMemberActivity, MEMBER_ROSTER_ID, type MemberTurn } from './memberActivity.ts'
+import { createMemberActivityBridge, type MemberInput } from './memberActivityBridge.ts'
 import { slimAgentEvent } from './agentEventSlim.ts'
 import http from 'node:http'
 import os from 'node:os'
@@ -40,6 +42,9 @@ import {
 } from './agentCompat.ts'
 import type { AgentMessage, AgentEvent, BeforeToolCallContext, AgentTool, ImageContent, Model as NiusDreamModel } from './agentCompat.ts'
 import { buildResponsesRequest, parseResponsesReply } from './responsesProtocol.ts'
+/* ★member-lifetime：成员用量**唯一口径**的纯聚合（全历史=当前+归档段、命中率=Σ读/(Σ读+Σ未命中)）。
+   读取层只负责把会话对象映射成 SegmentRow，怎么加怎么算只有这一份（见模块头注释）。 */
+import { collectMemberUsageViews, detailTotalsFromView, mergeViewsIntoMemberTotals, pickCurrentRow, sessionToSegmentRow, type MemberUsageSegmentRow, type MemberUsageTotalsView } from './memberUsageAggregate.ts'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { rebuildTranscriptFromMessages } from './transcriptRebuild.ts'
 import { buildCheckRunTool } from './tools.ts'
@@ -76,13 +81,14 @@ const RESET_GRACE = FACTORY_EPOCH ? resetGraceActive(DATA_ROOT) : false
 import { PROJECT_ROOT, SKILLS_ROOT } from './paths.ts'
 import { mcpHubInit, mcpHubInstall, mcpHubRemove, mcpHubDisconnect, getMcpAgentTools, getMcpStatus, mcpHubSetEnabled, mcpHubSetSelected, mcpHubSetSelectedAll, registerVirtualServer, setMcpStatusListener } from './mcpRuntime.ts'
 import * as browserEngine from './browserEngine.ts'
+import * as browserRetirement from './browserRetirement.ts'
 import type { McpToolInfo } from './mcpRuntime.ts'
 
 /** 内置虚拟 MCP server 注册（0904 浏览器）：工具命名抄 webbridge 的 wb_* 语义。
  *  execute 直接调 browserEngine 内存函数 → 自动受 预设总开关 / 开关B(enabled) / 仓库 / list_tools 全链路管辖。 */
 const BROWSER_TOOLS: McpToolInfo[] = [
   { name: 'wb_status', description: '查看内置浏览器运行状态（是否启动/当前标签页/视口模式）', inputSchema: { type: 'object', properties: {} } },
-  { name: 'wb_navigate', description: '打开【网络网址】(http/https，自动补 https://)到内置浏览器。落点：默认新开标签；若存在仍停留在默认首页的空闲标签则复用它。用户在用的标签永远不会被顶掉或关闭。硬性限制：本地工作区文件（file:// 或本地路径）会被系统拒绝——要给用户看本地文件请用 wb_preview_file（预览）或 wb_send_screenshot path=（截图发对话流）。页面内跳转（点链接/表单/翻页）用 wb_click 而非重复 navigate；遇到验证码/扫码等真人环节不要重试绕过，直接告知用户在「浏览器」视图接管完成', inputSchema: { type: 'object', properties: { url: { type: 'string', description: '要访问的网络网址' } }, required: ['url'] } },
+  { name: 'wb_navigate', description: '打开【网络网址】(http/https，自动补 https://)到内置浏览器（surface=builtin-browser）。用户说「在这里打开 / 点一下 / 帮我操作这个页面」= 内置浏览器，就是本工具。落点：默认新开标签；若存在仍停留在默认首页的空闲标签则复用它。用户在用的标签永远不会被顶掉或关闭。硬性限制：本地工作区文件（file:// 或本地路径）会被系统拒绝——要给用户看本地文件请用 wb_preview_file（预览）或 wb_send_screenshot path=（截图发对话流）。页面内跳转（点链接/表单/翻页）用 wb_click 而非重复 navigate；遇到验证码/扫码等真人环节不要重试绕过，直接告知用户在「浏览器」视图接管完成。用户明确要求「用 Chrome / 默认浏览器 / 外部浏览器 / 系统浏览器」打开时：标准工具没有这条通道，不要用本工具顶替、也不要用 run_command 去启浏览器替代，如实说明并请用户点链接旁的「打开方式」菜单自己选外部浏览器，或问一句「要不要我用内置浏览器打开」', inputSchema: { type: 'object', properties: { url: { type: 'string', description: '要访问的网络网址' } }, required: ['url'] } },
   { name: 'wb_snapshot', description: '抓取当前页面可读文本快照（title/url/正文+可交互元素清单），AI 据此判断下一步。行为准则：发现当前页不是目标内容（错误页/无关导航页）时，重新 wb_navigate 直达正确网址；清单里的引号文字可直接作为 wb_click 的 text= 参数；遇到扫码/验证码/人工审核环节直接告知用户接管完成，你 wb_wait 等待', inputSchema: { type: 'object', properties: { tabId: { type: 'string' } } } },
   { name: 'wb_screenshot', description: '当前页面截图，返回 base64 图（图只有你自己能看，用于判断页面状态；要给【用户】看请改用 wb_send_screenshot）。失败最多重试一次，仍失败就放弃并告知用户', inputSchema: { type: 'object', properties: { format: { type: 'string', enum: ['png', 'jpeg'] } } } },
   { name: 'wb_click', description: '点击元素。优先 text=页面上可见文字（如"发送""登录"，来自 wb_snapshot 清单）；拿不到文字再用 CSS selector=。找不到元素先 wb_snapshot 看页面实况，盲重试无效', inputSchema: { type: 'object', properties: { text: { type: 'string', description: '按可见文字点击（优先）' }, selector: { type: 'string', description: 'CSS 选择器（备选）' } } } },
@@ -98,9 +104,9 @@ const BROWSER_TOOLS: McpToolInfo[] = [
   { name: 'wb_set_viewport', description: '切换视口预设：pc / iphone15 / ipad / pixel7（模拟移动端/桌面）', inputSchema: { type: 'object', properties: { viewport: { type: 'string' } }, required: ['viewport'] } },
   { name: 'wb_list_tabs', description: '列出所有标签页（含 tabId/url）。要继续操作之前打开过的页面时，先列 tab 找到对应 tabId，后续工具带 tabId= 参数操作那一页，不要重新 wb_navigate', inputSchema: { type: 'object', properties: {} } },
   { name: 'wb_close_tab', description: '关闭某标签页。仅限关闭你自己为本次任务打开的、且任务已完成的标签；用户的默认首页标签和最后一个标签会被系统强制拒绝；没让你清理就不要主动关任何标签', inputSchema: { type: 'object', properties: { tabId: { type: 'string' } }, required: ['tabId'] } },
-  { name: 'wb_preview_file', description: '在预览面板打开本地工作区文件（HTML/图片等）展示给用户——后台打开不打断用户当前视图（tab 栏有提示点），用户随时自己点开看。仅当用户明确要求查看/预览某文件时才调用；写完文件后不要主动开预览、也不要为展示产物调用它——直接回复文件路径即可。硬性限制：外部网址(http/https)会被系统拒绝——真实网络页面用 wb_navigate；想把网页/文件效果【发到对话流里】用 wb_send_screenshot', inputSchema: { type: 'object', properties: { path: { type: 'string', description: '工作区内相对路径或绝对路径' } }, required: ['path'] } },
-  { name: 'wb_send_screenshot', description: '把画面直接发送到对话流里给用户看（零成本，图不回传你、勿复述内容）。四种用法：不带参数=截【用户当前正在看的页面】；url= 一步导航到该网址并等页面就绪后截（最新效果，可再带 delay_ms 等动画渲染）；tabId= 截【指定已开标签页】；path= 发【本地工作区文件】（图片直发，HTML/md 自动渲染成截图）。要截桌面上非浏览器的内容用 wb_screen_capture。回执会报告实际截图来源 URL——发现截错对象就换参数重截一次，不要盲重试', inputSchema: { type: 'object', properties: { format: { type: 'string', description: 'png 或 jpeg，默认 png' }, url: { type: 'string', description: '要导航后截图的网址（可选）' }, tabId: { type: 'string', description: '要截的标签页 id（来自 wb_list_tabs，可选）' }, path: { type: 'string', description: '本地工作区图片/文本文件路径（可选）' }, delay_ms: { type: 'number', description: '截图前额外等待毫秒数（动画/异步渲染，上限 15000，可选）' } } } },
-  { name: 'wb_screen_capture', description: '截取用户桌面发到对话流：默认截【整块屏幕】（能看到所有可见应用窗口）；也可只截【某一个应用窗口】（target=window）——这时窗口被别的窗口挡住也截得到（走 PrintWindow），截不到才退回"把窗口提到前台再抓"。内置浏览器页截图/本地文件请用 wb_send_screenshot，别用本工具。给用户看某个具体应用时：优先 target=window + windowTitle=应用标题关键字（找不到会返回可用标题清单让你重选）；不想动用户的窗口层级就别传 windowTitle（截前台窗口），或先请用户把应用切到前台再截整屏。每次都会弹审批卡由用户批准；图不回传你本人（零 vision 成本），用户视角展示用', inputSchema: { type: 'object', properties: { target: { type: 'string', enum: ['screen', 'window'], description: 'screen=整块屏幕（默认，原行为）；window=只截一个应用窗口（含被遮挡部分）' }, windowTitle: { type: 'string', description: '仅 target=window 时有意义：窗口标题关键字（不区分大小写，包含匹配）。不传=截当前前台窗口' }, delay_ms: { type: 'number', description: '截图前等待毫秒数（等窗口切前台/动画渲染，可选）' } } } },
+  { name: 'wb_preview_file', description: '在预览面板打开本地工作区文件（HTML/图片等）展示给用户（surface=preview-panel：落点是应用内的预览面板，不是浏览器、也不进对话流）——后台打开不打断用户当前视图（tab 栏有提示点），用户随时自己点开看。仅当用户明确要求查看/预览某文件时才调用；写完文件后不要主动开预览、也不要为展示产物调用它——直接回复文件路径即可。硬性限制：外部网址(http/https)会被系统拒绝——真实网络页面用 wb_navigate；想把网页/文件效果【发到对话流里】用 wb_send_screenshot', inputSchema: { type: 'object', properties: { path: { type: 'string', description: '工作区内相对路径或绝对路径' } }, required: ['path'] } },
+  { name: 'wb_send_screenshot', description: '把画面直接发送到对话流里给用户看（surface=chat-stream：落点是对话流，不是浏览器、也不是预览面板；零成本，图不回传你、勿复述内容）。四种用法：不带参数=截【内置浏览器里用户当前正在看的那一页】（桌面/其它应用用 wb_screen_capture）；url= 一步导航到该网址并等页面就绪后截（⚠️ 真副作用：会先把内置浏览器导航过去、换掉 AI 当前页，回执里 navigated=true 就是它；只想看网页效果又不想改动内置页时先说一句）；tabId= 截【指定已开标签页】；path= 发【本地工作区文件】（图片直发，HTML/md 自动渲染成截图，用独占的后台临时标签渲染，不抢用户那一页）。要截桌面上非浏览器的内容用 wb_screen_capture。回执会报告实际截图来源 URL——发现截错对象就换参数重截一次，不要盲重试', inputSchema: { type: 'object', properties: { format: { type: 'string', description: 'png 或 jpeg，默认 png' }, url: { type: 'string', description: '要导航后截图的网址（可选）' }, tabId: { type: 'string', description: '要截的标签页 id（来自 wb_list_tabs，可选）' }, path: { type: 'string', description: '本地工作区图片/文本文件路径（可选）' }, delay_ms: { type: 'number', description: '截图前额外等待毫秒数（动画/异步渲染，上限 15000，可选）' } } } },
+  { name: 'wb_screen_capture', description: '截取用户桌面发到对话流（surface=desktop-shot：来源是桌面或任意应用窗口，与浏览器页面无关）：默认截【整块屏幕】（能看到所有可见应用窗口）；也可只截【某一个应用窗口】（target=window）——这时窗口被别的窗口挡住也截得到（走 PrintWindow），截不到才退回"把窗口提到前台再抓"。内置浏览器页截图/本地文件请用 wb_send_screenshot，别用本工具。给用户看某个具体应用时：优先 target=window + windowTitle=应用标题关键字（找不到会返回可用标题清单让你重选）；不想动用户的窗口层级就别传 windowTitle（截前台窗口），或先请用户把应用切到前台再截整屏。每次都会弹审批卡由用户批准；图不回传你本人（零 vision 成本），用户视角展示用', inputSchema: { type: 'object', properties: { target: { type: 'string', enum: ['screen', 'window'], description: 'screen=整块屏幕（默认，原行为）；window=只截一个应用窗口（含被遮挡部分）' }, windowTitle: { type: 'string', description: '仅 target=window 时有意义：窗口标题关键字（不区分大小写，包含匹配）。不传=截当前前台窗口' }, delay_ms: { type: 'number', description: '截图前等待毫秒数（等窗口切前台/动画渲染，可选）' } } } },
 ]
 
 /** 0905：AI 在浏览器里的"专属标签"（按会话隔离）——后续点击/填表/截图都作用在它上面，
@@ -108,21 +114,26 @@ const BROWSER_TOOLS: McpToolInfo[] = [
 const aiPreferredTabBySession = new Map<string, string>()
 
 /** 0908 三批（实测：模型打开B站后连发多张截图=白烧轮次+transcript 塞多份 base64）：
- *  send_screenshot 同页去重——距上次发图 <45s 且页面自那以后【无任何交互动作】且目标 URL 相同
- *  → 不再截图不再发图，回"已发送过"提示。合法场景（点完再看效果/导航到新页再截）不受影响。 */
-const shotDedupBySession = new Map<string, { url: string; at: number }>()
+ *  send_screenshot 同页去重——距上次发图 <45s、期间【无任何交互动作】、且**截到的是同一个标签**
+ *  → 不再发第二张，回"已发送过"提示。
+ *  ★1120 单一证据链：判据只认「上一次截图真正截到的那个标签身份」（engine.screenshot 返回值）。
+ *    截图 API 不携带画面地址，所以任何"截图之前读到的 URL"（标签列表里的、导航返回的）都**不是**证据，
+ *    一律不参与判重、也不登记 —— 否则会出现"请求 A 被当成已发过"的假事实（实测复现过）。 */
+const shotDedupBySession = new Map<string, { tabId: string; at: number }>()
 const lastActionAtBySession = new Map<string, number>()
 function markPageAction(sessionKey: string): void { lastActionAtBySession.set(sessionKey, Date.now()) }
-/** 同页去重窗口：45s。判据是"同 URL + 期间无任何页面交互动作"——换页/点击/导航都会 markPageAction 放行，
- *  换 URL 也放行，所以这个时间窗只是"同页静止时"的连拍保险，放宽不会误伤合法的"点完再看新效果"。 */
-function duplicateShotHit(sessionKey: string, url: string): boolean {
+/** 同页去重窗口：45s。没有可证明的标签身份就**不算重复**（没有证据不产生事实）；期间有页面交互动作也放行。 */
+function duplicateShotHit(sessionKey: string, tabId: string): boolean {
+  if (!tabId) return false
   const prev = shotDedupBySession.get(sessionKey)
+  if (!prev || !prev.tabId) return false
   const acted = lastActionAtBySession.get(sessionKey) || 0
-  if (prev && Date.now() - prev.at < 45000 && acted < prev.at && normShotUrl(prev.url) === normShotUrl(url)) return true
-  return false
+  return Date.now() - prev.at < 45000 && acted < prev.at && prev.tabId === tabId
 }
-function normShotUrl(u: string): string {
-  try { return u.replace(/\/+$/, '').toLowerCase() } catch { return u }
+/** 登记"这次的画面确实发过了"——只有拿到真实标签身份才登记（空身份不登记，免得污染下一次判重）。 */
+function recordShot(sessionKey: string, tabId: string): void {
+  if (!tabId) return
+  shotDedupBySession.set(sessionKey, { tabId, at: Date.now() })
 }
 
 /** 0905 T2：AI 主动打开内容 → 通知前端自动切到浏览器视图 + 弹对话悬浮窗（带发起会话，前端过滤） */
@@ -160,7 +171,7 @@ const BROWSER_PAGE_TOOLS = new Set([...BROWSER_INTERACTIVE_TOOLS, 'wb_snapshot',
 
 /** 0905 九批：wb_navigate 落点——①与某现有标签 URL 完全相同→复用（等价刷新，防 SPA 操作失败后反复重开同一站）；
  *  ②仍停留在默认首页的空闲标签→拿来用；③否则新开。用户在用的标签永不被占用。 */
-async function resolveAiNavigateTarget(inst: browserEngine.BrowserInstance, rawUrl: string): Promise<{ tabId?: string; how: string }> {
+async function resolveAiNavigateTarget(inst: browserEngine.BrowserInstance, rawUrl: string, taskId = ''): Promise<{ tabId?: string; how: string }> {
   const u = rawUrl.trim().replace(/\/+$/, '')
   /* ★C2：shell 模式下数据源换成「引擎已认领 + 壳视图列表」的并集，否则 AI 看不到人手动开的页 */
   const tabs = await inst.listTabsFresh()
@@ -170,7 +181,9 @@ async function resolveAiNavigateTarget(inst: browserEngine.BrowserInstance, rawU
   const home = inst.getHomeUrl()
   const idleHome = tabs.find(t => !t.url || t.url === 'about:blank' || (!!home && t.url === home))
   if (idleHome) return { tabId: idleHome.id, how: '默认首页标签' }
-  const nt = await inst.newTab(rawUrl)
+  /* ★1132：**只有这里建出来的页才算 AI 临时页**（带本轮 taskId）。复用的页一律不改归属 ——
+     复用用户页之后它仍然是用户页，退场扫描会跳过它。 */
+  const nt = await inst.newTab(rawUrl, { origin: 'ai', ...(taskId ? { ownerTaskId: taskId } : {}) })
   return { tabId: nt.id, how: '新标签' }
 }
 
@@ -547,10 +560,16 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
           return { text: '【行为指令】本地工作区文件禁止用 wb_navigate 打开。要给用户看效果请改用：wb_preview_file（工作区预览面板，不打断用户当前视图）或 wb_send_screenshot（把文件渲染成截图直接发进对话流）。给用户看的页面永远走预览通道，浏览器只用于真实网络网址。', isError: true }
         }
         broadcastBrowserAct(sessionId)
-        const t = await resolveAiNavigateTarget(inst, String(args.url || ''))
+        const t = await resolveAiNavigateTarget(inst, String(args.url || ''), String((sessions.get(sessionId) as any)?.activeTaskId || ''))
         const r = await inst.navigate(String(args.url || ''), t.tabId)
-        aiPreferredTabBySession.set(sessionKey, t.tabId || '')
-        return { text: `已在${t.how}打开 ${r.url}（tabId ${t.tabId || '新'}），后续点击/填表自动作用于此标签` }
+        /* ★1120 单一证据链：AI 专属标签与回执都用**导航真正落到的那个标签**（引擎返回值），
+           不用"导航前挑落点时的计划值"——目标标签在两步之间被关掉时，计划值会撒谎、
+           还会把后续点击/填表引到一个不存在的 id 上。 */
+        aiPreferredTabBySession.set(sessionKey, r.tabId || '')
+        const plannedReuse = t.how === '已有同址标签' ? 'same-url' : t.how === '默认首页标签' ? 'idle-home' : 'new'
+        /* 计划"复用某标签"但实际落到别处 ⇒ 标 fell-back；计划"新开"则落点本来就是新建那个标签。 */
+        const reuseTag = !r.tabId ? 'unknown' : (r.tabId === t.tabId || t.how === '新标签') ? plannedReuse : 'fell-back-other-tab'
+        return { text: `surface=builtin-browser url=${r.url} tabId=${r.tabId || 'unknown'} reuse=${reuseTag}\n已在${t.how}打开 ${r.url}（tabId ${r.tabId || '未识别'}，内置浏览器，不是用户的 Chrome/系统默认浏览器），后续点击/填表自动作用于此标签` }
       }
       case 'wb_snapshot': {
         const r = await inst.snapshot(tabId)
@@ -575,7 +594,7 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
           try { pv = readForPreview(String(sessionId || ''), rawPath) } catch { pv = null }
           if (!pv) return { text: `无法读取「${rawPath}」（不存在或不在工作区内）。发本地文件请传工作区内相对/绝对路径；截网页请带 url= 或不带参数截当前页`, isError: true }
           if (pv.kind === 'image' && pv.dataUrl) {
-            return { text: `图片已直接发送到对话流中（源文件 ${pv.name}）。不要用文字复述图片内容`, details: persistShotFromDataUrl(sessionId, pv.dataUrl) }
+            return { text: `surface=chat-stream source.kind=path source.name=${pv.name}\n图片已直接发送到对话流中（源文件 ${pv.name}）。不要用文字复述图片内容`, details: persistShotFromDataUrl(sessionId, pv.dataUrl) }
           }
           if (pv.content) {
             let tmpTab: string | undefined
@@ -587,7 +606,11 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
               tmpTab = (await inst.newTab(`file:///${abs.replace(/\\/g, '/')}`, { requireNew: true, background: true })).id
               await new Promise(rs => setTimeout(rs, 600))   // 本地文件渲染余量
               const r = await inst.screenshot(tmpTab, fmt)
-              return { text: `文件 ${pv.name} 已渲染截图发送到对话流中（源=${abs}）。不要用文字复述图片内容`, details: persistShot(sessionId, r.data, r.mime) }
+              /* 同一证据链：画面必须是这张临时标签渲染出来的那一页；不是就明确失败、不发送。 */
+              if (r.tabId !== tmpTab) {
+                return { text: `渲染文件截图失败：实际截到的不是本次渲染的临时标签（期望 ${tmpTab}，实际 ${r.tabId || '（无身份）'}），本次没有发送任何图片。`, isError: true }
+              }
+              return { text: `surface=chat-stream source.kind=path source.path=${abs}\n文件 ${pv.name} 已渲染截图发送到对话流中（源=${abs}）。不要用文字复述图片内容`, details: persistShot(sessionId, r.data, r.mime) }
             } catch (e: any) {
               return { text: `渲染文件截图失败：${e?.message || e}。图片文件可直接发送，HTML 也可让用户在预览面板查看（wb_preview_file）`, isError: true }
             } finally {
@@ -597,41 +620,66 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
           return { text: `「${rawPath}」类型暂不支持发送（支持 png/jpg/webp/gif/svg 等图片与 html/md/txt 等文本渲染截图）`, isError: true }
         }
         if (!inst.isRunning()) return { text: '【不要重试】内置浏览器未运行且无法截图。截本地文件请带 path=；截网页请带 url=。', isError: true }
-        const shotReceipt = (u: string, mime: string, data: string) => ({
-          text: `截图已发送到对话流（来源：${u || '当前页'}）。用户已经看到了这一张，【同屏无需再次截图发送】——继续完成你的回复即可；只有页面发生变化后才值得再截。不要复述图片内容`,
-          details: persistShot(sessionId, data, mime),
+        /* ★1120 显式表面：回执只写**同一捕获动作能证明的事实**。
+           · surface=       图发到哪（对话流）—— 确定的目的地；
+           · source.tabId=  截图动作内解析出的真实目标标签（引擎返回值），可证明；
+           · source.url=    **永远 unknown**：截图不携带画面地址。截图前后读到的任何 URL（列表里的、
+                            导航返回的）都只是别的事实，不等于这张图的实际地址 ⇒ 一律不写进 source.url。
+           · requested=/navigated=/landed= 请求与导航事实，单独字段，明确不冒充画面地址。 */
+        const shotReceipt = (src: { kind: 'tab' | 'url' | 'active-page'; tabId?: string; requested?: string; navigated?: boolean; landed?: string }, mime: string, data: string) => {
+          const id = ['surface=chat-stream', `source.kind=${src.kind}`, `source.tabId=${src.tabId || 'unknown'}`]
+          if (src.requested) id.push(`requested=${src.requested}`)
+          if (src.navigated) id.push(`navigated=true${src.landed ? ` landed=${src.landed}` : ''}`)
+          id.push('source.url=unknown（截图动作不返回画面地址；requested/landed 只是请求与导航事实，不要当成本图的实际地址）')
+          return {
+            text: `${id.join(' ')}\n截图已发送到对话流（画面来自标签 ${src.tabId || '未识别'}）。用户已经看到了这一张，【同屏无需再次截图发送】——继续完成你的回复即可；只有页面发生变化后才值得再截。不要复述图片内容`,
+            details: persistShot(sessionId, data, mime),
+          }
+        }
+        /* 指定了目标标签就必须**真截到它**：引擎在标签消失时会落到当前页（getTab 的回落语义），
+           那时画面不是用户/模型要的那一页 ⇒ 明确失败，不发送、不登记、不报成功。
+           （身份由引擎截图动作内解析，不依赖任何截图前的读数。） */
+        const targetMissed = (want: string, got: string) => ({
+          text: `【不要重试】请求截标签 ${want}，实际可截到的标签是 ${got || '（无身份）'}——目标标签已关闭或未连上，本次没有发送任何图片。请用 wb_list_tabs 重新取 tabId，不要复用旧 id。`,
+          isError: true,
+        })
+        /* url= 指定的对象是「这个网址的画面」：导航落在哪个标签、截图就必须来自哪个标签（两边都由引擎动作返回）。 */
+        const navSplit = (navTabId: string, got: string) => ({
+          text: `【不要重试】导航与截图不在同一标签（导航落在 ${navTabId || '（无身份）'}，实际截到 ${got || '（无身份）'}）——目标标签可能在两步之间被关闭，本次没有发送任何图片。请用 wb_list_tabs 重新取 tabId 后再试。`,
+          isError: true,
         })
         // ② 指定标签页截图
         if (args.tabId) {
-          const shotUrl0 = (await inst.listTabsFresh()).find(x => x.id === String(args.tabId))?.url || ''
-          if (duplicateShotHit(sessionKey, shotUrl0)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
           if (delayMs) await new Promise(rs => setTimeout(rs, delayMs))
           const r = await inst.screenshot(String(args.tabId), fmt)
-          shotDedupBySession.set(sessionKey, { url: shotUrl0, at: Date.now() })
-          return shotReceipt(shotUrl0 || String(args.tabId), r.mime, r.data)
+          if (r.tabId !== String(args.tabId)) return targetMissed(String(args.tabId), r.tabId)
+          if (duplicateShotHit(sessionKey, r.tabId)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
+          recordShot(sessionKey, r.tabId)
+          return shotReceipt({ kind: 'tab', tabId: r.tabId }, r.mime, r.data)
         }
         // ③ 带 url：导航到目标页 → 等就绪+可选 delay → 截该页（一步到位且能截"最新"）
         if (rawUrl) {
           if (/^file:\/\//i.test(rawUrl)) return { text: '【行为指令】截本地文件请带 path=（不要用 url=file://）。', isError: true }
-          if (duplicateShotHit(sessionKey, rawUrl)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
-          const nav = await inst.navigate(rawUrl.includes('://') ? rawUrl : `https://${rawUrl}`, tabId)
+          const navTarget = rawUrl.includes('://') ? rawUrl : `https://${rawUrl}`
+          const nav = await inst.navigate(navTarget, tabId)
           markPageAction(sessionKey)
           const p = inst.tryGetTab()
           if (p) { await p.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {}) }
-          if (duplicateShotHit(sessionKey, nav.url)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
           if (delayMs) await new Promise(rs => setTimeout(rs, delayMs))
           const r = await inst.screenshot(tabId, fmt)
-          shotDedupBySession.set(sessionKey, { url: nav.url, at: Date.now() })
-          return shotReceipt(nav.url, r.mime, r.data)
+          /* 单一证据链：截图必须与本次导航是**同一个标签**（两边身份都由引擎动作返回）。
+             不同 ⇒ 画面不是刚导航的那个网址，明确失败、不发送、不登记。 */
+          if (!nav.tabId || r.tabId !== nav.tabId) return navSplit(nav.tabId, r.tabId)
+          if (duplicateShotHit(sessionKey, r.tabId)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
+          recordShot(sessionKey, r.tabId)
+          return shotReceipt({ kind: 'url', tabId: r.tabId, requested: navTarget, navigated: true, landed: nav.url }, r.mime, r.data)
         }
         // ④ 默认：截用户当前激活页（不是 AI 专属页——修复"截到别的 tab"）
-        const activePage = inst.requirePage()
-        const shotUrl = activePage?.url?.() || ''
-        if (duplicateShotHit(sessionKey, shotUrl)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
         if (delayMs) await new Promise(rs => setTimeout(rs, delayMs))
         const r = await inst.screenshot(undefined, fmt)
-        shotDedupBySession.set(sessionKey, { url: shotUrl, at: Date.now() })
-        return shotReceipt(shotUrl, r.mime, r.data)
+        if (duplicateShotHit(sessionKey, r.tabId)) return { text: '同一页面的截图刚刚已经发给用户了，用户已看到，无需重复截图。请继续回复。' }
+        recordShot(sessionKey, r.tabId)
+        return shotReceipt({ kind: 'active-page', tabId: r.tabId }, r.mime, r.data)
       }
       case 'wb_screen_capture': {
         // 0908 C₁：整屏截图（用户桌面上任何可见内容），图进对话流给用户看、不回灌模型。
@@ -654,7 +702,7 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
             ? `窗口截图（${_want ? `标题含「${_want}」` : '当前前台窗口'}）`
             : '整屏截图'
           return {
-            text: `${_what}已发送到对话流（来源=用户桌面）。${_fbNote}不要复述图片内容`,
+            text: `surface=desktop-shot source=${_isWin ? `window${_want ? `(title~${_want})` : '(foreground)'}` : 'screen'}${_fbNote ? ' fallback=foreground' : ''}\n${_what}已发送到对话流（来源=用户桌面）。${_fbNote}不要复述图片内容`,
             details: persistShot(sessionId, shot.data, shot.mime),
           }
         } catch (e: any) {
@@ -782,7 +830,7 @@ async function callBrowserToolInner(tool: string, args: Record<string, any>, ses
             if (wd) relPath = path.relative(wd, resolveWorkdirPath({ workDir: wd }, raw)).replace(/\\/g, '/')
           } catch { /* 解析失败就不带，行为与旧版一致 */ }
           broadcastMux('', { type: 'preview/open', sessionId: sid, kind: pv.kind, name: pv.name, content: pv.content, dataUrl: pv.dataUrl, path: relPath || undefined })
-          return { text: `已在预览中打开 ${pv.name}。请继续完成你的回复（不要停在这个工具上）` }
+          return { text: `surface=preview-panel path=${relPath || pv.name}\n已在预览中打开 ${pv.name}。请继续完成你的回复（不要停在这个工具上）` }
         } catch (e: any) {
           return { text: `无法预览：${e?.message || e}`, isError: true }
         }
@@ -843,13 +891,52 @@ function registerBuiltinVirtualServers(): void {
 /** 观看态（0905 T5）：有人在看 → 挂起引擎 idle 计时（光看着/悬停不算空闲；离开视图 unwatch 后才起算 90s）。
  *  ★C2-a4：browser/frame（base64 截图帧）广播已删除 —— 面板换成 WebContentsView 真渲染后前端不再需要帧；
  *  引擎的 setFrameCallback 留在原处不用（定时任务 / 远程通道各有自己的出画通道，不受影响）。 */
-function setBrowserWatch(on: boolean, sessionId?: string): void {
+function setBrowserWatch(on: boolean, sessionId?: string, tabId?: string): void {
   const inst = browserEngine.getBrowserInstance(sessionId)
   if (on) {
-    inst.pauseIdle()
+    /* ★1132：**页级观看** —— "当前可见页不能在收尾时消失"靠的就是这个 tabId。
+       前端不传就是空（= 没有具体在看哪页），此时退场只按"整会话有人在看"处理。 */
+    inst.pauseIdle(tabId)
   } else {
     inst.resumeIdle()
   }
+}
+
+/* ★1132：**AI 临时页退场**（老板 11-18 定案的落地）——
+   收轮后扫一次：只关"本轮任务开的 + 没人看的"页，保底留一页，失败不重试只留痕。
+   判据全在 `browserRetirement.ts`（纯函数、可脱离宿主单测）；这里只负责取事实 + 执行。 */
+async function sweepAiTabsOnTurnEnd(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId)
+  const taskId = String((session as any)?.activeTaskId || '')
+  if (!session || !taskId) return
+  /* 还有活在跑（成员/分身/队列）⇒ 这一轮不算结束，不动页面 */
+  try { if (sessionAgentBusy(sessionId)) return } catch { /* 判定失败按"不结束"处理：宁可不关 */ return }
+  let inst: browserEngine.BrowserInstance
+  try { inst = browserEngine.getBrowserInstance(sessionId) } catch { return }
+  let tabs: browserEngine.BrowserTabInfo[] = []
+  try { tabs = await inst.listTabsFresh() } catch (e) {
+    sessionLog(sessionId, 'warn', 'browser', '[退场] 取页面列表失败，本轮不退场：' + String((e as any)?.message || e))
+    return
+  }
+  const plan = browserRetirement.planSweep(tabs, {
+    taskId,
+    watchedTabId: inst.getWatchedTabId(),
+    watching: (inst as any).watching === true,
+    controlledBy: inst.controlledBy,
+  })
+  for (const t of plan.retire) {
+    try {
+      await inst.closeTab(t.id)
+      sessionLog(sessionId, 'info', 'browser', `[退场] 已关 AI 临时页 ${t.id}（任务 ${taskId.slice(0, 8)}）`)
+    } catch (e) {
+      sessionLog(sessionId, 'warn', 'browser', `[退场] 关闭失败 ${t.id}：${String((e as any)?.message || e)}（不重试）`)
+    }
+  }
+  if (plan.skipped.length) {
+    sessionLog(sessionId, 'info', 'browser', `[退场] 跳过 ${plan.skipped.length} 页：${plan.skipped.map((x: any) => x.id + ':' + x.reason).join(',')}`)
+  }
+  /* 这一轮的任务到此结束 ⇒ 清 taskId（下一轮 beginTurnMark 会生成新的） */
+  try { delete (session as any).activeTaskId } catch { /* ignore */ }
 }
 
 /* ★1117（需求「死的全删除」）：**浏览器设置块整段删除** ——
@@ -863,7 +950,7 @@ function setBrowserWatch(on: boolean, sessionId?: string): void {
 
 import { logEvent, readSessionLogs, cleanupOldLogs } from './sessionLogger.ts'
 import { getCustomAgentTools, buildCustomToolAdminTools, saveCustomTool, deleteCustomTool, listCustomTools } from './customTools.ts'
-import { initTeams, listTeams, readTeam, saveTeam, deleteTeam, assignMemberIds, TEAMS_DIR, type TeamDef } from './teamsStore.ts'
+import { initTeams, listTeams, readTeam, readTeamMemberRoster, saveTeam, deleteTeam, assignMemberIds, TEAMS_DIR, type TeamDef } from './teamsStore.ts'
 import { listProjects, createProject as createProjectStore, updateProject as updateProjectStore, deleteProject as deleteProjectStore, setProjectStorageRootProvider } from './projectsStore.ts'
 import { migrateRootPathsOnDisk, deleteDirToRecycleBin } from './projectPaths.ts'
 import { listChannels, getChannel, getChannelRedacted, updateChannel, addBot, updateBot, removeBot, modelForChannel, setRemoteToken, invalidateChannelsCache, defaultPermissionOf } from './channelsStore.ts'
@@ -928,7 +1015,9 @@ async function syncGroupName(channel: string, botId: string, peerId: string): Pr
   setPeerLabel(channel, botId, peerId, info.name, 'group', { auto: true })
   console.log(`[channel] 群名已同步：${peerId.slice(0, 8)} →「${info.name}」${info.memberNum ? `（${info.memberNum} 人）` : ''}`)
 }
-import { buildTeamTools, clearBlackboard, abortSubAgents, abortSubAgentByMember, loadBlackboard, memberName, setMemberRunLimitProvider, setMemberInspectorProvider, setInspectorReviewer, isRunActive, installMemberStreamOpHook, type TeamCtx, type ModelOverride } from './teamRuntime.ts'
+import { buildTeamTools, clearBlackboard, abortSubAgents, abortSubAgentByMember, loadBlackboard, memberName, memberViaSessionEnabled, setMemberRunLimitProvider, setMemberInspectorProvider, setInspectorReviewer, isRunActive, installMemberStreamOpHook, type TeamCtx, type ModelOverride } from './teamRuntime.ts'
+/* ★m6-member-model：成员会话模型决策（判定本体独立成模块 ⇒ 可隔离单测；这里只注入真依赖） */
+import { applyResolvedMemberTurnModel, resolveMemberTurnModel, type MemberTurnLlm, type MemberTurnLlmDeps } from './memberTurnModel.ts'
 import { runningSubAgentCount, setSubAgentsIdleHook } from './teamRuntime.ts'
 import { buildCloneTools, cancelClones, isCloneRunActive } from './cloneRuntime.ts'
 import { Type as TbType } from 'typebox'
@@ -1013,7 +1102,11 @@ type MuxFrame =
   | { type: 'stream/subscribed'; sessionId?: string; lastSeq: number }
   /** ★1005 补类型：**会话运行状态帧** —— 后端 8 处广播、前端整套"运行中/收轮(agentEnd)"逻辑都吃它，
    *  却一直不在联合里（于是又成了"用 as any 绕"的一处）。字段按实际广播点取值。 */
-  | { type: 'session/status'; sessionId: string; running: boolean; mainRunning?: boolean; clones?: number; agentEnd?: boolean; aborted?: boolean; stopped?: boolean;
+  | { type: 'session/status'; sessionId: string; running: boolean; sidebarReplying: boolean; mainRunning?: boolean; clones?: number; agentEnd?: boolean; aborted?: boolean; stopped?: boolean;
+      /* ★1129（左栏纪元契约）：`stateRev` 与 `logEpoch` 现在**写进 payload**（不再只活在 WS 信封里）——
+         chat.ts 的 onFrame 会把 WS 信封扔掉、只把 payload 包成 server-request 往下游递，
+         于是 ChatInterface（左栏）根本看不到信封上的 logEpoch。这一处不下发 = 前端只能靠时间差猜进程。 */
+      stateRev?: number; logEpoch?: string;
       loopBreak?: boolean; usage?: unknown; timing?: unknown; model?: string; replyPreview?: string; sessionTitle?: string }
   /** ★1103 s6：**统计帧**（圆环分子 + 四胶囊同源同帧；值变才推）——镜像帧，不占事实序列号 */
   | { type: 'session/stats'; sessionId: string; ts: number; usedTokens: number; maxTokens: number; percent: number; fromUsage: boolean;
@@ -1220,6 +1313,7 @@ interface QueuedMsg {
    *  丢了它 ⇒ `beginTurnMark(session, undefined)` ⇒ `turnSource` 退化成 'user'
    *  ⇒ 自动续跑/通知轮被当成"用户在等" ⇒ 界面挂处理中 + 输入框变停止键（状态对不上的另一半）。 */
   source?: string
+  noticeReason?: NoticeMeta['reason']
 }
 
 interface SessionView {
@@ -1388,6 +1482,8 @@ interface SessionView {
    *  拿 `status` 顶替 `mainRunning` 会造成：主 agent 已说完、成员还在干活时，
    *  刷新走 session.list 看到 running ⇒ 运行行冒出来 + 计时从 0 起；实时走状态帧却不显示（两端不一致）。 */
   mainRunning?: boolean
+  /** In-memory origin of the admitted main turn; not the legacy input-box turnSource. */
+  sidebarTurnSource?: SidebarTurnSource
   /** turn 计时（TTFT/耗时统计） */
   turnStartTime?: number
   firstTokenTime?: number
@@ -1631,6 +1727,9 @@ function broadcastTurnRetry(sessionId: string, s?: any): void {
       type: 'turn_retry',
       sessionId,
       turnId: tid,
+      /* ★1130：重试态可能先于一切帧到达（429 第一跳就失败）—— 建壳也要有稳定位置，
+         否则整帧退化"不排序"（前端会留痕）。 */
+      ord: turnOrdOfOpeningId(sessionId, tid),
       retry: { phase: r.phase, attempt: r.attempt, max: r.max, reason: r.reason, delayMs: r.delayMs, time: r.at },
       expectFinal: false,
     },
@@ -4015,56 +4114,55 @@ export function setMemberStreamOpHook(h: { begin: (sid: string, actor?: string) 
   memberStreamOpHook = h
 }
 
-/** ★d1：**成员用量累计的账本读数**（唯一实现，供两处调用）。
+/** ★member-lifetime：**成员用量读取层**（唯一实现）—— 把会话对象映射成纯聚合的输入行。
  *
- *  两个调用点（与 u1 的 ctx 完全同一个坑，必须两处同源）：
- *   ① `buildTeamCtx` 的 `memberUsageLedgerTotal`（广播帧用）；
- *   ② `blackboard.read`（前端打开成员面板走 RPC 读盘，那条路径**不经过广播**）。
- *  只做一处会出现"面板刚打开是 runs 口径、跑一轮后才变账本口径"的不一致。
+ *  为什么要有这一层（病灶）：原来三个读函数各自 `findMemberSession(父, 成员)`，
+ *  而它只返回**未归档**的那一段 ⇒ 所谓"全历史累计"实际上只是当前段（实测 m4：当前段 280.9M，
+ *  全部段 732.9M，漏 61.7%）。这里一次遍历把**全部段**（含归档）读出来，聚合交给
+ *  `memberUsageAggregate.ts` 的纯函数 —— 口径只有一份，详情/黑板 RPC/实时投影同源。
  *
- *  数据链路：`findMemberSession(父会话, memberId)` →（骨架则先 `sessions.get` 升级）→ 读 `usageTotals`。
- *
- *  **拿不到返回 null**（调用方保留 runs 累计并标 source='runs'，不写 0 冒充）：
- *   ① 成员从未跑过 / 会话已归档或回收 —— `findMemberSession` 找不到；
- *   ② 会话在但 `usageTotals` 不存在（老会话没记过账）。
  *  ⚠️ 骨架会话必须先升级：启动走索引快路径时 `putSkeleton` 放的对象**不含 usageTotals**
- *     （索引条目本身就不存它 —— x1 在 `buildMemberCtxUsage` 里已经踩过同一个坑）。
- *     这里同样用 `sessions.get(dm.id)` 触发 SessionStore 的既有升级契约（:5237-5250）。 */
-function buildMemberUsageLedgerTotal(sessionId: string): (memberId: string) => {
-  promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheWriteTokens: number
-  tokens: number; llmMs: number; runs: number
-} | null {
-  return (memberId: string) => {
-    try {
-      const mid = String(memberId || '')
-      if (!mid) return null
-      let dm: any = findMemberSession(sessionId, mid)   // 只找不建
-      if (!dm) return null
+ *     （索引条目本身不存它）。这里用 `sessions.get(dm.id)` 触发 SessionStore 的既有升级契约。
+ *     **重启后第一次读到的是骨架也照样升级**（任务单点名的"重启骨架"场景）。
+ *
+ *  只读：不建会话、不改账本、不做任何迁移。 */
+function readMemberSegmentRows(sessionId: string, memberId?: string): MemberUsageSegmentRow[] {
+  const out: MemberUsageSegmentRow[] = []
+  const only = String(memberId || '')
+  if (!sessionId) return out
+  try {
+    for (const s of sessions.values()) {
+      const anyS: any = s
+      if (String(anyS?.parentSessionId || '') !== sessionId) continue
+      const mid = String(anyS?.memberId || '')
+      if (!mid) continue
+      if (only && mid !== only) continue
+      let dm: any = anyS
       if (dm._skeleton === true) {
         try {
           const up: any = sessions.get(String(dm.id))
           if (up && up._skeleton !== true) dm = up
-        } catch { /* 升级失败就用原骨架（下面会因拿不到 usageTotals 返回 null，如实回退） */ }
+        } catch { /* 升级失败就用原骨架：下面 hasLedger=false 会如实反映"读不到" */ }
       }
-      const ut: any = dm.usageTotals
-      if (!ut || typeof ut !== 'object') return null
-      const n = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : 0 }
-      const uncached = n(ut.uncached), cacheRead = n(ut.cacheRead), cacheWrite = n(ut.cacheWrite), output = n(ut.output)
-      return {
-        promptTokens: uncached,
-        completionTokens: output,
-        cacheReadTokens: cacheRead,
-        cacheWriteTokens: cacheWrite,
-        tokens: uncached + cacheRead + cacheWrite + output,
-        llmMs: n(ut.llmMs),
-        runs: n(ut.turns),
-      }
-    } catch (e) {
-      try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员账本累计失败（${String((e as Error)?.message || e)}）⇒ 该成员回退 runs 口径`) } catch { /* ignore */ }
-      return null
+      /* ★member-lifetime：字段映射只有 `sessionToSegmentRow` 一份（纯函数，已单测） */
+      const row = sessionToSegmentRow(dm, sessionId)
+      if (row) out.push(row)
     }
+  } catch (e) {
+    try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员分段失败（${String((e as Error)?.message || e)}）`) } catch { /* ignore */ }
   }
+  return out
 }
+
+/** ★member-lifetime：**该父会话下每个成员的全历史用量**（唯一入口，一次遍历）。
+ *
+ *  键 = 真实存在成员会话的 memberId ⇒ **包含"只私聊过、没有 bb.runs 记录"的成员**
+ *  （原来 `memberTotals` 的键只来自 runs/retired，这种成员连一行都不出现，账本再多也看不见）。
+ *  值 = 纯聚合结果（全历史累计 + 命中率 + 完整度状态），见 `memberUsageAggregate.ts` 头注释。 */
+function collectMemberUsage(sessionId: string): Map<string, MemberUsageTotalsView> {
+  return collectMemberUsageViews(readMemberSegmentRows(sessionId), sessionId)
+}
+
 
 /** ★f1：**成员用量按段读** —— "当前段"与"全部段"（详情弹窗用）。
  *
@@ -4090,6 +4188,11 @@ interface MemberSegmentUsage {
   /** 这一段有没有**可信读数**：true=账本在（含真 0）/ false=有对话但账本没写（数字不可信，前端显示「—」）。
    *  ⚠️ 与"是不是 0"是两件事：新段没跑过 = hasUsage:true 且 tokens:0。 */
   hasUsage: boolean
+  /** ★member-lifetime：把 hasUsage 拆成两个事实（前端可继续只读 hasUsage，排障能分清）：
+   *  `hasLedger` = usageTotals 在；`hasAssistant` = 有 assistant 消息。 */
+  hasLedger: boolean
+  hasAssistant: boolean
+  updatedAt: number
   /** 该段自己的账本合计（含私聊；与 MemberTokenTotal 同口径） */
   promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheWriteTokens: number
   tokens: number; llmMs: number; runs: number
@@ -4097,43 +4200,23 @@ interface MemberSegmentUsage {
 function readMemberSegmentUsages(sessionId: string, memberId: string): MemberSegmentUsage[] {
   const mid = String(memberId || '')
   if (!sessionId || !mid) return []
-  const out: MemberSegmentUsage[] = []
-  try {
-    for (const s of sessions.values()) {
-      const anyS: any = s
-      if (String(anyS?.parentSessionId || '') !== sessionId) continue
-      if (String(anyS?.memberId || '') !== mid) continue
-      let dm: any = anyS
-      if (dm._skeleton === true) {
-        try {
-          const up: any = sessions.get(String(dm.id))
-          if (up && up._skeleton !== true) dm = up
-        } catch { /* 升级失败就用原骨架（下面会因拿不到 usageTotals 算 0，如实反映） */ }
-      }
-      const ut: any = dm.usageTotals
-      const n = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : 0 }
-      const uncached = n(ut?.uncached), cacheRead = n(ut?.cacheRead), cacheWrite = n(ut?.cacheWrite), output = n(ut?.output)
-      out.push({
-        sessionId: String(dm.id),
-        seq: Number(dm.memberSessionSeq) > 0 ? Number(dm.memberSessionSeq) : 0,
-        archived: dm.archived === true,
-        /* hasUsage：这一段**有没有可信读数** —— 账本条目在就算有（哪怕是 0）；
-           完全没有账本条目时，用"有没有 assistant 消息"区分「真的 0」和「账本没写」（同 readMemberCurrentSegmentTotal 的口径）。 */
-        hasUsage: !!ut && typeof ut === 'object'
-          ? true
-          : !(Array.isArray(dm.messages) && dm.messages.some((m: any) => String(m?.role || '') === 'assistant')),
-        promptTokens: uncached,
-        completionTokens: output,
-        cacheReadTokens: cacheRead,
-        cacheWriteTokens: cacheWrite,
-        tokens: uncached + cacheRead + cacheWrite + output,
-        llmMs: n(ut?.llmMs),
-        runs: n(ut?.turns),
-      })
-    }
-  } catch (e) {
-    try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员分段用量失败（${String((e as Error)?.message || e)}）`) } catch { /* ignore */ }
-  }
+  /* ★member-lifetime：只做"行 → 段视图"的映射（读取逻辑已在 readMemberSegmentRows 一处）。 */
+  const out: MemberSegmentUsage[] = readMemberSegmentRows(sessionId, mid).map((r) => ({
+    sessionId: r.sessionId,
+    seq: r.seq,
+    archived: r.archived,
+    hasUsage: r.hasLedger ? true : !(r.hasAssistant || r.skeleton === true),
+    hasLedger: r.hasLedger,
+    hasAssistant: r.hasAssistant,
+    updatedAt: r.updatedAt || 0,
+    promptTokens: r.uncached,
+    completionTokens: r.output,
+    cacheReadTokens: r.cacheRead,
+    cacheWriteTokens: r.cacheWrite,
+    tokens: r.uncached + r.cacheRead + r.cacheWrite + r.output,
+    llmMs: r.llmMs,
+    runs: r.turns,
+  }))
   /* 段号升序（seq 为 0 的排在最后：那是"没有段号"的老数据，不该冒充第 0 段跑到最前面） */
   out.sort((a, b) => {
     const sa = a.seq > 0 ? a.seq : Number.MAX_SAFE_INTEGER
@@ -4154,36 +4237,34 @@ function readMemberCurrentSegmentTotal(sessionId: string, memberId: string): {
   segTokens: number; segSeq: number
   promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheWriteTokens: number
   llmMs: number; runs: number
+  /** ★member-lifetime：存在 >1 个未归档段（数据异常）⇒ 当前段按 seq 最大取，并把异常报出来 */
+  ambiguous: boolean
 } | null {
   const mid = String(memberId || '')
   if (!sessionId || !mid) return null
   try {
-    let dm: any = findMemberSession(sessionId, mid)
-    if (!dm) return null
-    if (dm._skeleton === true) {
-      try {
-        const up: any = sessions.get(String(dm.id))
-        if (up && up._skeleton !== true) dm = up
-      } catch { /* 用原骨架 */ }
+    /* ★member-lifetime：与全历史聚合**同一次读取**（readMemberSegmentRows），
+       当前段用 `pickCurrentRow`（seq 最大）——不再靠 `findMemberSession` 的 Map 迭代顺序。
+       ⚠️ 这个函数的语义**不变**：只回答"当前未归档段用了多少"，不换口径（团队运行预算/runs 仍用它）。 */
+    const rows = readMemberSegmentRows(sessionId, mid)
+    const cur = pickCurrentRow(rows)
+    if (!cur) return null
+    const activeCount = rows.filter((r) => !r.archived).length
+    if (!cur.hasLedger) {
+      /* 有对话却没账本 / 重启骨架（正文还没升级）⇒ 不可信（null）；一次都没跑过的新段 ⇒ 真 0 */
+      if (cur.hasAssistant || cur.skeleton === true) return null
+      return { segTokens: 0, segSeq: cur.seq, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmMs: 0, runs: 0, ambiguous: activeCount > 1 }
     }
-    const ut: any = dm.usageTotals
-    const segSeq = Number(dm.memberSessionSeq) > 0 ? Number(dm.memberSessionSeq) : 0
-    if (!ut || typeof ut !== 'object') {
-      const hasAssistant = Array.isArray(dm.messages) && dm.messages.some((m: any) => String(m?.role || '') === 'assistant')
-      if (hasAssistant) return null   // 有对话却没账本 ⇒ 数字不可信（如实缺失）
-      return { segTokens: 0, segSeq, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmMs: 0, runs: 0 }
-    }
-    const n = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : 0 }
-    const uncached = n(ut.uncached), cacheRead = n(ut.cacheRead), cacheWrite = n(ut.cacheWrite), output = n(ut.output)
     return {
-      segTokens: uncached + cacheRead + cacheWrite + output,
-      segSeq,
-      promptTokens: uncached,
-      completionTokens: output,
-      cacheReadTokens: cacheRead,
-      cacheWriteTokens: cacheWrite,
-      llmMs: n(ut.llmMs),
-      runs: n(ut.turns),
+      segTokens: cur.uncached + cur.cacheRead + cur.cacheWrite + cur.output,
+      segSeq: cur.seq,
+      promptTokens: cur.uncached,
+      completionTokens: cur.output,
+      cacheReadTokens: cur.cacheRead,
+      cacheWriteTokens: cur.cacheWrite,
+      llmMs: cur.llmMs,
+      runs: cur.turns,
+      ambiguous: activeCount > 1,
     }
   } catch (e) {
     try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员当前段用量失败（${String((e as Error)?.message || e)}）`) } catch { /* ignore */ }
@@ -5889,7 +5970,16 @@ const memberEntrySeen = new Set<string>()
  *  以前前端拿"主 agent 在跑 + 成员未读"去猜"排队汇报"，那是用显示态当数据判据。
  *  ★f4：`kind?` 字段已删（它唯一的用户是「成员私聊通知」，已随需求回退；
  *  剩下三类都是事件型通知，不需要按类型去重 —— 见 injectSessionNotice 的注释）。 */
+type NoticeMeta = NonNullable<Parameters<NonNullable<TeamCtx['notifyDone']>>[1]>
 type BgNotice = { text: string; memberIds?: string[] }
+type SidebarTurnSource = 'user' | 'notice' | NonNullable<NoticeMeta['reason']>
+type TeamReturn = { batchId: string; text: string; memberIds: string[]; attempt?: TeamReturnAttempt }
+type TeamReturnAttempt = { batch: TeamReturn; message?: AgentMessage }
+const teamReturnInboxes = new WeakMap<SessionView, { pending: Map<string, TeamReturn>; accepted: Set<string>; stopped: boolean }>()
+const teamReturnPrompts = new WeakMap<Record<string, unknown>, TeamReturnAttempt>()
+/* Runtime only: admission is bound to the exact agent; delivered inputs to the exact message. */
+const nativeSidebarStarts = new WeakMap<Agent, { source: SidebarTurnSource }>()
+const sidebarInputs = new WeakMap<AgentMessage, 'user'>()
 const pendingBgNotices = new Map<string, BgNotice[]>()
 
 /* ══ ★ 0930（用户两条要求）：后台回访「LLM 裁决」+ 续跑到限「收尾汇报」══════════════
@@ -6158,7 +6248,8 @@ function drainBgNotices(sessionId: string, agent: unknown): void {
       const _now = Date.now()
       const _inject: any = { merge: true, at: _now, kind: 'bg_notice' }
       if (_ids.length) _inject.memberIds = _ids
-      ;(agent as any)?.steer?.({ role: 'user', content: [{ type: 'text', text: `【后台任务通知】${_text}\n（要看完整输出用 bg_read，看全部任务用 bg_list）` }], timestamp: _now, _inject })
+      const message = { role: 'user' as const, content: [{ type: 'text' as const, text: `【后台任务通知】${_text}\n（要看完整输出用 bg_read，看全部任务用 bg_list）` }], timestamp: _now, _inject }
+      ;(agent as any)?.steer?.(message)
     }
     setMembersQueued(sessionId, q.flatMap((n: any) => (Array.isArray(n?.memberIds) ? n.memberIds : [])), false)
     sessionLog(sessionId, 'info', 'lifecycle', `补送 ${q.length} 条后台任务通知给 AI`)
@@ -7145,6 +7236,11 @@ function purgeSessionState(sessionId: string): void {
   try { agentForSession(sid)?.abort() } catch { /* 该会话可能根本没有 agent */ }
   /* ★mg2：会话没了，草稿也没意义（含上一轮被强杀留下的） */
   try { clearPendingTurn(sid, s) } catch { /* ignore */ }
+    const activityKey = memberActivityKey(s)
+  if (activityKey) {
+    for (const item of s.queuedMessages || []) memberActivityBridge.discardQueue(item)
+    memberActivity.retire(activityKey)
+  }
   sessions.delete(sid)
   agents.delete(sid)
   turnAccumulators.delete(sid)
@@ -8990,6 +9086,35 @@ function resolveTeamMemberModel(member: { modelMode?: string; modelId?: string }
   return null
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * ★m6-member-model：**成员会话的模型只有一个决策点**（老板第 6 项）。
+ *
+ * 病（本轮只读取证 team-member-model-effect 的结论）：
+ *  成员卡片改模型只写 `team.json`；而"实际请求发到哪家模型"由两处**旧事实**决定：
+ *   ① 派发路径把**建 agent 时**抓的 `ctx.team` 快照解析成 `p.model`（teamRuntime.ts:3036-3045）
+ *      ⇒ 排队项 / 下一轮可能拿着一份旧配置派活；
+ *   ② 成员窗口私聊（`session.memberSay` → 转 `session.prompt`，不带模型）
+ *      ⇒ 用成员段上**残留的** `llmOverride`（上一次独立模型写的）或建段时的全局模型（`createSession:8587`）。
+ *  ⇒ 症状："改了模型要等下一个任务/新窗口"；切回「跟随会话」还在跑旧独立模型。
+ *
+ * 判定本体在 `memberTurnModel.ts`（独立模块 ⇒ 可隔离单测），这里只做**真依赖注入**：
+ * 会话表 / 团队配置 / 两个既有解析器 / 落盘，全部是 server 里现成的那一份，不另造实现。
+ * 触发点 = `runPromptCore` 的"这一轮真正取得执行权"那一刻（队列/忙闸门之后）。
+ * ══════════════════════════════════════════════════════════════════════════════ */
+const MEMBER_TURN_MODEL_DEPS: MemberTurnLlmDeps = {
+  isMemberSession: (s) => memberStore.isMemberSession(s),
+  getSession: (id) => sessions.get(id) || null,
+  readTeam: (id) => readTeam(id),
+  resolveMemberModel: (m) => resolveTeamMemberModel(m),
+  resolveSessionLlm: (id) => resolveSessionLlm(id),
+  memberName: (t, id) => memberName(t, id),
+}
+/** 只读解析（不写会话、不落盘、不碰全局）：给"发送前预估"和"真正落库"共用同一份决策。
+ *  解析失败会抛（模型不可用/配置不完整/父会话没有模型）⇒ 这一轮根本不该发出。 */
+function memberTurnPlanFor(s: any): MemberTurnLlm | null {
+  return resolveMemberTurnModel(s, MEMBER_TURN_MODEL_DEPS)
+}
+
 /** 0908三：解析会话 model 的归属供应商。显式记录优先；存量会话（字段上线前创建）按 model id
  *  在供应商表反查——当前激活供应商优先（同名模型多处存在时取用户最可能在用的）。查不到返回 ''。 */
 function resolveModelProviderId(modelId: string, explicit?: string): string {
@@ -9005,6 +9130,7 @@ function resolveModelProviderId(modelId: string, explicit?: string): string {
 /** 团队运行时上下文工厂（0904 单聊抽取）：getOrCreateAgent 挂派发工具与 session.memberPrompt 单聊共用同一构造，
  *  避免两处 ctx 漂移。session 实时查（成员 workDir/permissionMode 等运行期可被 configure 改）。 */
 function buildTeamCtx(sessionId: string, teamDef: TeamDef): TeamCtx {
+  const activityRoster = readTeamMemberRoster(teamDef.id)
   // use_skill（与主 agent 内联版同实现；成员工具池需要）
   const skillParams = TbType.Object({
     name: TbType.String({ description: '技能名称（见系统提示词中的可用技能清单）' }),
@@ -9069,9 +9195,8 @@ function buildTeamCtx(sessionId: string, teamDef: TeamDef): TeamCtx {
          （实测 3 个成员，运行中只出现 1 个，另外两个要等停止收尾才冒出来）。 */
       pushRunSnapshotFrame(sessionId, toolCallId, runs)
     },
-    /* ★1036-S36（**团队派活异步化**的配套）：成员跑完后，结果要能回到主对话。
-       走与分身同一条注入通路（`injectSessionNotice`）—— 同一件事只有一条实现。 */
-    notifyDone: (text: string, meta?: { memberIds?: string[] }) => injectSessionNotice(sessionId, text, meta),
+    /* 团队汇总携带批次身份；普通通知仍走原通路。 */
+    notifyDone: (text, meta) => injectSessionNotice(sessionId, text, meta),
     /* ★1036-S37：`sub_read` 的全量数据源（会话内嵌的 subRuns，按 callId 展开）。
        不再让它读黑板的 60 条窗口 —— 那是"存档滚动上限"，不是"能派多少"的上限。 */
     listAllRuns: () => {
@@ -9125,7 +9250,14 @@ function buildTeamCtx(sessionId: string, teamDef: TeamDef): TeamCtx {
         return null
       }
     },
-    runPromptCore: async (sid: string, p: Record<string, unknown>) => {
+    laneActivity: (memberId, runId, queued) => {
+      if (!memberViaSessionEnabled() || /^clone\d+$/i.test(memberId)) return
+      const rosterId = activityRoster?.get(memberId)
+      if (queued) memberActivity.enqueueDispatch(sessionId, memberId, `l5run-${runId}`, rosterId)
+      else memberActivity.discardDispatch(sessionId, memberId, `l5run-${runId}`)
+    },
+    runPromptCore: async (sid: string, p: Record<string, unknown>, activityTurnId) => {
+      setMemberPromptInput(sid, p, { turnId: activityTurnId, kind: 'dispatch' })
       /* ★L5：这条 user 消息的**持久 id** 用调用方给的 `clientMessageId`（= 派发的 runId）。
          两个作用：① 提取产出的精确定位锚点（能区分"本轮新增"与"用户同时在私聊说过的话"）；
          ② 不推的话落盘会回退随机 id，并打一条「[rpcid] 没有待认领的 rpcId」警告 ——
@@ -9258,10 +9390,13 @@ function buildTeamCtx(sessionId: string, teamDef: TeamDef): TeamCtx {
         return null
       }
     },
-    /* ★d1（需求：成员用量累计以成员会话账本为准，含私聊）。
-       与上面 `memberUsageLedger` 读同一个账本，差别是用途：那个给单 run 算差值，这个取累计绝对值。
-       唯一实现在 `buildMemberUsageLedgerTotal`（`blackboard.read` 也用同一份 —— 面板首帧不能是 runs 口径）。 */
-    memberUsageLedgerTotal: buildMemberUsageLedgerTotal(sessionId),
+    /* ★member-lifetime（全历史口径）：**该父会话下每个成员的全历史累计**（当前段 + 归档段 + 其中私聊）。
+       与旧 `memberUsageLedgerTotal` 的区别只有一处、但正是病根：旧实现 `findMemberSession` 只取
+       **未归档**段 ⇒ 归档段全部丢失（实测 m4 漏 61.7%）。现在一次遍历全部段、按纯聚合相加。
+       键 = 真实存在成员会话的 memberId ⇒ 只有私聊、没有 bb.runs 记录的成员也会出现。
+       返回 Map 而不是单成员闭包：`mergeMemberUsageLedger` 一帧只要算一次，不再 N 次遍历会话。
+       拿不到（该父会话没有任何成员会话）⇒ 空 Map ⇒ 调用方保留 runs 残值并标 source='runs'。 */
+    memberUsageHistory: () => collectMemberUsage(sessionId),
     /* ★f1（需求）：**当前段的用量**（卡片显示用，新开对话天然从 0 起）。
        与上面全历史累计同源（同一份成员会话账本），只是取"未归档那一段"。
        拿不到就返回 null ⇒ 调用方不写 segTokens/segSeq ⇒ 前端显示「—」。 */
@@ -9651,10 +9786,17 @@ function stopStatusHeartbeat(sessionId: string): void {
   if (t) { clearInterval(t); statusHeartbeatTimers.delete(sid) }
 }
 
-function statusFrame(sessionId: string, opts: { mainRunning: boolean } & Record<string, unknown>): Record<string, unknown> {
+function sidebarReplyingOf(s: SessionView | undefined): boolean {
+  /* ★1131：只认"主 agent 自己在跑"。以前还要求 `sidebarTurnSource === 'user' | 'team-summary'`，
+     结果自动续跑/后台回归那一轮（notice 源）真在跑时左栏一片安静（老板 11-19 实测）。
+     口径与前端 `sessionState.isAgentRunning` **完全一致**：一个事实一个判据。 */
+  return s?.mainRunning === true
+}
+
+function statusFrame(sessionId: string, opts: { mainRunning: boolean } & Record<string, unknown>): Extract<MuxFrame, { type: 'session/status' }> & Record<string, unknown> {
   const split = splitRunningSubAgents(sessionId)
   const { mainRunning, ...rest } = opts
-  const s: any = sessions.get(sessionId)
+  const s = sessions.get(sessionId)
   return {
     type: 'session/status',
     sessionId,
@@ -9662,7 +9804,8 @@ function statusFrame(sessionId: string, opts: { mainRunning: boolean } & Record<
     clones: split.clones,
     members: split.members,
     running: mainRunning || split.clones > 0 || split.members > 0,
-    stateRev: bumpStateRev(sessionId),
+        stateRev: bumpStateRev(sessionId),
+    ...(s ? { memberActivity: readMemberActivity(s) } : {}),
     /* ★P119：本轮来源（user / notice）—— 前端用它把"通知唤醒的轮"从"用户正在等"里排除 */
     turnSource: String((sessions.get(sessionId) as any)?.turnSource || 'user'),
     /* ★1126（设计定案·甲）：**未读数随状态帧一起下发** —— 未读从"一条独立帧"变成"会话状态的一部分"。
@@ -9674,11 +9817,16 @@ function statusFrame(sessionId: string, opts: { mainRunning: boolean } & Record<
          · 正文已在内存（刚跑完的会话必然如此）⇒ `unreadCountOf()` **现算**，比摘要更新；
          · 骨架（正文没加载）⇒ 用索引带进来的 `_summary.unread`（它在最后一次落盘时算好，零成本）。
        ⚠️ 绝不在骨架上调 `unreadCountOf()` —— 那会经访问器触发同步读盘，而本函数每轮要发十几次。 */
-    unread: s ? (hasBody(s) ? unreadCountOf(s) : (Number(s._summary?.unread) || 0)) : 0,
+    unread: s ? (hasBody(s) ? unreadCountOf(s) : (Number((s as any)._summary?.unread) || 0)) : 0,
     /* ★1126d：**成员异常告警数**（老板需求：成员失败/中断时聊天列表也要红）。
        与 `members` 同族都在这里算 —— 前端只认字段，不自己拼 memberStates。 */
     memberAlert: memberAlertOf(s),
     ...rest,
+    /* ★1129（左栏纪元契约）：**这条帧是哪个后端进程产生的** —— 与信封上的 logEpoch 是同一个
+       LOG_EPOCH，但前端拿不到信封（chat.ts onFrame 只把 payload 往下游递），所以必须在 payload 里给。
+       `stateRev`（上面 bumpStateRev）只在**同 logEpoch 内**单调，跨进程不可比 ⇒ 两者必须成对出现。 */
+    logEpoch: LOG_EPOCH,
+    sidebarReplying: sidebarReplyingOf(s),
   }
 }
 
@@ -9702,7 +9850,7 @@ async function waitSessionAgentIdle(sessionId: string, maxMs = 10 * 60 * 1000): 
   return !sessionAgentBusy(sessionId)
 }
 /** 忙时把这条用户消息放进既有队列（不裸抛、不丢）。返回错误文案（队列满等）或 null */
-function enqueueBusyPrompt(sessionId: string, p: Record<string, unknown>, message: string, opts?: { notice?: string; log?: string; guard?: string; id?: string }): string | null {
+function enqueueBusyPrompt(sessionId: string, p: Record<string, unknown>, message: string, opts?: { notice?: string; log?: string; guard?: string; id?: string; noticeReason?: NoticeMeta['reason'] }): string | null {
   const itemId = opts?.id || String((p as any)?.clientMessageId || crypto.randomUUID())
   /* ★1130：**入队这一刻把注入身份摘下存进队列项**（不能留给 `message_start` 去内存队列里碰运气）。
      调用方的顺序是确定的（先 `pushInjectMeta` 再 `runPromptCore`），所以这里 take 到的就是这条消息的；
@@ -9719,7 +9867,8 @@ function enqueueBusyPrompt(sessionId: string, p: Record<string, unknown>, messag
     createdAt: Date.now(),
     ...(injectMeta ? { inject: injectMeta } : {}),
     ...(typeof (p as any)?.source === 'string' && (p as any).source ? { source: String((p as any).source) } : {}),
-  })
+    ...(opts?.noticeReason ? { noticeReason: opts.noticeReason } : {}),
+  }, memberPromptInputs.get(p))
   if (err) return err
   const n = queueSnapshot(sessionId).length
   sessionLog(sessionId, 'info', 'lifecycle', opts?.log || `忙时发送 → 已入队（队列 ${n} 条，本轮结束自动发出）`, { guard: opts?.guard || 'busy-enqueue' })
@@ -9781,10 +9930,10 @@ function turnLevelFailure(sessionId: string): { turnFailed: true; error: string 
 
 /** ★0927 P0-1 兜底：忙检查之后、prompt 调用之前仍有窄竞态（同刻两条都过了检查）。
  *  命中 pi 的"运行中重复 prompt"裸错 → 按忙时策略入队（消息不丢）。返回入队项 id（失败返回 null）。 */
-function rescueBusyPromptToQueue(sessionId: string, p: Record<string, unknown>, message: string, e: any): string | null {
+function rescueBusyPromptToQueue(sessionId: string, p: Record<string, unknown>, message: string, e: any, noticeReason?: NoticeMeta['reason']): string | null {
   if (!isAgentBusyError(e) || (p as any).__fromQueue === true) return null
   const itemId = String((p as any)?.clientMessageId || crypto.randomUUID())
-  const qErr = enqueueBusyPrompt(sessionId, p, message, { id: itemId })
+  const qErr = enqueueBusyPrompt(sessionId, p, message, { id: itemId, noticeReason })
   if (qErr) return null
   scheduleQueueFlushRetry(sessionId)
   return itemId
@@ -9800,7 +9949,7 @@ function scheduleQueueFlushRetry(sessionId: string, tries = 8): void {
   }, 600)
 }
 /** 入队（校验/上限/持久化/广播统一入口）。返回错误文案或 null */
-function queuePush(sessionId: string, item: QueuedMsg): string | null {
+function queuePush(sessionId: string, item: QueuedMsg, input?: MemberInput): string | null {
   const s = sessions.get(sessionId)
   if (!s) return '会话不存在'
   if (!item.text.trim()) return '消息为空'
@@ -9810,7 +9959,9 @@ function queuePush(sessionId: string, item: QueuedMsg): string | null {
      它们确实要排队续发，但不该出现在用户可见的"排队消息"里（用户会误以为是自己排的）。
      只打标记、不改长度与顺序 ⇒ flush / 撤回编辑 / 全部撤回等逻辑都不受影响。 */
   const _injected = isInjectedUserMsg({ role: 'user', content: [{ type: 'text', text: item.text }] })
-  s.queuedMessages.push(_injected ? { ...item, injected: true } : item)
+  const stored = _injected ? { ...item, injected: true } : item
+  s.queuedMessages.push(stored)
+  memberActivityBridge.admitQueue(stored, input)
   schedulePersist()
   broadcastQueue(sessionId)
   return null
@@ -9860,7 +10011,7 @@ function flushNextQueued(sessionId: string): void {
   /* ★1020 诊断打点（实测"队列消息发出去了但既没落盘也没留队列"——缺证据无法定性）：
      flush 取出到 runPromptCore 之间原来是**日志盲区**，加一行，下次复现就能看到它到底走到哪一步。 */
   sessionLog(sessionId, 'info', 'lifecycle', `队列续发开始：id=${String(item.id).slice(0, 12)}「${String(item.text || '').slice(0, 24)}」`)
-  runPromptCore(sessionId, {
+  const prompt = {
     message: item.text, attachments: item.attachments, skills: item.skills,
     model: item.model, effort: item.effort, __fromQueue: true,
     /* ★1130：把入队时摘下的**注入身份 / 轮来源**原样交还给真正发送的这一跳。
@@ -9868,10 +10019,20 @@ function flushNextQueued(sessionId: string): void {
        （界面以为用户在等）。见 `QueuedMsg.inject` 的注释。 */
     ...(item.inject ? { __inject: item.inject } : {}),
     ...(item.source ? { source: item.source } : {}),
-  }).catch((e: any) => {
+  }
+  const activityInput = memberActivityBridge.queuedInput(item)
+  if (activityInput) memberPromptInputs.set(prompt, activityInput)
+  else {
+    setMemberPromptInput(sessionId, prompt, { turnId: String(item.id), kind: 'unknown' })
+    memberActivityBridge.admitQueue(item, memberPromptInputs.get(prompt))
+  }
+  runPromptCore(sessionId, prompt, item.noticeReason).then(() => { memberActivityBridge.discardQueue(item) }).catch((e: any) => {
     // 同步闸门拒绝（vision/模型切换）=消息根本没发出 → 放回队首不丢；后续 flush 触发点自然重试
     const cur = sessions.get(sessionId)
-    if (cur?.queuedMessages && !cur.queuedMessages.includes(item)) cur.queuedMessages.unshift(item)
+    if (cur?.queuedMessages && !cur.queuedMessages.includes(item)) {
+      cur.queuedMessages.unshift(item)
+      memberActivityBridge.admitQueue(item, memberActivityBridge.queuedInput(item))
+    } else if (!cur?.queuedMessages) memberActivityBridge.discardQueue(item)
     schedulePersist()
     broadcastQueue(sessionId)
     /* ★0927：被拒原因是"上一轮还在生成"→ 消息根本没发出去，**不要**立刻再 flush（会形成
@@ -9895,7 +10056,10 @@ function flushNextQueued(sessionId: string): void {
     // 链式续发：本条自然结束后接着发下一条。agent_end 的 waitForIdle 回调与本 finally 存在竞态
     // （守卫可能先被 agent_end 路径触发又被本路径删除挡掉）——显式再调一次保证链不断。
     // 忙错退避时跳过（已安排 scheduleQueueFlushRetry，避免空转）。
-    if (!skipChainFlush) flushNextQueued(sessionId)
+    if (!skipChainFlush) {
+      flushNextQueued(sessionId)
+      wakeTeamReturn(sessionId)
+    }
   })
 }
 
@@ -10013,6 +10177,7 @@ function injectMergesIntoPrev(m: any, session: any, prevTs = 0): boolean {
  *  （所以 label='' 是"这一类注入不显示段首标签"的正式表达，不是缺数据）。
  *  非 inject 段（steer / task / 真用户消息）仍返回空串，行为不变。 */
 function injectLabelOf(m: any): string {
+  if (teamReturnIdentity(m)) return INJECT_MARKERS.find(x => x.kind === 'team_return')!.label
   const raw = stripInjectedLines(injectedUserText(m))
   const byPrefix = INJECT_MARKERS.find((x) => raw.startsWith(x.prefix))
   if (byPrefix) return byPrefix.label
@@ -10601,7 +10766,7 @@ function getOrCreateAgent(sessionId: string): Agent {
       })
       agent.subscribe((event) => {
         if (agents.get(sessionId) !== agent) return
-        handleAgentEvent(sessionId, event)
+        handleAgentEvent(sessionId, event, agent)
       })
       if (session?.transcript?.length) {
         try { agent.state.messages = JSON.parse(JSON.stringify(session.transcript)) } catch { /* ignore */ }
@@ -10715,7 +10880,11 @@ function getOrCreateAgent(sessionId: string): Agent {
     /* ★ g3：验收命令 —— **常驻**（不进懒包）：验收随时要跑，藏进懒包等于每次先 load_tools 再用。
        ⚠️ 它的审批与 run_command 同级（assessRisk 的 check_run 分支 + approvalGate 的杀伤命令硬拦截）。 */
     withPlanAutoTick(buildCheckRunTool(session?.workDir?.trim() || process.cwd(), sessionId), sessionId),
-    ...buildScheduleTools(),
+    /* ★1118：传当前会话 id + 任务产出读取器 ——
+       ① convId 让定时任务工具支持 target="this"（绑到本对话 / 开值守）；
+       ② readTaskResult 让值守任务能读执行层任务今天的产出（schedule 的 result 动作）。
+       原来无参 ⇒ 工具层既拿不到会话身份、也读不到别的任务产出 ⇒ AI 只能绕过工具去打 HTTP RPC。 */
+    ...buildScheduleTools(sessionId, readTaskResult),
     ...buildRepoTools(session?.workDir?.trim() || process.cwd()),
   ]
   const allTools = [...tools, ...extraTools, ...memoryTools, ...notebookTools, ...buildWebTools(), skillTool, askTool, planTool, settingsTool, ...cloneTools, projectNoteTool]
@@ -10947,7 +11116,7 @@ function getOrCreateAgent(sessionId: string): Agent {
       // 旧 agent（被 session.cancel 停止/删除、或新 prompt 重建）的事件一律丢弃：
       // abort 后的 handleRunFailure/tool 结果不再广播，避免"停止后仍继续回复/内容串到下一轮"
       if (agents.get(sessionId) !== agent) return
-      handleAgentEvent(sessionId, event)
+      handleAgentEvent(sessionId, event, agent)
     })
     // 恢复持久化的对话上下文（重启后 agent 重建，transcript 回填保证多轮连续）
     if (session?.transcript?.length) {
@@ -12402,7 +12571,82 @@ function buildAskUserTool(sessionId: string): AgentTool<any> {
    · 只做内存、不落盘：本步的范围是"顺序权威"，持久化仍走既有 transcript 路径（S5 再统一）。
    · 不做静默兜底：seq 分配失败会打日志（客户端随后走 resync → 快照）。 */
 const SESSION_LOG_CAP = 2000
+/* ★1129（左栏纪元契约 · 进程身份的唯一源）：`LOG_EPOCH` 就是**本进程的身份**，不是"日志编号"。
+   它在本模块加载时生成一次（= 进程启动那一刻），此后**全进程不变** ⇒ 同进程重连/刷新仍是同一个身份，
+   真重启必然换一个。所以"这份数据是哪个后端产生的"这件事，后端只有这一个答案，各处都复用它：
+     · WS 信封每帧 `logEpoch`（wsMap.ts:73）、hello-ack、subscribe 回执（wsHub.ts:438/490）
+     · `session/status` 帧 payload、`session.state`、`session.list`、`/api/ping`（本次接上）
+   ⚠️ 不许再引入第二个"进程 id"（bootId / procId / bootAt 时间差推算都算）——
+      两个身份必然漂移，前端就会拿着 A 的身份去比 B 的游标。前端原来用 `/api/ping` 的 `t - up*1000`
+      推 bootAt，那是**时间差猜出来的**身份（秒级取整 + 系统校时可跳），现在有 `ping.logEpoch` 用它。
+   强度说明（诚实标注、不夸大）：`slice(0, 8)` = 32 位随机，同一客户端两次重启撞上同一值的概率
+   ≈ 1/4.29e9（与 1035 起"跨重启 seq 不可比"那条判据用的是**同一个**强度，本次没有加强也没有减弱；
+   `stateRev` 只在**同 logEpoch 内**才可比，因此两者的可信度必须一致）。 */
 const LOG_EPOCH = crypto.randomUUID().slice(0, 8)
+const memberActivity = createMemberActivity({ logEpoch: LOG_EPOCH, currentStateRev, publish: publishMemberActivity })
+function publishMemberActivity(parentId: string) {
+  try {
+    const parent = sessions.get(parentId)
+    if (parent) broadcastMux(parentId, statusFrame(parentId, { mainRunning: parent.mainRunning === true }))
+  } catch (e) { console.warn('[member-activity] publish failed:', e) }
+}
+const memberActivityBridge = createMemberActivityBridge(memberActivity)
+const memberPromptInputs = new WeakMap<object, MemberInput>()
+
+function memberActivityKey(child: SessionView | undefined) {
+  const parentSessionId = child?.parentSessionId
+  const memberId = child?.memberId
+  if (!child || !parentSessionId || !memberId || /^clone\d+$/i.test(memberId) || !memberStore.isMemberSession(child)) return undefined
+  const parent = sessions.get(parentSessionId)
+  if (!parent) return undefined
+  return { parentSessionId, memberId, childSessionId: child.id,
+    [MEMBER_ROSTER_ID]: parent.teamId && child.teamId === parent.teamId ? readTeamMemberRoster(parent.teamId)?.get(memberId) : undefined }
+}
+
+function bindMemberActivity(child: SessionView | undefined) {
+  const key = memberActivityKey(child)
+  if (!key || !child) return undefined
+  memberActivity.bind(key, { observedIdle: !sessionAgentBusy(child.id) && memberViaSessionEnabled() })
+  if (findMemberSession(key.parentSessionId, key.memberId)?.id === key.childSessionId) {
+    const row = memberActivity.snapshot(key.parentSessionId, [key.memberId]).members.find(r => r.memberId === key.memberId)!
+    memberActivity.selectCurrent(key, row.current.childSessionId, true)
+  }
+  return key
+}
+
+function clearMemberActivitySelection(child: SessionView) {
+  const key = memberActivityKey(child)
+  if (key && memberActivity.snapshot(key.parentSessionId).members.some(r => r.current.childSessionId === key.childSessionId)) {
+    memberActivity.selectCurrent(key, key.childSessionId, false)
+  }
+}
+
+function setMemberPromptInput(childId: string, p: Record<string, unknown>, turn: MemberTurn) {
+  const key = bindMemberActivity(sessions.get(childId))
+  if (key) memberPromptInputs.set(p, { key, turn })
+}
+
+function readMemberActivity(s: SessionView | undefined) {
+  if (!s) return undefined
+  const key = memberActivityKey(s)
+  const covered = memberViaSessionEnabled()
+  if (key) {
+    const view = memberActivity.segmentSnapshot(key)
+    return !covered && view.phase === 'idle' ? { ...view, phase: 'unknown' as const, executionKnown: false } : view
+  }
+  if (s.parentSessionId) return undefined
+  const roster = s.teamId ? readTeamMemberRoster(s.teamId) : new Map<string, object>()
+  const view = memberActivity.rosterSnapshot(s.id, roster)
+  return { ...view, rosterStatus: !s.teamId ? 'unbound' : roster === undefined ? 'unknown' : 'known',
+    teamId: s.teamId ?? null, executionCoverage: covered ? 'member-session' : 'partial',
+    configuredActivityKnown: covered && roster !== undefined && view.members.every(row => row.phase === 'running' || row.current.executionKnown),
+    members: view.members.map(row => {
+      if (covered) return row
+      const state = (segment: typeof row.current) => segment.phase === 'idle' ? { ...segment, phase: 'unknown' as const, executionKnown: false } : segment
+      return { ...row, phase: row.phase === 'idle' ? 'unknown' as const : row.phase,
+        current: state(row.current), segments: row.segments.map(state) }
+    }) }
+}
 interface SessionLogEntry { seq: number; at: number; type: string; frame: any }
 interface SessionLog { entries: SessionLogEntry[]; nextSeq: number; floorSeq: number }
 const sessionEventLogs = new Map<string, SessionLog>()
@@ -12547,7 +12791,7 @@ function drainPendingSteers(sid: string, agent: any): number {
       broadcastMux(sid, {
         type: 'session/event',
         sessionId: sid,
-        event: { type: 'message_added', message: { id, role: 'user', content: [{ type: 'text', text }], timestamp: at, expectFinal: true, _inject: inject, clientMessageId: id }, turnIndex: _turnIdx, turnId: id },
+        event: { type: 'message_added', message: { id, role: 'user', content: [{ type: 'text', text }], timestamp: at, expectFinal: true, _inject: inject, clientMessageId: id }, turnIndex: _turnIdx, turnId: id, ord: turnOrdOfOpeningId(sid, id) },
       } as any)
     }catch (e) { /* 广播失败不影响落盘 */ swallowedThrottled('broadcast', e, 'session/event|' + String(sid)) }
   }
@@ -12859,7 +13103,9 @@ function setMembersQueued(parentId: string, memberIds: string[] | undefined, que
   if (!memberIds || !memberIds.length) return
   const s: any = sessions.get(parentId)
   if (!s) return
+  const pending = queued ? undefined : teamReturnInboxes.get(s)?.pending
   for (const mid of memberIds) {
+    if (pending && [...pending.values()].some(batch => batch.memberIds.includes(mid))) continue
     const cur: any = s.memberStates?.[mid]
     if (!cur || !!cur.reportQueued === queued) continue
     patchMemberState(parentId, mid, { reportQueued: queued })
@@ -12867,7 +13113,95 @@ function setMembersQueued(parentId: string, memberIds: string[] | undefined, que
 }
 
 
-function injectSessionNotice(sessionId: string, text: string, meta?: { memberIds?: string[] }): void {
+function teamReturnMessageId(batchId: string): string {
+  return `team-return:${batchId}`
+}
+
+function offerTeamReturn(batch: TeamReturn, merge: boolean, text = batch.text): AgentMessage {
+  const timestamp = Date.now()
+  const message = { id: teamReturnMessageId(batch.batchId), role: 'user' as const,
+    content: [{ type: 'text' as const, text }], timestamp,
+    _inject: { kind: 'team_return', merge, at: timestamp, memberIds: batch.memberIds } }
+  return message
+}
+
+function teamReturnIdentity(message: any): string | undefined {
+  const prefix = 'team-return:'
+  const id = message?.id
+  if (message?.role === 'user' && message._inject?.kind === 'team_return'
+    && typeof id === 'string' && id.startsWith(prefix) && id.length > prefix.length) return id.slice(prefix.length)
+}
+
+function teamReturnPublicMessage<T>(message: T): T {
+  // The model input and stored transcript retain the report; client projections expose its identity only.
+  return teamReturnIdentity(message) ? { ...message, content: [] } : message
+}
+
+function wakeTeamReturn(sessionId: string, skip?: Set<string>): void {
+  const session = sessions.get(sessionId)
+  const inbox = session && teamReturnInboxes.get(session)
+  if (!session || !inbox || inbox.stopped || session.mainRunning || sessionAgentBusy(sessionId)
+    || flushInFlight.has(sessionId) || queueSnapshot(sessionId).length) return
+  if ([...inbox.pending.values()].some(batch => batch.attempt)) return
+  const batch = [...inbox.pending.values()].find(item => !skip?.has(item.batchId))
+  if (!batch) return
+  const attempt = { batch }
+  batch.attempt = attempt
+  const prompt = { message: batch.text, source: 'notice' }
+  teamReturnPrompts.set(prompt, attempt)
+  const release = () => { if (batch.attempt === attempt) delete batch.attempt }
+  void runPromptCore(sessionId, prompt).catch(e => {
+    sessionLog(sessionId, 'warn', 'lifecycle', `团队回归 ${batch.batchId} 投递异常：${String(e)}`)
+  }).finally(release)
+}
+
+function offeredTeamReturn(session: SessionView, message: AgentMessage): TeamReturn | undefined {
+  const id = teamReturnIdentity(message)
+  if (!id || !session.mainRunning) return
+  const batch = teamReturnInboxes.get(session)?.pending.get(id)
+  if (batch?.attempt?.message === message) return batch
+}
+
+function acceptTeamReturn(sessionId: string, session: SessionView, batch: TeamReturn): void {
+  const inbox = teamReturnInboxes.get(session)!
+  inbox.pending.delete(batch.batchId)
+  inbox.accepted.add(batch.batchId)
+  delete batch.attempt
+  setMembersQueued(sessionId, batch.memberIds, false)
+  if (session.sidebarTurnSource === 'notice') {
+    session.sidebarTurnSource = 'team-summary'
+    broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: true }))
+  }
+}
+
+function stopTeamReturnWake(session: SessionView): void {
+  const inbox = teamReturnInboxes.get(session)
+  if (!inbox) {
+    teamReturnInboxes.set(session, { pending: new Map(), accepted: new Set(), stopped: true })
+    return
+  }
+  inbox.stopped = true
+  for (const batch of inbox.pending.values()) delete batch.attempt
+}
+
+function injectSessionNotice(sessionId: string, text: string, meta?: NoticeMeta): void {
+  const ids = meta?.memberIds
+  if (meta?.reason === 'team-summary') {
+    const session = sessions.get(sessionId)
+    if (!session) return  // deleted, not accepted
+    let inbox = teamReturnInboxes.get(session)
+    if (!inbox) {
+      inbox = { pending: new Map(), accepted: new Set(), stopped: false }
+      teamReturnInboxes.set(session, inbox)
+    }
+    if (inbox.pending.has(meta.batchId) || inbox.accepted.has(meta.batchId)
+      || session.messages?.some(message => teamReturnIdentity(message) === meta.batchId)) return
+    const memberIds = [...new Set(meta.memberIds)]
+    inbox.pending.set(meta.batchId, { batchId: meta.batchId, text, memberIds })
+    setMembersQueued(sessionId, memberIds, true)
+    wakeTeamReturn(sessionId)
+    return
+  }
   /* ★1036-S36（**队列是唯一真相，唤醒只是"叫醒"**）：
      原来先 `steer`、失败才入队 —— 而 steer 只对**正在跑的轮次**有效：
      主 agent 刚收轮、状态还没落的那个窗口里 steer 会静默失败 ⇒ 消息直接丢
@@ -12884,7 +13218,8 @@ function injectSessionNotice(sessionId: string, text: string, meta?: { memberIds
      ⇒ 按铁律"结构性简洁正确、禁止兜底"：没有使用者的机制不留着（不留"以后可能用"）。
      现在回到**纯追加**，与加 kind 之前逐字一致。 */
   const q0 = pendingBgNotices.get(sessionId) || []
-  pendingBgNotices.set(sessionId, [...q0, { text, memberIds: meta?.memberIds }].slice(-10))
+  const notice: BgNotice = { text, ...(ids ? { memberIds: ids } : {}) }
+  pendingBgNotices.set(sessionId, [...q0, notice].slice(-10))
   /* ★P120（**实测"主 agent 回复完成、分身运行的时候，主 agent 还显示运行中"的真根因**）：
      这里判"忙"原来用 `sessionAgentBusy`，而它**含成员/分身**（subRuns 有货就算忙）。
      ⇒ 成员在跑、主 agent 明明已经收轮（空闲），却被判"忙" → 走下面的 steer 分支 →
@@ -12894,7 +13229,7 @@ function injectSessionNotice(sessionId: string, text: string, meta?: { memberIds
   const _mainBusy = (sessions.get(sessionId) as any)?.mainRunning === true
   if (_mainBusy) {
     /* 主 agent 正在说话 ⇒ 这份汇报**排队等下一轮**：这是后端知道的事实，记在成员状态上（前端只读）。 */
-    setMembersQueued(sessionId, meta?.memberIds, true)
+    setMembersQueued(sessionId, ids, true)
     return
   }
   /* ★1032-TM（P92）：**空闲到达 = 新的一段**，这个事实由发起方写下来（不再交给读侧按时间反推）。
@@ -12905,16 +13240,16 @@ function injectSessionNotice(sessionId: string, text: string, meta?: { memberIds
      这里 `sessionAgentBusy()===false` 已经明确告诉我们"上一轮结束了"——就用它登记 `merge:false`，
      `message_start` 消费（`takeInjectMeta`）后随消息落盘，历史投影读到的是同一个事实。
      忙的那条分支不入队不开轮（等 `drainBgNotices` 用 steer 并进当轮，merge 由那边给定 true）。 */
-  pushInjectMeta(sessionId, { merge: false, at: Date.now(), kind: 'notice', ...(meta?.memberIds?.length ? { memberIds: meta.memberIds.map(String) } : {}) })
-  void runPromptCore(sessionId, { message: text, source: 'notice' } as any).then(() => {
+  pushInjectMeta(sessionId, { merge: false, at: Date.now(), kind: 'notice', ...(ids?.length ? { memberIds: ids.map(String) } : {}) })
+  void runPromptCore(sessionId, { message: text, source: 'notice' }).then(() => {
     /* ★1032-TM（P100）：**送达即清"报告排队"标记**。
        蓝徽标（`member-badge-queued`）原来只在 `drainBgNotices` 里清，而 P92 之后空闲到达走的是
        这条"直接开轮"的路（不经 drain）⇒ 标记永远挂着，面板上一直显示「成员 ①」，
        可列表里每个成员都是正常状态（实测就是这么问的）。
        清的位置就在"这条汇报真的发出去了"这里 —— 与置真的位置（忙碌分支）对称。 */
-    try { setMembersQueued(sessionId, meta?.memberIds, false) } catch { /* 状态没清掉不影响汇报送达 */ }
+    try { setMembersQueued(sessionId, ids, false) } catch { /* 状态没清掉不影响汇报送达 */ }
     const q = pendingBgNotices.get(sessionId) || []
-    const i = q.findIndex((x) => x.text === text)
+    const i = q.indexOf(notice)
     if (i < 0) return                       // drain 已经整队消费过
     const n = q.slice(); n.splice(i, 1)
     pendingBgNotices.set(sessionId, n)
@@ -12948,7 +13283,7 @@ function ensureMemberSession(parentId: string, memberId: string): any | null {
   if (!parent || !memberId) return null
   if (!_isCloneMember && !parent.teamId) return null
   const _reuse = findMemberSession(parentId, memberId)
-  if (_reuse) return _reuse
+  if (_reuse) { bindMemberActivity(_reuse); return _reuse }
   const teamDef: any = readTeam(parent.teamId)
   /* ★1032（P20）：**分身也有自己的会话** —— 分身（cloneN）不是团队成员，teamDef 里没有它，
      所以预设跟随父会话（分身 = 自己的另一份）、标题「分身N」。
@@ -12984,6 +13319,7 @@ function ensureMemberSession(parentId: string, memberId: string): any | null {
      不再只依赖 `parentSessionId`（它是软标识：一旦落盘漏了/被清，会话就漏回列表 ——
      实测"分身/成员的窗口全跑到会话列表里了"就是这么来的）。 */
   try { dm.inMainList = false; schedulePersist(dm.id) } catch (e) { console.warn('[成员] 标记子会话失败:', e) }
+  bindMemberActivity(dm)
   broadcastHost({ type: 'host/session-added', sessionId: dm.id, blank: true, parentSessionId: parentId, cwd: dm.workDir })
   sessionLog(parentId, 'info', 'session', `[成员] 已建立成员会话：${name}（${String(dm.id).slice(0, 8)}）`)
   return dm
@@ -13288,7 +13624,8 @@ function newMemberSessionFor(parentId: string, memberId: string, handoff: string
   for (const x of sessions.values()) {
     const anyX: any = x
     if (anyX.parentSessionId === parentId && anyX.memberId === memberId && anyX.archived !== true) {
-      anyX.archived = true
+            anyX.archived = true
+      clearMemberActivitySelection(anyX)
       archived++
       try { schedulePersist(anyX.id) } catch { /* 落盘失败不影响归档语义 */ }
     }
@@ -13488,6 +13825,14 @@ function projectTurnBlocksOf(sessionId: string, msgs: any[], from: number, to: n
           /* ★1024bg-4：块的 `msgId` = 它来自哪条 assistant 消息 = **段 id**。
              通知（后端）按 `afterSegId` 归属，前端靠这个字段把通知落到正确的段；缺了它通知就无处可落。 */
           const mid = String(m.id || '')
+          const batchId = teamReturnIdentity(m)
+          if (batchId) {
+            if (!out.some(block => block.kind === 'team-return' && block.batchId === batchId)) {
+              out.push({ kind: 'team-return', batchId, id: mid, msgId: mid, turnId: tid,
+                label: injectLabelOf(m), ...noticeMembersOf(session, m) })
+            }
+            continue
+          }
           /* ★1027（插话块，**有数据支撑**）——实测：插话在 transcript 里就排在 [回复4] 与 [回复5] 之间
              （index=5），所以投影按消息顺序遍历就必然落在中间；产出 `kind:'steer'` 块交给前端渲染。
              `injectMergesIntoPrev` 已保证 kind==='steer' 恒属本轮（不看时序），因此不会切成新轮。 */
@@ -13926,6 +14271,57 @@ function buildRenderMessages(session: any, sessionId: string, opts?: { live?: an
    · 历史/快照（`partialFor`）：要的是"进行中的那一轮" ⇒ 会话必须 running，否则没有"此刻"可言；
    · 实时帧（`pushTurnSnapshot`）：要的是"我刚写出来的这部分内容" ⇒ 只要累加器还在就投影，
      与 status 无关（收尾那一帧 `expectFinal=true` 恰恰发生在 status 翻转的边上，用 running 判会把终态帧吞掉）。 */
+/** 会话内每一轮的**稳定绝对序号**（1 基，含注入段）—— 前端排序的唯一依据。
+ *
+ * ★1130（老板 11-18 15:00 实测原话：「原本在上面轮次的对话，显示到了最新轮次的下面……我点击加载了一下
+ *   老的轮次，顺序又正确了」，11-19 20:40 再次复现，点名就是 0812745a 这条会话）：
+ *   · `from`/`to` 是**本次回包消息数组的下标**，只说明"这一轮在本次切片里的位置"，不是跨回包可比的绝对位置
+ *     （窗口起点、装配基准一变就失真 —— 1028 已实测过 live/transcript 两套基准的坑）；
+ *   · `turnIndex` 对注入段恒为 0（不编号、不可删），同值无法排序；
+ *   · 实时帧（`buildTurnProjection`）以前**压根不带位置** ⇒ 前端只能拿 `MAX_SAFE_INTEGER` 当"位置"兜
+ *     ⇒ 实时建出来的轮在下一次历史回包里必然沉到最底部。
+ * 这里给一个与窗口无关的序号，历史与实时**同一口径**（一条开启新段的 user 消息 = 一轮；
+ * `injectMergesIntoPrev` 判为并入前轮的注入不算新段 —— 与 `buildTurns` 的段规则一字不差）。
+ * ⚠️ 前端**只按它排**：缺 ord 就报错留痕并保持后端数组顺序，绝不再退回"没有位置 = 排最后"。
+ */
+function turnOrdMapOf(msgs: any[], session: any): Map<number, number> {
+  const map = new Map<number, number>()
+  let ord = 0
+  for (let i = 0; i < msgs.length; i++) {
+    const m: any = msgs[i]
+    if (!m || m.role !== 'user') continue
+    /* 会话开头就是注入（还没有 cur）时必须开段 —— 与 buildTurns 里 `&& cur` 同一个条件。 */
+    if (isInjectedUserMsg(m) && ord > 0 && injectMergesIntoPrev(m, session, Number(msgs[i - 1]?.timestamp) || 0)) continue
+    map.set(i, ++ord)
+  }
+  return map
+}
+
+/** 按**轮的起点消息 id** 算稳定轮序 —— 给 `turn-open` / `message_added` 这类
+ *  **不在 buildTurns 循环里**的下发点用（★1130）。
+ *
+ *  为什么需要：老板实测的现场是「**AI 回复中**，尤其**大量后台任务回归**时」——
+ *  那正是 `turn-open`（注入开新段）和 `message_added`（新用户消息回显）两条实时帧密集触发的时刻。
+ *  这两条帧原来只带 `turnId/turnIndex`，不带位置 ⇒ 前端只能建一个"没有位置"的轮壳
+ *  ⇒ 下一帧合并时整帧退化成"不排序"，临时壳也可能被排错。
+ *
+ *  口径与 `buildTurns` / `buildTurnProjection` **同一个函数**（`turnOrdMapOf`）；
+ *  消息还没进装配基准（极早期）⇒ 返回 0，前端据此留痕、不猜位置。
+ */
+function turnOrdOfOpeningId(sessionId: string, openingMsgId: string): number {
+  const sid = String(sessionId || '')
+  const oid = String(openingMsgId || '')
+  if (!sid || !oid) return 0
+  const session = sessions.get(sid)
+  if (!session) return 0
+  try {
+    const msgs = renderMessagesOf(sid, session, { withSubRuns: false })
+    const map = turnOrdMapOf(msgs, session)
+    for (const [i, ord] of map) if (String((msgs[i] as any)?.id || '') === oid) return ord
+  } catch { /* 装配失败 ⇒ 0（前端留痕，不猜） */ }
+  return 0
+}
+
 function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolean }): any | null {
       const session = sessions.get(sessionId)
       if (!session) return null
@@ -13988,7 +14384,8 @@ function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolea
            实时帧没有它就等于"历史说这是一段注入、实时说这是用户轮"，第 1 步要消灭的正是这种分叉。 */
         const _opening: any = _lu >= 0 ? _msgs[_lu] : null
         const _kind: TurnKind | '' = _opening && _opening.role === 'user' ? turnKindOf(_opening) : ''
-        const blocks: any[] = _lu >= 0 ? projectTurnBlocksOf(sessionId, _msgs, _lu + 1, _msgs.length, _turnId) : []
+        const blocks: any[] = _lu >= 0
+          ? projectTurnBlocksOf(sessionId, _msgs, teamReturnIdentity(_opening) ? _lu : _lu + 1, _msgs.length, _turnId) : []
         /* 已**拿到结果**的工具 callId —— 尾巴里只追加"还没拿到结果"的工具。
            ══ ★k4（实测"截图实时不显示、刷新才有"的**真根因**）══
            病：这里原来是 `blocks.filter(b => b.kind === 'tool' && b.callId)` ——
@@ -14163,6 +14560,9 @@ function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolea
         const txt = blocks.filter((b) => b?.kind === 'text').map((b) => String(b.text || '')).join('')
         const rsn = blocks.filter((b) => b?.kind === 'reasoning').map((b) => String(b.text || '')).join('')
         const _turnIndex = _lu >= 0 ? _msgs.slice(0, _lu + 1).filter((m: any) => m?.role === 'user' && !isInjectedUserMsg(m)).length : 0
+        /* ★1130：实时帧也必须带**稳定轮序** —— 否则前端只能把它当"没有位置"排到最后，
+           下一次历史回包就是老板实测的"旧轮跑到最新下面"。与 buildTurns 同一个函数、同一口径。 */
+        const _ord = _lu >= 0 ? (turnOrdMapOf(_msgs, session).get(_lu) || 0) : 0
         return {
           /* ★1032-块身份：**不许用 turnId 伪造消息 id**（原来 `|| _turnId` 已删）。
              前端拿 `partial.id` 当块身份的"来源消息段"（`streamTurns.ts:559`）；
@@ -14173,6 +14573,8 @@ function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolea
           /* ★1024a：轮身份随帧下发 —— 前端不再需要 `live:` 兜底、也不再自己造轮号 */
           turnId: _turnId,
           turnIndex: _turnIndex,
+          /* ★1130：稳定轮序（前端排序唯一依据；缺它前端不会退回 MAX 猜测） */
+          ord: _ord,
           /* ★1032-TM（P87）：身份也随帧下发（历史/实时同判据）。取不到起点消息 ⇒ 不带该字段，
              前端会报"缺 kind"而不是自己猜一个。 */
           ...(_kind ? { kind: _kind } : {}),
@@ -14235,6 +14637,7 @@ function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolea
           prompt: (() => {
             const um: any = _lu >= 0 ? _msgs[_lu] : null
             if (!um) return undefined
+            if (teamReturnIdentity(um)) return { text: '', id: '' }
             const cs = Array.isArray(um.content) ? um.content : []
             const tx = cs.filter((c: any) => c?.type === 'text').map((c: any) => String(c.text || '')).join('\n')
             const imgs = imageUrlsOf(cs)
@@ -15812,11 +16215,13 @@ function broadcastAgentEvent(sessionId: string, event: AgentEvent): void {
     : event
   const ev = AGENT_EV_TRIM ? (trimAgentEvent(sessionId, ev0) as AgentEvent | null) : ev0
   if (!ev) return   /* 该事件按裁剪规则"没有消费者" ⇒ 不发（不是丢错，是不需要） */
+  const publicEvent = 'message' in ev ? { ...ev, message: teamReturnPublicMessage(ev.message) }
+    : ev.type === 'agent_end' && Array.isArray(ev.messages) ? { ...ev, messages: ev.messages.map(teamReturnPublicMessage) } : ev
   broadcastMux(sessionId, {
     type: 'session/agent-event',
     sessionId,
     seq: ++agentEventSeq,
-    event: ev,
+    event: publicEvent,
   })
 }
 
@@ -16121,6 +16526,8 @@ const turnSnapRev = new Map<string, number>()
  *  用途：前端把"历史回包里的这一轮"和"本地已经渲染到哪一版"按**版本**比较
  *  （替代原来"比正文总长度猜谁新"那个补丁）。缺这个值（重启后/老数据）⇒ 历史仍是权威。 */
 const turnRevByTurn = new Map<string, number>()
+// Complete wire projection at the shared delta boundary, not an unsent streaming tail.
+const turnWireBaselines = new WeakMap<SessionView, { turnKey: string; published?: DSHMessage }>()
 /** ★1035 阶段C：稀疏帧开关（`NIS_SPARSE=0` 可关，用于出问题时立刻回到全量帧）。 */
 const SPARSE_ENABLED = process.env.NIS_SPARSE !== '0'
 /** 每轮"上次已发送的块"：`sessionId|turnId` → (blockId → {sig, textLen, rLen})。
@@ -16355,11 +16762,11 @@ function pushSessionStats(sessionId: string, force = false): void {
   broadcastMux(sessionId, frame as any)
 }
 
-/* ★c6x：第 5 个参数 preview = "只有 memHit 的提前帧"（零块帧）。
-   它必须**整帧发**：稀疏帧对"一个块都没变"的情况会判定无变化而不发 ⇒ 提前帧会被吞掉。 */
-function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal = false, force = false, preview = false): void {
-  const emit = () => {
-    turnSnapTimers.delete(sessionId)
+/* preview is the existing non-terminal memory-hit frame, independent of subscription baselines. */
+function emitTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal: boolean, preview: boolean, subscriber?: HubConnection): void {
+    const session = sessions.get(sessionId)
+    if (!session) return
+    if (expectFinal) turnWireBaselines.delete(session)
     const _emitT0 = performance.now()
     /* ★1026h（**结构性替换：实时帧的内容来源 = 唯一投影器**）——
        原来这里用 `assembleTurnContent(turn, false)`：累加器自己拼一套块（`type` 形状、块上没有
@@ -16381,10 +16788,10 @@ function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal 
     turnSnapRev.set(sessionId, rev)
     /* ★1026o（①）：把版本记到**这一轮**上 —— 历史回包（buildTurns）据此给前端
        "这一轮最新到第几版"，前端就能按版本决定要不要采用历史（而不是比正文长度猜）。 */
-    try {
+    if (!subscriber) {
       const _tid = String((proj as any).turnId || '')
       if (_tid) turnRevByTurn.set(sessionId + '|' + _tid, rev)
-    } catch { /* 记版本失败不影响推送 */ }
+    }
     const dshMsg: any = {
       /* ★1032-块身份：`|| turn.id` 已删 —— 它与 `proj.id` **恒等或同为空的兜底**：
          · 真累加器：`proj` 由 `buildTurnProjection` 从**同一个** `turn` 算出，`proj.id === turn.id`
@@ -16392,7 +16799,6 @@ function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal 
          留着它就是死分支，而且会让人以为"这里还有第二个 id 来源"。 */
       id: String((proj as any).id || ''),
       role: 'assistant',
-      content: (proj as any).blocks,
       timestamp: Date.now(),
       expectFinal,
       rev,
@@ -16475,6 +16881,22 @@ function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal 
     })
     const _frameMsgId = String(dshMsg.id || '')
     const _turnKey = sessionId + '|' + String(dshMsg.turnId || dshMsg.id || '')
+    const prior = turnWireBaselines.get(session)
+    const basis = prior?.turnKey === _turnKey ? prior : undefined
+    const messageFrame = (message: DSHMessage): MuxFrame => ({
+      type: 'session/event', sessionId, event: { type: 'message_updated', message }, expectFinal,
+    })
+    const fullMessage: DSHMessage = { ...dshMsg, content: frameBlocks }
+    if (subscriber) {
+      if (!wsHub || !dshMsg.id || !dshMsg.turnId) return
+      // An unsent text tail is ahead of the shared textDelta base. Start at the published version.
+      const message = basis?.published ? { ...basis.published, rev } : fullMessage
+      const result = wsHub.sendTo(subscriber, toWsFrame(sessionId, messageFrame(message), 'session'))
+      if (result === 'sent' && !basis && SPARSE_ENABLED) turnWireBaselines.set(session, { turnKey: _turnKey })
+      return
+    }
+    const initialFull = !!basis && !basis.published // publication zero replaces any pre-publication subscription projection
+    let message = fullMessage
     if (!expectFinal && !preview && SPARSE_ENABLED) {
       /* 稀疏帧：只发**变化/新增**的块 + 被删的块 id；什么都没变就**不发帧**（省一次序列化+传输）。
          文本/思考块额外做**增量**：新内容以旧内容为前缀时只发 `textDelta/reasoningDelta`，
@@ -16511,17 +16933,23 @@ function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal 
       sparseSentSig.set(_turnKey, cur)
       sparseSentAt.set(_turnKey, Date.now())
       sweepSparseSent()
-      if (!changed.length && !removed.length) return
-      dshMsg.sparse = true
-      dshMsg.content = changed
-      if (removed.length) dshMsg.removed = removed
-    } else {
-      dshMsg.content = frameBlocks
-      /* 终态帧走全量 ⇒ 签名表清掉（下一轮重新开始比对） */
-      if (expectFinal) { sparseSentSig.delete(_turnKey); sparseSentAt.delete(_turnKey) }
+      if (!initialFull) {
+        if (!changed.length && !removed.length) return
+        message = { ...fullMessage, sparse: true, content: changed, ...(removed.length ? { removed } : {}) } as DSHMessage
+      }
+    } else if (expectFinal) {
+      sparseSentSig.delete(_turnKey)
+      sparseSentAt.delete(_turnKey)
     }
-    broadcastMux(sessionId, { type: 'session/event', sessionId, event: { type: 'message_updated', message: dshMsg }, expectFinal })
+    if (!expectFinal && !preview) turnWireBaselines.set(session, { turnKey: _turnKey, published: fullMessage })
+    broadcastMux(sessionId, messageFrame(message))
     noteEmitCost(performance.now() - _emitT0)
+}
+
+function pushTurnSnapshot(sessionId: string, turn: TurnAccumulator, expectFinal = false, force = false, preview = false): void {
+  const emit = () => {
+    turnSnapTimers.delete(sessionId)
+    emitTurnSnapshot(sessionId, turn, expectFinal, preview)
   }
   if (expectFinal) {
     const t = turnSnapTimers.get(sessionId)
@@ -17958,26 +18386,26 @@ function ensureTaskOwnSession(task: any, target?: TaskNotifyTarget): string {
     s.originPeer = primary.peerId
     s.originBot = primary.botId
     if (primary.kind) s.originKind = primary.kind
-    /**
-     * ★1020（已定案）：**定时任务会话默认全放行** —— 用户原话"定时任务还真需要默认自审计，毕竟不是聊天"：
-     * 任务跑起来没人守着，卡在审批上就等于任务失败。
-     * 历史：这里原来写 `if (mc?.permissionMode) s.permissionMode = mc.permissionMode`（套那个已删的"通道级权限档"，
-     * 取值是通道配置里的陈旧值，语义不稳）；后来**显式写死 self_audit**，与通道配置彻底解耦。
-     * ★1034：`self_audit` 档已撤（与 full_access 行为重复）⇒ 这里改成 `full_access`，**语义完全等价**
-     *        （都是"全放行 + 留痕"，见 approvalGate 的 full_access 分支会 sessionLog）。
-     *        ⚠️ **绝不要改成"读通道配置"** —— 定时任务会跟着通道档位变成 confirm/high_only，
-     *           然后无人值守时卡在审批上、任务直接失败。
-     *        ⚠️ **注意：这是「定时任务会话」（`ensureTaskOwnSession`），不是通道会话。**
-     *           曾经把这两处搞混过（误以为要接通道配置）—— 判据：函数名 + 上面 `createSession('⏰ ...')`。
-     * 注意：这只是**建会话时的默认值**，用户在 PC 上仍可手动切这条会话的档位（对话自己的权限优先）。
-     */
-    s.permissionMode = 'full_access'
     if (mc?.modelId) {
       s.model = mc.modelId
       s.modelProviderId = resolveModelProviderId(mc.modelId) || undefined
     }
     if (mc?.effort) s.effort = mc.effort
   }
+  /**
+   * ★1119：**任务会话一律全放行 —— 无权在 `if (primary)` 里**。
+   *
+   * 原来这行写在上面那个 if 内部 ⇒ 只有「有通知目标」的任务才拿到 full_access；
+   * `notifyTargets: []`（无推送目标，最常见形态，如运营巡检）会落到默认 `confirm`
+   * ⇒ 无人值守时每条命令都弹审批卡 → 10 分钟超时 → 重试再 10 分钟 → 20 分钟后停轮。
+   *
+   * 实测事故（2026-11-19）：「NiusDream 开源运营巡检」10:00 起跑，20:06 被中止，
+   * approvalLog 里躺着两条没人点的审批（gh auth status / agently-cli message +list）。
+   *
+   * ★1020 的定案本来就是「定时任务会话默认全放行」，与有无通知目标无关；
+   * 权限与通道归属无关，所以必须与 primary 解耦。
+   */
+  s.permissionMode = 'full_access'
   /**
    * 0912 十九批：打上「定时任务支线」标记 ——
    * 前端据此打 ⏰、右键改「放回定时任务」、并**禁止直接删**（只能删任务）。
@@ -19215,7 +19643,7 @@ function agentForSession(sessionId: string): any {
   return agents.get(sessionId) || memberAgents.get(sessionId) || null
 }
 
-function handleAgentEvent(sessionId: string, event: AgentEvent): void {
+function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): void {
   const session = sessions.get(sessionId)
   if (!session) return
   /* ★1032（P45）：**成员/分身会话只跑内容管线**（累加器 → 投影帧 → 落盘）。
@@ -19281,7 +19709,9 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
          ⇒ 运行行冒出来 + 计时从 0 起（锚点已清）；实时走状态帧看到 mainRunning=false ⇒ 不显示。
          **刷新前后两个口径** —— 这就是老大截图那个"回复完成了还显示处理中"。
          现在：status 仍表示"这个会话还有活在跑"（侧栏转圈用），mainRunning 专指主 agent 的轮。 */
-      session.mainRunning = true
+      const start = agent && nativeSidebarStarts.get(agent)
+      if (agent) nativeSidebarStarts.delete(agent)
+      startMainTurn(session, start?.source)
       /* ★1023z（D10）：**本轮开始时间由后端记**，随 status 帧下发 ⇒ 前端刷新后计时连续，
          不再"一刷新就从 0 开始"（实测）。口径：一轮一个起点，agent_start 覆盖。 */
       ;(session as any).turnStartedAt = Date.now()
@@ -19299,10 +19729,21 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
       try { ;(session as any)._msgReqAt = Date.now(); const _tm = turnAccumulators.get(sessionId); if (_tm) (_tm as any)._rsMark = Date.now() } catch { /* 累积器未建，不影响主流程 */ }
       const msg = event.message
       if (msg.role === 'user') {
+        const delivered = sidebarInputs.get(msg)
+        if (delivered) {
+          sidebarInputs.delete(msg)
+          if (session.mainRunning && session.sidebarTurnSource === 'notice') {
+            session.sidebarTurnSource = delivered
+            broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: true }))
+          }
+        }
         /* ★1025：注入消息与 `buildTurns` **同一判据**（`injectMergesIntoPrev`）——
            忙时并入当前段（规则 A）、空闲到达即新段（规则 B）。
            注入不 push session.messages（不污染轮计数/撤销），前端也不为它建节点（无假气泡/分隔条）。 */
         if (isInjectedUserMsg(msg)) {
+          const teamBatchId = teamReturnIdentity(msg)
+          const teamBatch = teamBatchId && agent && agents.get(sessionId) === agent ? offeredTeamReturn(session, msg) : undefined
+          if (teamBatchId && !teamBatch) break
           const injId = injectedTurnId(msg)
           try { if (!(msg as any).id) (msg as any).id = injId } catch { /* 冻结对象也无妨，时间戳派生仍可用 */ }
           /* ★1025：消费发起时登记的忙/闲事实，写进消息随会话落盘（历史投影不再依赖文本标记）。
@@ -19372,6 +19813,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
             /* 落不进去 = 刷新后这一段会并回上一轮（用户看得见的错位）⇒ 不静默。 */
             sessionLog(sessionId, 'warn', 'session', `[注入] 落盘失败（刷新后段边界会丢）：${String((e as any)?.message || e)}`)
           }
+          if (teamBatch) acceptTeamReturn(sessionId, session, teamBatch)
           const _prevMsg: any = (session.messages || [])[session.messages.length - 1]
           if (!injectMergesIntoPrev(msg, session, Number(_prevMsg?.timestamp) || 0)) {
             try { sessionTurnBase.set(sessionId, injId) } catch { /* ignore */ }
@@ -19389,7 +19831,10 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
                  不再靠 `injected:true` 布尔猜这一轮是不是注入段。 */
               broadcastMux(sessionId, {
                 type: 'session/projection', sessionId, key: 'turn-open', seq: Date.now(),
-                value: { turnId: injId, kind: turnKindOf(msg), noticeLabel: injectLabelOf(msg), ...noticeMembersOf(session, msg), injected: true },
+                value: { turnId: injId, kind: turnKindOf(msg), noticeLabel: injectLabelOf(msg), ...noticeMembersOf(session, msg), injected: true,
+                  /* ★1130：**后台任务回归/自动续跑开新段的这一刻**也要有稳定位置 ——
+                     否则前端只能建"没有位置"的轮壳，下一帧整帧退化不排序（老板实测就是在这一步看到的错位）。 */
+                  ord: turnOrdOfOpeningId(sessionId, String((msg as any)?.id || '')) },
               } as any)
             }catch (e) { /* 广播失败不影响注入 */ swallowedThrottled('broadcast', e, 'session/projection|' + String(sessionId)) }
           }
@@ -19512,7 +19957,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
           userTurnIndex = userCount
         }
         /* ★1023y：turnIndex/turnId 放在**事件信封**上（不进 DSHMessage，避免污染落盘结构）。 */
-        broadcastMux(sessionId, { type: 'session/event', sessionId, event: { type: 'message_added', message: dshMsg, turnIndex: userTurnIndex, turnId: id }, expectFinal: true })
+        broadcastMux(sessionId, { type: 'session/event', sessionId, event: { type: 'message_added', message: dshMsg, turnIndex: userTurnIndex, turnId: id, ord: turnOrdOfOpeningId(sessionId, id) }, expectFinal: true })
       } else if (msg.role === 'assistant') {
         /* ★1032（P37 **id 单源，第 1 步**）：**每一条 assistant 消息在 message_start 那一刻就要有 id**。
            原来只给"本轮第一条"打 id（建累加器时），工具往返之后的第 2、3 条 assistant 消息**没有 id**，
@@ -19632,7 +20077,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
           // = 撞墙 → abort 本轮 + 日志/前端提示（走 session.cancel 同链路语义，agent_end 收尾）
           if (checkThinkingLoop(sessionId, assistantEvent.delta)) {
             sessionLog(sessionId, 'warn', 'llm', '检测到模型重复输出同一段思考（疑似死循环），已自动停止本轮——请换个问法或降低任务复杂度重试')
-            (stopStatusHeartbeat(sessionId), broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: false, agentEnd: true, aborted: true, loopBreak: true })))
+            stopStatusHeartbeat(sessionId)
             // 撞墙收尾对齐 session.cancel 语义（铁律 12：中断收尾放这里，别依赖 agent_end——
             // abort 后订阅守卫会丢弃旧 agent 的 agent_end 事件）：
             // 快照 transcript（上下文连续）+ 删 agent/累积器 + 状态复位
@@ -19687,6 +20132,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
             /* ★1104-J：撞墙自动停止也是"这一轮结束"，走同一个收尾出口（旧实现只写 status='idle'，
                mainRunning 与计时锚点都留着 ⇒ 界面停在「处理中」，与点停止后的病一模一样的成因）。 */
             endTurnState(sessionId, session)
+            broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: false, agentEnd: true, aborted: true, loopBreak: true }))
             /* ★mg2（方案 A）：撞墙自停同样是"这一轮结束"，草稿清掉（本轮的占位消息上面已 push） */
             try { clearPendingTurn(sessionId, session) } catch { /* ignore */ }
             /* ★0927 R14（对齐 session.cancel 语义）：挂起的询问卡也要解除 ——
@@ -19971,6 +20417,8 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
       /* ★1104-J：主 agent 这一轮结束的清理收口（`mainRunning` / 计时锚点 / `status` 三件套，
          与 session.cancel 同一份代码 —— 见 endTurnState）。 */
       endTurnState(sessionId, session)
+      /* ★1132：AI 临时页退场（异步、不阻塞收尾；失败只留痕不重试） */
+      setTimeout(() => { void sweepAiTabsOnTurnEnd(sessionId) }, 300)
       /* ★g4：自动验收 —— **不阻塞回复**（回复这时已经交给用户了，等验收跑完再改口径没意义）；
          条件全在 maybeAutoVerify 内部判（无 verifyCmd / 计划没全完成 / 同一份计划已验过 ⇒ 直接返回）。
          结果落在 session.__verifyResult，由下一轮消息头带出（见 runPromptCore 的 [验收结果]）。 */
@@ -19991,7 +20439,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
           const _text = _q.map((n: any) => String(typeof n === 'string' ? n : (n?.text ?? ''))).filter(Boolean).join('\n\n')
           const _ids = _q.flatMap((n: any) => (Array.isArray(n?.memberIds) ? n.memberIds : []))
           if (!_text.trim()) return
-          injectSessionNotice(sessionId, _text, _ids.length ? { memberIds: _ids } : undefined)
+          injectSessionNotice(sessionId, _text, { memberIds: _ids.length ? _ids : undefined })
         } catch (e) { console.warn('[bg] 收轮后补送排队通知失败:', String((e as any)?.message || e)) }
       }, 200)
       const endUsage = extractUsage(event)
@@ -20638,11 +21086,17 @@ function handleAgentEvent(sessionId: string, event: AgentEvent): void {
       if (!_isMemberSession) {
         const settledAgent = agents.get(sessionId)
         if (settledAgent && !abortedTurn) {
+          // Do not retry an unaccepted input as a consequence of its own agent_end.
+          const offered = new Set<string>()
+          for (const batch of teamReturnInboxes.get(session)?.pending.values() || []) {
+            if (batch.attempt) offered.add(batch.batchId)
+          }
           void settledAgent.waitForIdle().then(() => {
             if (agents.get(sessionId) !== settledAgent) return
             flushNextQueued(sessionId)
             /* ★ 0923：队列优先（用户消息先发）—— 队列空了才轮到「后台事件自动续跑」 */
             if (!queueSnapshot(sessionId).length) drainBgResumeAfterIdle(sessionId)
+            if (!flushInFlight.has(sessionId)) wakeTeamReturn(sessionId, offered)
           }).catch(() => { /* ignore */ })
         } else if (settledAgent && abortedTurn) {
           /* ★ 0923：本轮是用户中断的 → 续跑链暂停（与 session.cancel 同口径的双保险） */
@@ -21261,7 +21715,11 @@ const server = http.createServer(async (req, res) => {
      只回一个极小 JSON：不碰会话/磁盘/LLM，零副作用。 */
   if (req.method === 'GET' && url.pathname === '/api/ping') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-    res.end(JSON.stringify({ ok: true, t: Date.now(), up: Math.round(process.uptime()), resetEpoch: FACTORY_EPOCH }))
+    /* ★1129（左栏纪元契约）：**这是"当前后端进程是谁"的探针**。
+       以前前端只能拿 `t - up*1000` 推 bootAt 当纪元 —— 秒级取整、系统校时可跳，是**猜**出来的身份；
+       现在直接回后端发行的 `logEpoch`（与 WS 握手 / 状态帧 / session.state / session.list 同一个值）。
+       `t/up/resetEpoch` 原样保留（别处仍在读，本次不动它们）。 */
+    res.end(JSON.stringify({ ok: true, t: Date.now(), up: Math.round(process.uptime()), resetEpoch: FACTORY_EPOCH, logEpoch: LOG_EPOCH }))
     return
   }
 
@@ -22253,7 +22711,52 @@ function beginTurnMark(session: any, source: unknown): void {
   const notice = String(source || '') === 'notice'
   session.turnSource = notice ? 'notice' : 'user'
   /* 已有锚点（插话/队列续发仍在同一轮）就不重打 —— 重打等于把已经等过的时间抹掉。 */
-  if (!session.turnAnchorAt) session.turnAnchorAt = Date.now()
+  if (!session.turnAnchorAt) {
+    session.turnAnchorAt = Date.now()
+    /* ★1132：**一轮一个 taskId** —— AI 这一轮开的页都记在它名下，收轮时只退这一轮的页。
+       与锚点同生命周期（插话不换 taskId），所以"同一轮里连续查资料"天然共享归属。 */
+    session.activeTaskId = crypto.randomUUID()
+  }
+}
+
+function startMainTurn(session: SessionView, source: SidebarTurnSource | undefined): void {
+  session.mainRunning = true
+  session.sidebarTurnSource = source
+}
+
+/** Bind the accepted native prompt to its own agent_start, not the earlier queue admission. */
+async function promptMainAgent(sessionId: string, session: SessionView, agent: Agent, text: string, images: ImageContent[] | undefined, source: SidebarTurnSource, input?: MemberInput, teamAttempt?: TeamReturnAttempt): Promise<void> {
+  const inbox = teamReturnInboxes.get(session)
+  if (teamAttempt && (sessions.get(sessionId) !== session || inbox?.stopped || teamAttempt.batch.attempt !== teamAttempt)) return
+  // Batch inputs share the real prompt boundary, not a second queue inside Agent.steer().
+  // The first input opens the round; each following batch joins that same round.
+  const merged: TeamReturnAttempt[] = []
+  if (inbox && (!inbox.stopped || source === 'user')) {
+    inbox.stopped = false
+    for (const batch of inbox.pending.values()) {
+      if (batch.attempt) continue
+      const attempt = { batch, message: offerTeamReturn(batch, true) }
+      batch.attempt = attempt
+      merged.push(attempt)
+    }
+  }
+  let payload: AgentMessage[] | undefined
+  if (teamAttempt || merged.length) {
+    const first = teamAttempt
+      ? (teamAttempt.message = offerTeamReturn(teamAttempt.batch, false, text))
+      : { role: 'user' as const, content: [{ type: 'text' as const, text }, ...(images || [])], timestamp: Date.now() }
+    payload = [first, ...merged.map(attempt => attempt.message!)]
+  }
+  const start = { source }
+  nativeSidebarStarts.set(agent, start)
+  try {
+    await memberActivityBridge.native(agent, input, () => payload ? agent.prompt(payload) : agent.prompt(text, images))
+  } finally {
+    if (nativeSidebarStarts.get(agent) === start) nativeSidebarStarts.delete(agent)
+    for (const attempt of merged) {
+      if (attempt.batch.attempt === attempt) delete attempt.batch.attempt
+    }
+  }
 }
 
 /** ★1104-J（**一轮的收尾也必须只有一个出口**）：`agent_end` 与 `session.cancel` 共用这一份清理。
@@ -22266,6 +22769,7 @@ function beginTurnMark(session: any, source: unknown): void {
 function endTurnState(sessionId: string, session: any): void {
   if (!session) return
   session.mainRunning = false
+  delete session.sidebarTurnSource
   delete (session as any).turnAnchorAt
   /* status 是"这个会话还有没有活在跑"（成员不随主 agent 停止）——与 agent_end 同一口径。 */
   session.status = runningSubAgentCount(sessionId) > 0 ? 'running' : 'idle'
@@ -22276,7 +22780,7 @@ function endTurnState(sessionId: string, session: any): void {
 
 
 
-export async function runPromptCore(sessionId: string, p: Record<string, unknown>): Promise<{ ok: boolean; rebuilt?: boolean; queued?: boolean; queuePosition?: number; queueLength?: number; turnFailed?: boolean; error?: string }> {
+export async function runPromptCore(sessionId: string, p: Record<string, unknown>, noticeReason?: NoticeMeta['reason']): Promise<{ ok: boolean; rebuilt?: boolean; queued?: boolean; queuePosition?: number; queueLength?: number; turnFailed?: boolean; error?: string }> {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('session not found')
   if ((session as any).importReview?.historyOnly) throw new Error('这是导入的历史副本，不执行旧对话。请新建会话并手动复制所需内容。')
@@ -22289,6 +22793,14 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   /* ★1104-H/O：`turnSource` 与计时锚点**同一处打点**（`beginTurnMark`）——
      `turnSource` 表示"用户有没有在等"（前端停止键/处理中用），锚点表示"这一轮从什么时候开始跑"。
      两者各管一件事：通知轮也有自己的锚点（运行行要显示秒数），但不算"用户在等"。 */
+  if (!memberPromptInputs.has(p) && memberActivityKey(session)) {
+    setMemberPromptInput(sessionId, p, { turnId: crypto.randomUUID(), kind: 'unknown' })
+  }
+  const activityInput = memberPromptInputs.get(p)
+  const teamAttempt = teamReturnPrompts.get(p)
+  if (teamAttempt && (sessionAgentBusy(sessionId) || session.mainRunning || queueSnapshot(sessionId).length)) return { ok: true, queued: true }
+  if (teamAttempt && isExternalPreset(session.presetId)) throw new Error('团队回归尚未接纳：当前主会话已切换到外部引擎')
+  const sidebarSource: SidebarTurnSource = p.source === 'notice' ? 'notice' : 'user'
   beginTurnMark(session, (p as any)?.source)
 
   /* ══ ★0927 N1：**不许插队** —— 队列非空时，新消息一律排到队尾（FIFO，先来先发）══════════════
@@ -22316,6 +22828,7 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
         const pos = queueSnapshot(sessionId).length + 1
         const qErr = enqueueBusyPrompt(sessionId, p, message, {
           id: itemId,
+          noticeReason,
           notice: `前面还有 ${pos - 1} 条排队消息：这条排在第 ${pos} 位${wasPaused ? '（队列已自动恢复）' : ''}`,
           log: `队列非空 → 排到队尾（第 ${pos} 位，FIFO；${wasPaused ? '顺带解除暂停' : '队列 ' + (pos - 1) + ' 条在等'}）`,
           guard: 'fifo-enqueue',
@@ -22341,13 +22854,27 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     if (sessionAgentBusy(sessionId)) {
       const itemId = String((p as any)?.clientMessageId || crypto.randomUUID())
       const pos = queueSnapshot(sessionId).length + 1
-      const qErr = enqueueBusyPrompt(sessionId, p, message, { id: itemId })
+      const qErr = enqueueBusyPrompt(sessionId, p, message, { id: itemId, noticeReason })
       if (qErr) throw new Error(`正在生成回复，这条消息没能发出（${qErr}）——请稍后重试`)
       /* 兜底触发：若本轮 agent_end→waitForIdle 的 flush 已经跑过（窄竞态），这条没人来发。
          有限次重试（agent 还忙就再等）；正常路径下它会被 agent_end 的 flush 抢走。 */
       scheduleQueueFlushRetry(sessionId)
       return { ok: true, queued: true, ...queuePosOf(sessionId, itemId) }
     }
+  }
+  /* ★m6-member-model（打回点1）：**先只读解析一次权威决策，供发送前预估用**。
+     病：预检原来用 `p?.model`（成员窗口里通常是前端"没有会话级覆盖 ⇒ 退回全局模型"的那个值），
+     而真正发送用的是团队配置 ⇒ 同一条消息"按 A 判窗口是否超限（可能被拦）"、"按 B 真发"。
+     位置就在这儿：**队列/忙闸门之后 = 已经取得这一轮的执行权**，预检之前。
+     约束（照打回要求）：这里**只读** —— 不写会话、不落盘、不碰全局；门禁顺序/阈值一个没动。
+     解析失败（模型不可用/配置不完整）在预检前就如实失败：这一轮不该发出，也不该拿旧覆盖去发。 */
+  let _memberTurnPlan: MemberTurnLlm | null = null
+  try {
+    _memberTurnPlan = memberTurnPlanFor(session)
+  } catch (e) {
+    /* 这一轮没跑：撤掉 beginTurnMark 打的计时锚点（与下面 block 分支同口径，否则下一轮沿用旧锚点） */
+    try { delete (session as any).turnAnchorAt } catch { /* ignore */ }
+    throw e
   }
   /* ══ ★A2b（丙方案）：**发送前预估**（计算与阈值说明见上方 p0d:ctx-send 段）══════════════════
      为什么卡这里：① 它在**队列/忙碌闸门之后** ⇒ 排队的消息在"轮到自己真发"的这一刻才估，
@@ -22363,7 +22890,12 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     /* 内部调用方（定时任务/群插嘴的 __busyPolicy='wait'）与队列续发不拦（见上） */
     const _blockable = (p as any).__fromQueue !== true && (p as any).__busyPolicy !== 'wait'
     if (!_pfxInject && !_fromNotice) {
-      _ctxPre = ctxPreCheckSend(session, message, (p as any)?.attachments as unknown[], (p as any)?.model)
+      /* 窗口口径必须与"真正发送"同一个模型：成员会话用上面只读解析出的决策；
+         其它会话维持原样（payload 覆盖优先）。 */
+      const _preModel = _memberTurnPlan
+        ? { provider: _memberTurnPlan.providerId, model_id: _memberTurnPlan.model }
+        : (p as any)?.model
+      _ctxPre = ctxPreCheckSend(session, message, (p as any)?.attachments as unknown[], _preModel)
       const _line = '[ctx] 发送前预估：新消息 ' + _ctxPre.incoming + ' token + 当前 ' + _ctxPre.used + ' = ' + _ctxPre.total
         + '（窗口 ' + _ctxPre.win + '，占 ' + _ctxPre.pct.toFixed(1) + '%）'
       if (_ctxPre.level === 'block' && _blockable) {
@@ -22397,7 +22929,22 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   /* ★1001：外部预设 own 档的 p.model 是"它家模型名"（provider='external' 占位），不是 NiusDream 供应商——
      跳过会话级覆盖逻辑（否则"供应商未注册"误伤整条消息）；模型名由 runExternalTurn 的 hintModel 消费。 */
   const _extOwnModel = isExternalPreset(session?.presetId) && readAgentPreset(session?.presetId || '')?.modelSource === 'own'
-  if (m && m.provider && m.model_id && !_extOwnModel) {
+  /* ★m6-member-model：**成员会话的模型在这里落库** —— 位置就是"这一轮真正取得执行权"这一刻
+     （上面的队列/忙/暂停闸门之后；闸门里的入队项会 return，等它真开跑时再走一遍本函数）。
+     为什么必须在这儿、不是派发时：派发拿的是建 agent 时的 `ctx.team` 快照（teamRuntime.ts:3036-3045），
+     排队项/下一轮会拿着旧配置；而私聊走同一条 `runPromptCore`（不经派发）⇒ 两边要同一个口径只能在这里。
+     用的是**上面预检时那一份只读决策**（打回点1：判是否发送和真正发送必须是同一个模型），
+     这里才写会话 + 落盘；一轮只写一次 ⇒ 本轮各跳在 `resolveSessionLlm` 里读到的都是同一个模型（不热换）。 */
+  const _memberTurnModel = _memberTurnPlan
+    ? applyResolvedMemberTurnModel(session, _memberTurnPlan, () => {
+        try { schedulePersist() } catch { /* 落盘失败不影响本轮：内存值已是本轮口径 */ }
+      })
+    : null
+  if (_memberTurnModel) {
+    sessionLog(sessionId, 'info', 'llm', `[成员模型] 本轮定型：${_memberTurnModel.providerId} / ${_memberTurnModel.model}`
+      + ((m && m.model_id) ? `（已忽略 payload 里的 model「${m.model_id}」：成员会话以团队配置为准）` : ''))
+  }
+  if (m && m.provider && m.model_id && !_extOwnModel && !_memberTurnModel) {
     let prov = getState().providers.find(x => x.id === m.provider)
     if (!prov && m.base) {
       addProvider({ id: m.provider, name: m.provider, base: m.base })
@@ -22438,7 +22985,10 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   }
   // 思考强度透传（前端 ReasoningModeBtn/模型面板）：按会话存储（窗口隔离）
   // 0908六：落盘（此前只在内存=刷新回全局默认；session.model RPC 也写这条但发送路径要同源）
-  if (typeof p?.effort === 'string' && p.effort.trim()) { session.effort = p.effort.trim(); schedulePersist() }
+  /* ★m6-member-model：成员会话的强度由上面的唯一决策点定（团队配置/父会话），
+     这里不再被 payload 覆盖 —— 与模型同一条边界：成员窗口里 payload 的强度也无法证明是用户手选
+     （前端发消息一律带当前挡位牌），两处口径必须一致，否则"模型按配置、强度按牌面"就是两种真相。 */
+  if (!_memberTurnModel && typeof p?.effort === 'string' && p.effort.trim()) { session.effort = p.effort.trim(); schedulePersist() }
 
   // 0920：工作模式随消息带（时效优先——避免"刚切模式就发消息"读到旧值），同时落会话便于刷新回填
   const modeIn = typeof p?.mode === 'string' ? p.mode.trim() : ''
@@ -22538,7 +23088,7 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   /* ★0930 自动召回：随消息附一行相关记忆/知识（前端 [记忆召回] 行剥离不显示；详见 buildMemoryRecall）。
      ★1004：注入类消息（分身回归/后台任务通知/自动续跑）不做召回——那是系统汇报不是用户提问，
      召回既浪费一次检索、拼回来的行也只是噪音（落盘已剥，但模型上下文里还在）。 */
-  const _isInject = INJECTED_USER_PREFIXES.some((pfx) => message.startsWith(pfx))
+  const _isInject = !!teamAttempt || INJECTED_USER_PREFIXES.some((pfx) => message.startsWith(pfx))
   /* ★b2（阶段 C·L0 常驻记忆）：**先算 L0**，再把它的 id 集合喂给 L2 语义召回 —— 同一条记忆不许
      在消息头和 [记忆召回] 行里各出现一次（纯浪费 token）。注入位置与 [记忆召回]/[项目档案卡] 同区：
      只拼进发模型的 finalMessage，落盘仍是用户原文（stripInjectedLines 已加 [常驻记忆] 块规则）。
@@ -22688,7 +23238,7 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     /* ★1010 P0：外部流 ACP 分流开关 —— 缺省走 ACP 路径（ext-stream 内嵌）；
        回滚红线：NIS_EXT_ACP === 'off' 时回旧 codex exec 路径（runExternalTurn），两路并存。 */
     const _extRun = process.env.NIS_EXT_ACP === 'off' ? runExternalTurn : runExternalTurnAcp
-    await _extRun(sessionId, finalMessage, typeof (m as any)?.model_id === 'string' ? String((m as any).model_id) : undefined)
+    await memberActivityBridge.external(activityInput, started => _extRun(sessionId, finalMessage, sidebarSource, typeof (m as any)?.model_id === 'string' ? String((m as any).model_id) : undefined, started))
     return { ok: true, ...(turnLevelFailure(sessionId) || {}) }
   }
 
@@ -22746,10 +23296,11 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     /* ★1130：同下面那条 —— 注入身份在真正发送这一刻才登记回来（见 `enqueueBusyPrompt` 的解释） */
     if ((p as any).__inject) pushInjectMeta(sessionId, (p as any).__inject as InjectMeta)
     try {
-      await (images && images.length > 0 ? freshAgent.prompt(finalMessage, images) : freshAgent.prompt(finalMessage))
+      await promptMainAgent(sessionId, session, freshAgent, finalMessage, images, sidebarSource, activityInput, teamAttempt)
     } catch (e) {
+      if (teamAttempt) throw e
       /* ★0927 P0-1：裸错一律不许当产品错误漏给用户；忙时把消息抢救进队列 */
-      const _rid = rescueBusyPromptToQueue(sessionId, p, message, e)
+      const _rid = rescueBusyPromptToQueue(sessionId, p, message, e, noticeReason)
       if (_rid) return { ok: true, queued: true, ...queuePosOf(sessionId, _rid) }
       throw e
     }
@@ -22765,11 +23316,12 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
      登记点放在这里而不是入队处：入队到真正发出可能隔几十分钟，中间任何一轮都可能抢走这份 meta。 */
   if ((p as any).__inject) pushInjectMeta(sessionId, (p as any).__inject as InjectMeta)
   try {
-    await (images && images.length > 0 ? agent.prompt(finalMessage, images) : agent.prompt(finalMessage))
+    await promptMainAgent(sessionId, session, agent, finalMessage, images, sidebarSource, activityInput, teamAttempt)
   } catch (e) {
+    if (teamAttempt) throw e
     /* ★0927 P0-1：上面的忙检查与本调用之间仍有窄竞态（同刻两条都过检查）→ 这里兜住 pi 的裸抛，
        消息按忙时策略入队，绝不"整条蒸发"。 */
-    const _rid = rescueBusyPromptToQueue(sessionId, p, message, e)
+    const _rid = rescueBusyPromptToQueue(sessionId, p, message, e, noticeReason)
     if (_rid) return { ok: true, queued: true, ...queuePosOf(sessionId, _rid) }
     throw e
   }
@@ -22867,7 +23419,7 @@ function closeOutExternalDelivery(sessionId: string, rawBody: string): void {
   })()
 }
 
-async function runExternalTurn(sessionId: string, prompt: string, hintModel?: string): Promise<{ ok: boolean }> {
+async function runExternalTurn(sessionId: string, prompt: string, sidebarSource: SidebarTurnSource, hintModel?: string, activityStarted?: () => void): Promise<{ ok: boolean }> {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('session not found')
   if ((session as any).importReview?.historyOnly) throw new Error('导入历史副本不能恢复外部进程，请新建会话')
@@ -22926,10 +23478,11 @@ async function runExternalTurn(sessionId: string, prompt: string, hintModel?: st
   // ── 开轮：状态 + user 消息落盘（pi transcript + DSH messages 双口径） ──
   const ctrl = new AbortController()
   externalRuns.set(sessionId, ctrl)
+  activityStarted?.()
   const modelTag = `codex/${model || 'default'}`
   const ts0 = Date.now()
   session.status = 'running'
-  session.mainRunning = true   // ★P104：外部引擎轮也算"主 agent 在说话"（它不产生 agent_start 事件）
+  startMainTurn(session, sidebarSource)   // ★P104：外部引擎轮也算"主 agent 在说话"（它不产生 agent_start 事件）
   ;(session as any).turnStartTime = ts0
   broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: true }))
   broadcastHost({ type: 'host/session-status', sessionId, running: true })
@@ -23069,7 +23622,7 @@ async function runExternalTurn(sessionId: string, prompt: string, hintModel?: st
  *      （标题生成/IM 回推/会话摘要靠它）。usage 记账用收轮真值（含 thoughtTokens）。
  * 回滚红线：NIS_EXT_ACP === 'off' 时分流点走旧 runExternalTurn（见 runPromptCore 内分流）。
  */
-async function runExternalTurnAcp(sessionId: string, prompt: string, hintModel?: string): Promise<{ ok: boolean }> {
+async function runExternalTurnAcp(sessionId: string, prompt: string, sidebarSource: SidebarTurnSource, hintModel?: string, activityStarted?: () => void): Promise<{ ok: boolean }> {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('session not found')
   if ((session as any).importReview?.historyOnly) throw new Error('导入历史副本不能恢复外部进程，请新建会话')
@@ -23121,10 +23674,11 @@ async function runExternalTurnAcp(sessionId: string, prompt: string, hintModel?:
   // ── 开轮：状态 + user 消息落盘（pi transcript + DSH messages 双口径，同 runExternalTurn） ──
   const ctrl = new AbortController()
   externalRuns.set(sessionId, ctrl)
+  activityStarted?.()
   const modelTag = `codex/${model || 'default'}`
   const ts0 = Date.now()
   session.status = 'running'
-  session.mainRunning = true   // ★P104：外部引擎轮也算"主 agent 在说话"（它不产生 agent_start 事件）
+  startMainTurn(session, sidebarSource)   // ★P104：外部引擎轮也算"主 agent 在说话"（它不产生 agent_start 事件）
   ;(session as any).turnStartTime = ts0
   broadcastMux(sessionId, statusFrame(sessionId, { mainRunning: true }))
   broadcastHost({ type: 'host/session-status', sessionId, running: true })
@@ -23367,6 +23921,44 @@ function taskBranches(task: any): Array<{
 }
 
 /**
+ * ★1118：读「某条定时任务最近一次执行产出」—— 定时任务工具 `schedule_result` 的实现体，
+ * 由 buildScheduleTools 注入（tools 层不直接摸 sessions，依赖从上往里传）。
+ *
+ * 值守架构（老板 1118 定）：**执行层与决策层分开** ——
+ *   · 执行层：定时任务 target=own，在自己会话里正常跑，产出落在那条会话；
+ *   · 决策层：值守任务（watch=true + target=本对话）到点读这条产出，按规则修/报/问。
+ *
+ * 取法：执行会话里**倒着找最后一条有文本的 assistant 消息**（= 本轮最终回复），不拼过程消息。
+ * 拿不到就如实返回 error（不返回空串假装有产出 —— 值守任务据此报「今天没产出」）。
+ */
+function readTaskResult(taskId: string, chars = 4000): {
+  ok: boolean; sessionId?: string; text?: string; error?: string; runAt?: number; status?: string
+} {
+  const t: any = listTasks().find((x: any) => x.id === taskId)
+  if (!t) return { ok: false, error: `没有这个任务：${taskId}（用 schedule 的 list 动作查 id）` }
+  const sid = String(t.execSessionId || t.lastSessionId || t.ownSessionId || '')
+  if (!sid) return { ok: false, error: `「${t.name}」还没有执行会话（从未跑过？）` }
+  const s: any = sessions.get(sid)
+  if (!s) return { ok: false, error: `「${t.name}」的执行会话已被删除（${sid.slice(0, 8)}）` }
+  const msgs: any[] = Array.isArray(s.messages) ? s.messages : []
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m: any = msgs[i]
+    if (m?.role !== 'assistant') continue
+    const text = (Array.isArray(m.content) ? m.content : [])
+      .filter((c: any) => c?.type === 'text').map((c: any) => String(c.text || '')).join('\n').trim()
+    if (!text) continue
+    return {
+      ok: true,
+      sessionId: sid,
+      text: text.length > chars ? `${text.slice(0, chars)}\n…（已截断，原文 ${text.length} 字）` : text,
+      runAt: t.lastRunAt || s.updatedAt || 0,
+      status: t.lastStatus || '',
+    }
+  }
+  return { ok: false, error: `「${t.name}」最近一次执行没有 AI 文本产出（会话 ${sid.slice(0, 8)}）` }
+}
+
+/**
  * 已知的通道对端清单（0912 二十一批抽出）—— 「完成任务通知位置」与「转为通道对话」共用同一份口径。
  *
  * 为什么只有"聊过"的对端在列表里：推送/迁移都要求知道对端 id（QQ=openid / 微信=user_id），
@@ -23593,6 +24185,10 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       return {
         sessionId: sid,
         stateRev: currentStateRev(sid),
+        /* ★1129（左栏纪元契约）：快照也必须自报"我是哪个进程的全量" —— 否则跨重启的旧快照
+           （rev 数字比新进程大）会被当成更新的数据；前端用 logEpoch ≠ 当前身份 ⇒ 整条丢弃。 */
+        logEpoch: LOG_EPOCH,
+        sidebarReplying: sidebarReplyingOf(s),
         mainRunning: s.mainRunning === true,
         /* ★P119：全量快照也要带本轮来源 —— 否则前端跳号对齐后会把"通知轮"误判成"用户轮" */
         turnSource: String((s as any).turnSource || 'user'),
@@ -23607,12 +24203,15 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         /* ★1104-H/O：只给**轮起点**这一个口径（`turnStartedAt` 是"当前这一跳"的起点，
            拿它播种计时就是第三套口径 —— 已删）。0 = 当前没有未收尾的轮（用户轮与通知轮都算）。 */
         turnAnchorAt: Number(s.turnAnchorAt) || 0,
+        memberActivity: readMemberActivity(s),
         memberStates: s.memberStates && typeof s.memberStates === 'object' ? s.memberStates : {},
         queuedCount: Array.isArray(s.queuedMessages) ? s.queuedMessages.length : 0,
       }
     }
     case 'session.list':
-      return { sessions: Array.from(sessions.values())
+      /* ★1129（左栏纪元契约）：整份列表只可能由**一个**进程产生 ⇒ 身份在顶层给一次，
+         每条会话各自带 `stateRev`（已是现状）。前端拿 logEpoch 对当前身份：不等 ⇒ 整份列表作废。 */
+      return { logEpoch: LOG_EPOCH, sessions: Array.from(sessions.values())
         /* ★1035-E：**成员单聊子会话不进主列表** —— 它们是"成员头像点进去"的会话，
            混进侧栏会让列表被"张三/李四"刷满。判据是结构性字段（有父会话），不是标题匹配。 */
         /* ★1032（P22）：子会话有两个显式判据 ——
@@ -23637,13 +24236,9 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
             stateRev: currentStateRev(s.id),
             /* ★P104：主 agent 的轮在不在跑 —— 前端"运行行/计时"只认这个字段，不再拿 status 推
                （status 含成员/分身，会把"主 agent 早就说完了"显示成"还在回复"）。 */
+            sidebarReplying: sidebarReplyingOf(s),
             mainRunning: s.mainRunning === true,
-            /* ★1104-②：**列表也必须带 turnSource** —— 前端"回复中"的判据是
-               `mainRunning && turnSource !== 'notice'`（唯一入口 `utils/sessionState.ts`）。
-               状态帧/`session.state` 都带，只有列表这条漏了 ⇒ 成员回归那轮（通知唤醒，mainRunning=true）
-               撞上一次列表刷新（启动/重连/定时 60s）就把主 agent 翻成"回复中"，
-               而发货时后端判的是"不忙" ⇒ 消息进队列、点插话又提示空闲（实测的那个自相矛盾）。
-               一套判据三处下发，缺一处就是两副面孔。 */
+            /* 保留输入框 / 等待态的旧来源契约；侧栏只读 sidebarReplying。 */
             turnSource: String((s as any).turnSource || 'user'),
             /* ★1126（需求）：**成员在跑数** —— 侧栏"成员在跑"底部光条的列表回填来源。
                团队模式下主 agent 派完活就收轮（mainRunning=false ⇒ replying=false），
@@ -23655,6 +24250,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
             // A list is metadata-only. Live runs already own a resident body;
             // evictIdleBodies pins it until those exact runtime IDs finish.
             // Calling sessions.get here upgrades every cold skeleton synchronously.
+            memberActivity: readMemberActivity(s),
             members: countLiveSubRuns((s as any)._body?.subRuns, isRunActive).members,
             /* ★1126d：**成员异常告警数**（老板需求：成员失败/中断时聊天列表也要红）。
                判据见 memberAlertOf —— error/interrupted 且 unread=true；
@@ -23800,7 +24396,8 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       const newSystem = (system?.trim() && sessionBlank) ? system.trim() : session.system
       // 团队绑定：空串=解绑；未传=保持现状
       const newTeam = p?.teamId !== undefined ? (String(p.teamId || '').trim() || undefined) : session.teamId
-      const changed = newPreset !== session.presetId || newSystem !== session.system || newTeam !== session.teamId
+      const teamChanged = newTeam !== session.teamId
+      const changed = newPreset !== session.presetId || newSystem !== session.system || teamChanged
       if (newPreset !== session.presetId) session.presetBy = 'user'   // 二十一批：PC 明确选过 → 通道配置不再覆盖
       session.presetId = newPreset
       session.system = newSystem
@@ -23822,6 +24419,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         clearPendingQuestions(sessionId)
         schedulePersist()
       }
+      if (teamChanged && !session.parentSessionId) publishMemberActivity(sessionId)
       return { ok: true, presetId: session.presetId, teamId: session.teamId }
     }
 
@@ -24018,6 +24616,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       const messagesWithAssetUrls = (arr: any[]): any[] => {
         if (!Array.isArray(arr) || !arr.length) return arr
         return arr.map((m: any) => {
+          if (teamReturnIdentity(m)) return teamReturnPublicMessage(m)
           if (!Array.isArray(m?.content)) return m
           if (!m.content.some((c: any) => c?.type === 'image')) return m
           const content = m.content.map((c: any) => {
@@ -24099,6 +24698,8 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         const buildTurns = (from: number, to: number): Array<any> => {
           const out: Array<any> = []
           let cur: any = null
+          /* ★1130：轮序（含注入段）—— 全量算一次，切窗口不影响（前端只认它排序） */
+          const _turnOrdAt = turnOrdMapOf(msgs, session)
           /* ★1022ai：本会话里"哪些消息是插话注入的" —— 用来给对应轮打 `steer:true`，
              让前端刷新后也能显示「↳ 已引导」（原来这条信息只存在于前端内存，刷新即失）。 */
           const _steerSet = new Set<string>(Array.isArray((session as any)?.steerIds) ? (session as any).steerIds.map((x: any) => String(x)) : [])
@@ -24134,6 +24735,8 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
                 const _isInject = _kind === 'inject'
                 cur = {
                   turnId: injectedTurnId(m), from: i, to: i + 1, blocks: [], model: '',
+                  /* ★1130：注入段也要有稳定位置（turnIndex 恒 0，不能拿来排序） */
+                  ord: _turnOrdAt.get(i) || 0,
                   /* 注入段没有"提问"（不画气泡）；派活单/交接/插话是**有正文的**，正文与时间留着 ——
                      前端按 kind 决定画不画气泡（`task` 第 2 步画任务单卡）。 */
                   prompt: _isInject
@@ -24152,7 +24755,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
               }
               /* ★1030r-fix：用户附图随 prompt 下发（两种内存/磁盘形态都认，见 `imageUrlsOf` 注释）。 */
               const _imgs = imageUrlsOf(m.content)
-              cur = { turnId: String(m.id || `u:${i}`), from: i, to: i + 1, prompt: { text: stripInjectedLines(txt), time: Number(m.timestamp) || 0, id: String(m.id || ''), ...(_imgs.length ? { images: _imgs } : {}) }, blocks: [], model: '', kind: _kind, injected: false, turnIndex: userTurnNoAt.get(i) || 0 }
+              cur = { turnId: String(m.id || `u:${i}`), from: i, to: i + 1, ord: _turnOrdAt.get(i) || 0, prompt: { text: stripInjectedLines(txt), time: Number(m.timestamp) || 0, id: String(m.id || ''), ...(_imgs.length ? { images: _imgs } : {}) }, blocks: [], model: '', kind: _kind, injected: false, turnIndex: userTurnNoAt.get(i) || 0 }
               /* ★1022ai：这条 user 消息是**插话注入**的 ⇒ 打标，前端据此渲染「↳ 已引导」 */
               if (_steerSet.size && _steerSet.has(String(m.id || ''))) cur.steer = true
               out.push(cur)
@@ -24340,6 +24943,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       const q = await dispatchMethod('session.queue', { sessionId: sid }) as any
       return {
         ...history,
+        memberActivity: readMemberActivity(sessions.get(sid)!),
         blackboard: bb?.blackboard || null,
         cloneRuns: bb?.cloneRuns || [],
         /* ★1032-C-1a-2b-3：`activeRuns` 字段删除（同 `blackboard.read`）——
@@ -24427,6 +25031,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         let _pErr = ''
         let _pRes: any = null
         try {
+          setMemberPromptInput(sessionId, p as Record<string, unknown>, { turnId: crypto.randomUUID(), kind: 'private' })
           _pRes = await runPromptCore(sessionId, p as Record<string, unknown>)
           if (_pRes && _pRes.queued === true) {
             sessionLog(sessionId, 'info', 'session', `[成员] 私聊已排队（${_pMid}，前面还有 ${Number(_pRes.queuePosition ?? _pRes.queuePos ?? 0) || 0} 条）——等它真跑完再收尾`)
@@ -24475,6 +25080,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       const s = sessions.get(sessionId)
       if (!s) throw new Error('session not found')
       const items = (s.queuedMessages || []).splice(0, (s.queuedMessages || []).length)
+      for (const item of items) memberActivityBridge.discardQueue(item)
       queuePaused.delete(sessionId)
       schedulePersist(sessionId)
       broadcastQueue(sessionId)
@@ -24495,7 +25101,8 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         effort: typeof p?.effort === 'string' && p.effort ? p.effort : undefined,
         createdAt: Date.now(),
       }
-      const err = queuePush(sessionId, item)
+      const key = bindMemberActivity(sessions.get(sessionId))
+      const err = queuePush(sessionId, item, key ? { key, turn: { turnId: crypto.randomUUID(), kind: 'private' } } : undefined)
       if (err) throw new Error(err)
       /* ★0927 N1：暂停态(乙)下用户又主动发话 = 他想动起来 → 自动恢复 continue（结果里如实说明） */
       const wasPaused = queuePaused.has(sessionId)
@@ -24526,7 +25133,10 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       if (!sessionId) throw new Error('sessionId required')
       const s = sessions.get(sessionId)
       if (s?.queuedMessages) {
-        s.queuedMessages = s.queuedMessages.filter(q => q.id !== String(p?.id || ''))
+        const id = String(p?.id || '')
+        const removed = s.queuedMessages.filter(q => q.id === id)
+        s.queuedMessages = s.queuedMessages.filter(q => q.id !== id)
+        for (const item of removed) memberActivityBridge.discardQueue(item)
         schedulePersist()
         broadcastQueue(sessionId)
       }
@@ -24668,6 +25278,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         sessionLog(sessionId || '', 'warn', 'session',
           `[插话] 插话前内容落盘失败（本次插话在对话流里的位置可能靠后）：${String(e?.message || e).slice(0, 160)}`)
       }
+      sidebarInputs.set(msg, 'user')
       if (kind === 'followUp') agent!.followUp(msg); else agent!.steer(msg)
       /* ★1104-D：**插话落盘收成一个写者** —— 这里是"第二个写者"，删掉。
          真正落盘的是 pi 注入后发出的 `message_start`（注入分支，按 `injId` + `clientMessageId` 去重后 push）。
@@ -24805,7 +25416,10 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         return false
       })()
       const _existing: any = findMemberSession(sid, memberId)
-      if (_existing) return { sessionId: _existing.id, title: _existing.title, memberId, created: false, running: _runningNow }
+      if (_existing) {
+        bindMemberActivity(_existing)
+        return { sessionId: _existing.id, title: _existing.title, memberId, created: false, running: _runningNow, memberActivity: readMemberActivity(_existing) }
+      }
       if (!readAgentPreset(member.preset)) throw new Error(`成员预设不存在：${member.preset}`)
       const wd = parent.workDir?.trim()
       if (!wd || !fs.existsSync(wd)) throw new Error('会话缺少合法工作区，无法单聊（成员需在工作区内读写）')
@@ -24817,7 +25431,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
          现在统一走模块级 `ensureMemberSession`（段号/归档/标题/预设在那一处决定）。 */
       const dm: any = ensureMemberSession(sid, memberId)
       if (!dm) throw new Error('建不出成员会话（父会话可能没有可用工作区）')
-      return { sessionId: dm.id, title: dm.title, memberId, created: false, running: _runningNow }
+      return { sessionId: dm.id, title: dm.title, memberId, created: false, running: _runningNow, memberActivity: readMemberActivity(dm) }
     }
 
     /* ★1032-TM（P1）：成员状态（徽标 / 右侧面板的唯一数据源）。 */
@@ -24857,7 +25471,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
           }
         }
       }
-      return { states: s.memberStates || {}, details }
+      return { states: s.memberStates || {}, details, memberActivity: readMemberActivity(s) }
     }
 
     /* ★f1（需求）：**成员用量详情**（卡片上的「详情」按钮 → 弹窗列出每一段的用量）。
@@ -24875,24 +25489,18 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       if (!sid) throw new Error('sessionId required')
       if (!mid) throw new Error('memberId required')
       const segs = readMemberSegmentUsages(sid, mid)
-      /* 合计 = 各段之和（**从段本身加出来的**，不另读一处，避免"合计与明细对不上"）。
-         只加 `hasUsage:true` 的段：不可信读数的段（账本没写）不参与合计 —— 加进去就是拿 0 冒充真值。
-         一段都没有就返回 null（前端显示「—」，不显示假 0）。 */
-      const usable = segs.filter(s => s.hasUsage)
-      const totals = usable.length
-        ? usable.reduce((acc, s) => ({
-            tokens: acc.tokens + s.tokens,
-            promptTokens: acc.promptTokens + s.promptTokens,
-            completionTokens: acc.completionTokens + s.completionTokens,
-            cacheReadTokens: acc.cacheReadTokens + s.cacheReadTokens,
-            cacheWriteTokens: acc.cacheWriteTokens + s.cacheWriteTokens,
-            llmMs: acc.llmMs + s.llmMs,
-            runs: acc.runs + s.runs,
-          }), { tokens: 0, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmMs: 0, runs: 0 })
-        : null
-      /* 当前段的 id：与卡片口径同源（`findMemberSession` = 未归档那一段），让前端能标出"这段是当前" */
-      let currentSessionId = ''
-      try { currentSessionId = String(findMemberSession(sid, mid)?.id || '') } catch { currentSessionId = '' }
+      /* ★member-lifetime：合计**不再是这里手写的一段 reduce**，而是调用与广播帧/黑板 RPC 同一个
+         纯聚合（`collectMemberUsage` 内部就是它）—— 三个出口一个口径，杜绝"详情说 732M、面板说 280M"。
+         `totals` 现在带完整度契约：
+           · `status` = complete / partial（有缺账段 ⇒ 合计是部分和，**不许当全量展示**）/ empty（新段全 0）/ none；
+           · `missingSegments` / `readableSegments` / `duplicateActive` 并列给出，前端不用猜；
+           · `hitRate` = Σ缓存读 ÷ (Σ未命中 + Σ缓存读 + Σ缓存写)（分母=完整输入量，三个互斥桶都算）。 */
+      const view = collectMemberUsage(sid).get(mid) || null
+      /* ★member-lifetime：totals 的**构造**也只有一份（`detailTotalsFromView`），与黑板出口共用 —— 
+         三个出口（详情 RPC / 黑板 RPC / 实时帧）不可能再各写一套字段。 */
+      const totals = detailTotalsFromView(view)
+      /* 当前段的 id：与卡片/聚合同源（`pickCurrentRow` = 未归档里 seq 最大），让前端能标出"这段是当前" */
+      const currentSessionId = view ? view.currentSessionId : ''
       return { memberId: mid, segments: segs, totals, currentSessionId }
     }
 
@@ -24936,6 +25544,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       const t: any = sessions.get(target)
       if (!t) throw new Error('会话不存在')
       t.archived = true
+      clearMemberActivitySelection(t)
       try { schedulePersist(target) } catch { /* ignore */ }
       sessionLog(sessionId || target, 'info', 'session', `[成员] 已归档对话 ${target.slice(0, 8)}`)
       return { ok: true }
@@ -26486,6 +27095,7 @@ const allowed = [
         if (c) { c.stopped = true; parkBgResumePending(sessionId) }
       }
       const session = sessions.get(sessionId)
+      if (session) stopTeamReturnWake(session)
       const agent = agentForSession(sessionId)
       // 中断前快照当前消息到 transcript：否则 agent 丢弃后重建时丢上下文
       // （用户中断卡住的安装 → 让 AI 继续时它不知道刚才在干什么）
@@ -26756,16 +27366,33 @@ const allowed = [
          resolveWorkdirPath 的工作区越界拦截会拒掉它 —— reveal 只是打开资源管理器（无内容面），
          绝对路径直接用；相对路径仍走工作区解析（越界拦截保留）。 */
       const rawPath = String(p?.path || '')
-      const target = path.isAbsolute(rawPath) ? path.normalize(rawPath) : resolveWorkdirPath(session, rawPath)
-      let args: string[]
+      let target = path.isAbsolute(rawPath) ? path.normalize(rawPath) : resolveWorkdirPath(session, rawPath)
+      /* 目录常以分隔符结尾（正文里的链接尤其常见）：explorer 拿到 `…\sub dir\` 会把 `\"` 当成转义引号，
+         和 /select 那条是同一类引号问题 —— 实测退化成打开「文档」。尾部「\」在 Windows 路径语义上去掉等价，
+         盘符根（C:\）原样保留。 */
+      const trimmedSep = target.replace(/[\\/]+$/, '')
+      if (trimmedSep && !/^[A-Za-z]:$/.test(trimmedSep)) target = trimmedSep
+      /* ★1118 第 5 项真因（实测证据见 batch-shell-actions-m6.md §2.2）：
+         explorer 的 /select 开关要求**引号只包路径**。以前传单参数 `/select,${target}`，
+         Node 对含空格的参数整体加引号 ⇒ 命令行成了 "/select,C:\…\b b.txt"，
+         explorer 认不出开关，退化成打开「文档」（无空格路径侥幸正常，所以长期没暴露）。
+         处置：文件走 verbatim（引号只包路径，已经实测选中）；目录仍传单参数（libuv 正常转义，实测可直接打开）。
+         另：死路径不再交给 explorer —— 实测会开出「桌面」这种无关窗口，所以在后端 stat 阶段就报错。 */
+      if (target.includes('"')) throw new Error(`非法路径（含引号）：${target}`)
+      let st: fs.Stats
       try {
-        const st = fs.statSync(target)
-        args = st.isDirectory() ? [target] : [`/select,${target}`]
-      } catch {
-        args = [`/select,${target}`]
+        st = fs.statSync(target)
+      } catch (e: any) {
+        throw new Error(`路径不存在或不可访问：${target}（${String(e?.code || e?.message || 'stat failed')}）`)
       }
-      await new Promise<void>((resolve) => {
-        execFile('explorer.exe', args, () => resolve())
+      const isDir = st.isDirectory()
+      await new Promise<void>((resolve, reject) => {
+        execFile('explorer.exe', isDir ? [target] : [`/select,"${target}"`], { windowsVerbatimArguments: !isDir }, (err: any) => {
+          /* explorer.exe 正常打开窗口时也返回 exit code 1（实测每次都 1），**数字 code 不是判据**，一律视为已启动；
+             但"进程根本没起来"（ENOENT/EACCES… 字符串 code）必须报错，不能吞成成功。 */
+          if (err && typeof err.code === 'string') return reject(new Error(`无法启动资源管理器：${String(err.code)}`))
+          resolve()
+        })
       })
       return { ok: true, path: target }
     }
@@ -29165,6 +29792,9 @@ const allowed = [
     case 'teams.save': {
       const r = saveTeam(p?.team as any)
       if (!r.ok) throw new Error(r.error)
+      for (const [sid, s] of sessions) {
+        if (s.teamId === r.team.id && !s.parentSessionId) publishMemberActivity(sid)
+      }
       // 热更新：编辑保存后让绑定该团队的所有会话 agent 失效（下次对话重建 agent，
       // 新成员/职责/模型即刻生效——原来要等会话重启才生效）
       try {
@@ -29195,6 +29825,7 @@ const allowed = [
       for (const [, s] of sessions) {
         if (s.teamId !== tid) continue
         s.teamId = undefined
+        if (!s.parentSessionId) publishMemberActivity(s.id)
         affected += 1
         const a = agents.get(String(s.id))
         if (a) {
@@ -29225,41 +29856,28 @@ const allowed = [
       {
         const _sid = sessionId || String(p?.sessionId || '')
         const _bb: any = loadBlackboard(_sid)
-        if (_bb && _bb.memberTotals && typeof _bb.memberTotals === 'object') {
+        if (_bb) {
           try {
             const _s: any = sessions.get(_sid)
             const _team: any = _s?.teamId ? readTeam(String(_s.teamId)) : null
-            /* ★d1：先把用量累计切成**成员会话账本**口径（含私聊）。这一步不依赖 _team ——
-               账本在成员会话上，与团队配置无关；放在 team 判空之前，团队配置缺失时也能给对数字。 */
-            try {
-              const _ledgerProbe = buildMemberUsageLedgerTotal(_sid)
-              for (const _mid of Object.keys(_bb.memberTotals)) {
-                const _rec = _bb.memberTotals[_mid]
-                if (!_rec || typeof _rec !== 'object') continue
-                let _lg: ReturnType<typeof _ledgerProbe> = null
-                try { _lg = _ledgerProbe(_mid) } catch { _lg = null }
-                if (!_lg) { _rec.source = 'runs'; continue }   // 拿不到 ⇒ 保留 runs 累计，只标来源
-                const _p = Number(_lg.promptTokens), _c = Number(_lg.completionTokens)
-                const _cr = Number(_lg.cacheReadTokens), _cw = Number(_lg.cacheWriteTokens)
-                const _tk = Number(_lg.tokens), _lm = Number(_lg.llmMs), _rn = Number(_lg.runs)
-                if (![_p, _c, _cr, _cw, _tk, _lm, _rn].every(v => Number.isFinite(v) && v >= 0)) { _rec.source = 'runs'; continue }
-                _rec.promptTokens = Math.round(_p)
-                _rec.completionTokens = Math.round(_c)
-                _rec.cacheReadTokens = Math.round(_cr)
-                _rec.cacheWriteTokens = Math.round(_cw)
-                _rec.tokens = Math.round(_tk)
-                _rec.llmMs = Math.round(_lm)
-                if (_rn > 0) _rec.runs = Math.round(_rn)   // turns 为 0（老会话）时保留原 runs 条数
-                _rec.source = 'ledger'
-              }
-            } catch { /* 账本补不上就保留 runs 口径（不阻断 ctx 那一段） */ }
+            /* ★member-lifetime：**唯一口径** —— 与广播帧调用同一个 `collectMemberUsage`
+              （纯聚合在 `memberUsageAggregate.ts`，server 只做读取映射）。三件事一起修：
+               ① **键补齐**：只私聊过、没有 `bb.runs` 记录的成员原来连一行都不出现（账本再多也看不见）；
+               ② **值换全历史**：旧实现 `findMemberSession` 只取未归档段 ⇒ 归档段全丢（实测漏 61.7%）；
+               ③ **命中率/完整度由后端给**：`hitRate` 先求和再相除，`usageStatus` 明确
+                  complete/partial/empty，缺账段数一并下发（不把部分和冒充全量）。 */
+            const _views = collectMemberUsage(_sid)
+            const _totals: any = (_bb.memberTotals && typeof _bb.memberTotals === 'object' && !Array.isArray(_bb.memberTotals)) ? _bb.memberTotals : {}
+            /* 补键 + 覆盖 + 残值标记 = 与广播帧同一个纯函数（`mergeViewsIntoMemberTotals`） */
+            mergeViewsIntoMemberTotals(_totals, _views)
+            _bb.memberTotals = _totals
             /* ★f1：**当前段用量**（卡片显示用；老板：新开对话就清 0）。
-               与上面全历史累计同源同口径，只是取"未归档那一段"的账本 ⇒ 与广播帧完全一致。
+               与全历史累计同源（同一次读取），只是取"未归档那一段"。
                拿不到 ⇒ **删掉**这两个键（不是留着旧值）：`segTokens` 语义是"当前段"，
                留旧值等于拿上一段冒充这一段。删掉后前端显示「—」，语义才诚实。 */
             try {
-              for (const _mid of Object.keys(_bb.memberTotals)) {
-                const _rec = _bb.memberTotals[_mid]
+              for (const _mid of Object.keys(_totals)) {
+                const _rec = _totals[_mid]
                 if (!_rec || typeof _rec !== 'object') continue
                 let _sg: ReturnType<typeof readMemberCurrentSegmentTotal> = null
                 try { _sg = readMemberCurrentSegmentTotal(_sid, _mid) } catch { _sg = null }
@@ -29273,13 +29891,15 @@ const allowed = [
                 const _ssq = Number(_sg.segSeq)
                 if (Number.isFinite(_ssq) && _ssq > 0) _rec.segSeq = Math.round(_ssq)
                 else delete _rec.segSeq
+                if (_sg.ambiguous) _rec.segAmbiguous = true
+                else delete _rec.segAmbiguous
               }
             } catch { /* 段读数补不上就不写（如实缺失） */ }
             if (_team) {
               /* 复用 buildTeamCtx 里那份 memberCtxUsage 的唯一实现（不复制算法）。 */
               const _probe = buildMemberCtxUsage(_sid, _team)
-              for (const _mid of Object.keys(_bb.memberTotals)) {
-                const _rec = _bb.memberTotals[_mid]
+              for (const _mid of Object.keys(_totals)) {
+                const _rec = _totals[_mid]
                 if (!_rec || typeof _rec !== 'object') continue
                 let _got: { ctxUsed: number; ctxWindow: number } | null = null
                 try { _got = _probe(_mid) } catch { _got = null }
@@ -29332,7 +29952,7 @@ const allowed = [
     case 'browser.status':
       return browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).currentStatus()
     case 'browser.watch':
-      setBrowserWatch(true, p?.sessionId ? String(p.sessionId) : undefined)
+      setBrowserWatch(true, p?.sessionId ? String(p.sessionId) : undefined, p?.tabId ? String(p.tabId) : undefined)
       return { ok: true, controlledBy: browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).controlledBy, ...browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).currentStatus() }
     case 'browser.unwatch':
       setBrowserWatch(false, p?.sessionId ? String(p.sessionId) : undefined)
@@ -29359,7 +29979,8 @@ const allowed = [
     case 'browser.navigate':
       return await browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).navigate(String(p?.url || ''), p?.tabId ? String(p.tabId) : undefined)
     case 'browser.newTab':
-      return await browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).newTab(p?.url ? String(p.url) : undefined)
+      /* ★1132：这是**前端按钮**发起的（用户主动开页）⇒ origin='user'，退场扫描永不碰它。 */
+      return await browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).newTab(p?.url ? String(p.url) : undefined, { origin: 'user' })
     case 'browser.closeTab':
       return await browserEngine.getBrowserInstance(p?.sessionId ? String(p.sessionId) : undefined).closeTab(String(p?.tabId || ''))
     case 'browser.switchTab':
@@ -30369,19 +30990,10 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     /* prompt / steer / upgrade-detail 暂不接：它们牵动发送主路径与乐观消息认领，
        需要和 1036（消息认领）一起验，不在这里半做。未注册的 op 会被 hub 报 internal（不静默成功）。 */
 
-    /* ★1035（对齐 SSE 的两处"补发"—— 不做就会出现"重连/刷新后当前轮空白"）：
-       ① 订阅即补当前轮快照：SSE 在 server.ts:15834 明写"切会话/切窗口重订阅期间那几帧永久丢"，
-          所以订阅后立刻补一发当前 turn 快照。WS 漏了这一步 = 实测的"重连没显示"。
-       ② 连接就绪先推一次 workspace：SSE 的 handleHostStream 连上就发这一帧，WS 也要发。 */
-    wsHub.onSubscribe((_conn, sid) => {
-      if (!sid) return
-      const turn = turnAccumulators.get(sid)
-      if (!turn) return
-      try {
-        pushTurnSnapshot(sid, turn, false)
-      } catch (e) {
-        console.error('[1035] 订阅补当前轮快照失败:', String((e as Error)?.message || e))
-      }
+    // Subscription establishes the receiving connection's base; it is not a broadcast tick.
+    wsHub.onSubscribe((conn, sid) => {
+      const turn = sid && turnAccumulators.get(sid)
+      if (turn) emitTurnSnapshot(sid, turn, false, false, conn)
     })
     wsHub.onConnectionReady((conn) => {
       if (!conn.hasStream('host')) return

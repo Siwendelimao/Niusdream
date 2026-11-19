@@ -34,14 +34,14 @@ export const LAZY_FAMILIES: Record<string, { label: string; match: (name: string
   screenshot: {
     label: '截图能力包',
     match: (n) => /^mcp__nis-browser__wb_(send_screenshot|screen_capture)$/.test(n),
-    hint: '截浏览器页面 / 截【整块桌面或指定窗口】（任何应用）/ 发本地图片文件 到对话流 —— 2 件',
+    hint: '截内置浏览器页面（发到对话流）/ 截【整块桌面或指定窗口】（任何应用）/ 发本地图片文件 到对话流 —— 2 件',
   },
   browser: {
     label: '浏览器能力包',
     /* ★k1：截图两件已独立成 screenshot 包（定义在上面，先匹配 ⇒ 这里不会再命中它们）。
        保留这条前缀匹配覆盖 browser 包其余工具（打开/点击/填表/读页面等）。 */
     match: (n) => /^mcp__nis-browser__wb_/.test(n),
-    hint: '打开网页/点击/填表单/读页面 等浏览器操作（真实浏览器，用户可见）。截图见 screenshot 包',
+    hint: '打开网页/点击/填表单/读页面 等【内置浏览器】操作（真实浏览器，用户可见；不是用户的 Chrome/系统外部浏览器）。截图见 screenshot 包',
   },
   /* 系统管理（13 件，三处来源：安装助手 6 + 预设管理 4 + 自定义工具 3）：改的是 NiusDream 自身配置，
      只在"装东西 / 造预设 / 造工具"场景用，普通干活轮次里 100% 不会被调。 */

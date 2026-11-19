@@ -68,7 +68,31 @@ function resolveChromiumExe(headless: boolean): string {
   return ''
 }
 
-interface BrowserTabInfo { id: string; title: string; url: string; active: boolean; isHome?: boolean }
+/** 页归属（★1132：自动退场的地基 —— 分不清"AI 页 / 用户页"就绝不能自动关）。
+ *  · 'ai'      ：**只由工具链显式声明**（wb_* 建页时带 origin='ai' + ownerTaskId）
+ *  · 'user'    ：用户明确动作产生的页（前端"新标签"按钮带上 origin='user'）
+ *  · 'unknown' ：拿不到来源的一律落这里（弹窗、Ctrl+T、恢复、旧快照）—— **不猜**，
+ *                退场扫描永远跳过它。 */
+export type TabOrigin = 'ai' | 'user' | 'unknown'
+
+export interface BrowserTabInfo {
+  id: string; title: string; url: string; active: boolean; isHome?: boolean
+  origin: TabOrigin
+  /** 开这一页时所属的任务（= 那一轮）。只有 origin==='ai' 才有意义 */
+  ownerTaskId?: string
+  /** 弹窗/子页继承的父页 id（拿不到就不填，不猜） */
+  parentTabId?: string
+}
+
+/** 页账本条目：归属与 page 一起存，**绝不从 URL/时间反推** */
+interface TabEntry {
+  id: string; page: Page
+  origin: TabOrigin
+  ownerTaskId?: string
+  parentTabId?: string
+  /** 归属判定依据（留痕用：'tool' / 'ui' / 'adopt-default'） */
+  originEvidence?: string
+}
 interface ViewportPreset { key: string; label: string; width: number; height: number; dpr: number; mobile: boolean; touch: boolean; userAgent: string }
 
 /** 设备下拉预设（前端只发 key；'auto'=跟随面板尺寸） */
@@ -170,7 +194,7 @@ export function allInstances(): BrowserInstance[] {
 export class BrowserInstance {
   readonly key: string
   private context: BrowserContext | null = null
-  private tabs: { id: string; page: Page }[] = []
+  private tabs: TabEntry[] = []
   private activeTabId = ''
   private homeUrl = ''   // 默认首页（start 时由前端传设置默认页；关到最后一个 tab 自动回此页）
   /** ★1011k：实际生效的代理（launch 参数）。变化时必须重启实例才生效，start 里据此判断 */
@@ -183,6 +207,10 @@ export class BrowserInstance {
      而重新打开面板会再 pauseIdle 重置本计时）。前端重开面板 watch 会重置计时 ⇒ 不影响正常使用。 */
   private watchCapTimer: ReturnType<typeof setTimeout> | null = null
   private watching = false   // 有观看者期间挂起 idle（0905 五批）
+  /** ★1132：**当前正在被看的那一页**（页级）。原来只有会话级布尔 ⇒ 退场时无法回答
+   *  "哪一页正被看着"，只能整会话不关或冒险关掉。老板的验收口径是
+   *  "当前可见页不能在收尾时从眼前消失" ⇒ 必须有这个事实。空 = 没有具体在看哪页。 */
+  private watchedTabId = ''
   controlledBy: 'user' | 'ai' | '' = ''   // 占用权（0905 四批）
   private viewportKey = 'pc'
   private customViewport: { width: number; height: number } | null = null
@@ -247,8 +275,9 @@ export class BrowserInstance {
   }
 
   /** 观看者在场：挂起 idle（有人看着就不自动关） */
-  pauseIdle(): void {
+  pauseIdle(tabId?: string): void {
     this.watching = true
+    this.watchedTabId = String(tabId || '')
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
     /* ★0927 R15：硬上限 2 小时——观众异常断开没解挂起时兜底释放（防 Chromium 永久占用）；
        到点仅恢复 idle（90s 后才关），前端重开面板会重置本计时，不影响正常长时间观看 */
@@ -262,14 +291,21 @@ export class BrowserInstance {
   /** 离开视图：恢复 idle，从现在起算 90s */
   resumeIdle(): void {
     this.watching = false
+    this.watchedTabId = ''
     if (this.watchCapTimer) { clearTimeout(this.watchCapTimer); this.watchCapTimer = null }
     this.touchIdle()
   }
-  private tabId(page: Page): string {
+  private tabId(page: Page, meta?: { origin?: TabOrigin; ownerTaskId?: string; parentTabId?: string; originEvidence?: string }): string {
     const existing = this.tabs.find(t => t.page === page)
     if (existing) return existing.id
     const id = 'tab-' + Math.random().toString(36).slice(2, 9)
-    this.tabs.push({ id, page })
+    this.tabs.push({
+      id, page,
+      origin: meta?.origin || 'unknown',      // 没声明 = unknown，绝不默认成 ai
+      ...(meta?.ownerTaskId ? { ownerTaskId: meta.ownerTaskId } : {}),
+      ...(meta?.parentTabId ? { parentTabId: meta.parentTabId } : {}),
+      ...(meta?.originEvidence ? { originEvidence: meta.originEvidence } : {}),
+    })
     // console 消息环形缓冲（wb_console 工具读，AI 调试 SPA 报错用）
     if (!(page as any).__nisConsoleHooked) {
       ;(page as any).__nisConsoleHooked = true
@@ -301,10 +337,10 @@ export class BrowserInstance {
    *  点击 _blank 链接（含 window.open）——都经此进入账本。此前只靠 newTab/restore 三处手动注册，
    *  手动 tab 不进 tabs → listTabs/restoreUrls/tabs.json 全不含它 = "手动开的不进列表、切走再切回就没了"。
    *  幂等：newPage 的 await 与 context 'page' 事件先后不定，同一 page 二次进入直接返回既有 id。 */
-  private adoptPage(pg: Page): string {
+  private adoptPage(pg: Page, meta?: { origin?: TabOrigin; ownerTaskId?: string; parentTabId?: string; originEvidence?: string }): string {
     const existing = this.tabs.find(t => t.page === pg)
     if (existing) return existing.id
-    const id = this.tabId(pg)
+    const id = this.tabId(pg, meta)
     pg.on('close', () => {
       this.tabs = this.tabs.filter(t => t.page !== pg)
       if (!this.tabs.some(t => t.id === this.activeTabId)) {
@@ -413,11 +449,18 @@ export class BrowserInstance {
       try { url = t.page.url() } catch { /* page closed */ }
       // isHome：默认首页标签（AI 口径里"打开的第 N 个网站"不该把它数进去）；去尾斜杠归一化比较
       const norm = (x: string) => x.replace(/\/+$/, '')
-      return { id: t.id, url, title, active: t.id === this.activeTabId, isHome: !!this.homeUrl && norm(url) === norm(this.homeUrl) }
+      return {
+        id: t.id, url, title, active: t.id === this.activeTabId, isHome: !!this.homeUrl && norm(url) === norm(this.homeUrl),
+        origin: t.origin,
+        ...(t.ownerTaskId ? { ownerTaskId: t.ownerTaskId } : {}),
+        ...(t.parentTabId ? { parentTabId: t.parentTabId } : {}),
+      }
     })
   }
 
   getHomeUrl(): string { return this.homeUrl }
+  /** ★1132：当前被观看的那一页（页级退场判据；空 = 没有具体在看哪页） */
+  getWatchedTabId(): string { return this.watchedTabId }
 
   /* ═══════════════════════════════════════════════════════════════════════════
      C2 · driver='shell'（桌面壳）—— 引擎不 launch，attach 到壳里的 WebContentsView
@@ -620,7 +663,17 @@ export class BrowserInstance {
     try {
       for (const v of await shellViews(this.key, 1500)) {
         if (tabs.some((t) => t.id === v.tabId)) continue
-        tabs.push({ id: v.tabId, url: v.url, title: v.title, active: v.active && !tabs.some((t) => t.active) })
+        {
+          const own = this.tabs.find((x) => x.id === v.tabId)
+          tabs.push({
+            id: v.tabId, url: v.url, title: v.title, active: v.active && !tabs.some((t) => t.active),
+            /* ★1132：壳视图列表必须把引擎账本里的归属带上 —— 否则壳模式下所有页都会被当成“来源不明”，
+               自动退场永远不生效（driver=shell 是默认路径，不是边角）。 */
+            origin: own?.origin || 'unknown',
+            ...(own?.ownerTaskId ? { ownerTaskId: own.ownerTaskId } : {}),
+            ...(own?.parentTabId ? { parentTabId: own.parentTabId } : {}),
+          })
+        }
       }
     } catch { /* ignore */ }
     return tabs
@@ -631,12 +684,12 @@ export class BrowserInstance {
    * P0-3 实测：隐藏的静态页上 page.screenshot 只有 1/4 成功、第 2 张必超时；而壳侧 capturePage 5/5、9~28ms。
    * 所以顺序是「壳通道 → 可见页 page.screenshot 兜底 → 明确报错」，两条都带超时。
    */
-  private async shellScreenshot(p: Page, tabIdArg: string | undefined, type: 'png' | 'jpeg', quality: number): Promise<{ data: string; mime: string; width: number; height: number }> {
+  private async shellScreenshot(p: Page, tabIdArg: string | undefined, type: 'png' | 'jpeg', quality: number): Promise<{ data: string; mime: string; width: number; height: number; tabId: string }> {
     const tabId = tabIdArg || this.tabs.find(t=>t.page===p)?.id
     if(!tabId) throw Error('截图目标没有明确标签身份')
     const r = await shellShot(this.key,8000,tabId)
     this.touchIdle()
-    return {data:r.data,mime:r.mime,width:r.width,height:r.height}
+    return {data:r.data,mime:r.mime,width:r.width,height:r.height,tabId}
   }
 
   /** 设备模拟（Emulation.setDeviceMetricsOverride）在 attach 下能否生效属"待实测"⇒ 返回结果而不是断言成功 */
@@ -822,16 +875,18 @@ export class BrowserInstance {
     if (c) { try { await c.close() } catch { /* ignore */ } }
   }
 
-  /** 导航；url 缺协议自动补 https */
-  async navigate(url: string, tabIdArg?: string): Promise<{ url: string }> {
+  /** 导航；url 缺协议自动补 https。
+   *  ★1120 单一证据链：返回值带上**这次导航真正落到的那个标签身份**（与本动作同一个 page 解析，
+   *  不是别处读来的、也不是调用方传进来的旧 id）——截图回执据此才能证明"导航与截图是同一标签"。 */
+  async navigate(url: string, tabIdArg?: string): Promise<{ url: string; tabId: string }> {
     await this.start()
     const page = this.getTab(tabIdArg)
+    const navTabId = this.tabs.find(t => t.page === page)?.id || ''
     let u = (url || '').trim()
     if (u && !/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(u)) u = (/^[\w-]+(\.[\w-]+)+/.test(u) || u.startsWith('localhost')) ? 'https://' + u : u
     if (this.driver === 'shell') {
-      const tabId = this.tabs.find(t => t.page === page)?.id
-      if (!tabId) throw Error('导航目标没有明确标签身份')
-      await shellCtlPost('/tab/switch', { key:this.key, tabId })
+      if (!navTabId) throw Error('导航目标没有明确标签身份')
+      await shellCtlPost('/tab/switch', { key:this.key, tabId: navTabId })
     }
     const resp = await page.goto(u || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => { throw new Error('导航失败：' + String(e?.message || e)) })
     // A requested navigation explicitly presents its exact tab; passive reads,
@@ -839,10 +894,10 @@ export class BrowserInstance {
     if (!tabIdArg || tabIdArg === this.activeTabId) this.syncActive(page)
     this.touchIdle()
     this.persistTabsSnapshot()
-    return { url: resp?.url() || u }
+    return { url: resp?.url() || u, tabId: navTabId }
   }
 
-  async newTab(url?: string, opts?: { requireNew?: boolean; background?: boolean }): Promise<{ id: string }> {
+  async newTab(url?: string, opts?: { requireNew?: boolean; background?: boolean; origin?: TabOrigin; ownerTaskId?: string; parentTabId?: string }): Promise<{ id: string }> {
     await this.start()
     if (this.driver === 'shell') {
       /* P0-1 实测：attach 下 context.newPage() 必然报 Target.createTarget -32000 ⇒ 只能请壳建。
@@ -858,6 +913,17 @@ export class BrowserInstance {
         if (!id) { const last = this.tabs[this.tabs.length - 1]; id = last ? last.id : '' }
         if (!id) throw new Error('[shell] 壳建了视图但引擎认领不到（preload 标记缺失）：请检查壳侧 browserHost 是否给 view 装了 browserViewPreload')
         this.activeTabId = id
+        /* ★1132：**壳建的页也得有归属** —— 壳路径走的是 adoptShellPage（它不认 origin），
+           归属只能由**调用方声明**。不补就会全部落 unknown ⇒ 退场永远不生效。 */
+        {
+          const own = this.tabs.find((x) => x.id === id)
+          if (own) {
+            own.origin = opts?.origin || 'unknown'
+            if (opts?.ownerTaskId) own.ownerTaskId = opts.ownerTaskId
+            if (opts?.parentTabId) own.parentTabId = opts.parentTabId
+            own.originEvidence = opts?.origin === 'ai' ? 'shell-tool' : (opts?.origin === 'user' ? 'ui' : 'adopt-default')
+          }
+        }
         this.touchIdle()
         this.persistTabsSnapshot()
         return { id }
@@ -880,7 +946,12 @@ export class BrowserInstance {
       }
     }
     const page = await this.context!.newPage()
-    const id = this.adoptPage(page)
+    const id = this.adoptPage(page, {
+      origin: opts?.origin || 'unknown',
+      ...(opts?.ownerTaskId ? { ownerTaskId: opts.ownerTaskId } : {}),
+      ...(opts?.parentTabId ? { parentTabId: opts.parentTabId } : {}),
+      originEvidence: opts?.origin === 'ai' ? 'tool' : (opts?.origin === 'user' ? 'ui' : 'adopt-default'),
+    })
     this.activeTabId = id
     // 0905：新标签一律跟随默认首页，不再留 about:blank（url 参数优先）
     const target = (url || '').trim() || (this.homeUrl && this.homeUrl !== 'about:blank' ? this.homeUrl : '')
@@ -905,13 +976,23 @@ export class BrowserInstance {
       this.tabs = this.tabs.filter(x => x.id !== tabIdArg)
       if (this.activeTabId === tabIdArg) this.activeTabId = this.tabs[0]?.id || ''
       await this.refreshShellTabs()
+      /* ★1132：壳受理 ≠ 视图已销毁 —— refresh 之后如果它还在，就必须报"未确认"，
+         不许让调用方以为关掉了（退场统计会失真，用户也会看到一块残留的空白视图）。 */
+      if (this.tabs.some(x => x.id === tabIdArg)) throw new Error('关闭未确认：壳已受理，但视图仍在（tab=' + tabIdArg + '）')
       try { this.onTabsChange?.() } catch { /* ignore */ }
       this.touchIdle()
       this.persistTabsSnapshot()
       return { tabs: this.listTabs() }
     }
     const t = this.tabs.find(x => x.id === tabIdArg)
-    if (t) { try { await t.page.close() } catch { /* ignore */ } this.tabs = this.tabs.filter(x => x !== t) }
+    if (t) {
+      /* ★1132：**账本删除 ≠ 页已消失**。原来 `try{close}catch{}` 之后无条件移出账本 ——
+         关不掉也当成关了，退场逻辑据此以为省下了内存（实际还占着）。
+         现在：失败必须抛；成功后用 isClosed() 复检，确认不了就不记成"已关闭"。 */
+      await t.page.close()
+      if (!t.page.isClosed()) throw new Error('关闭未确认：page.close() 返回后页面仍处于打开状态（tab=' + tabIdArg + '）')
+      this.tabs = this.tabs.filter(x => x !== t)
+    }
     if (this.activeTabId === tabIdArg) this.activeTabId = this.tabs[0]?.id || ''
     await this.ensureHome()
     if (this.onFrame) void this.restartScreencast()
@@ -935,15 +1016,22 @@ export class BrowserInstance {
   async reload(tabIdArg?: string, hard = false) { const p = this.getTab(tabIdArg); await p.reload({ waitUntil: hard ? 'load' : 'domcontentloaded' }).catch(() => {}); this.touchIdle() }
   async stop(tabIdArg?: string) { try { const p = this.getTab(tabIdArg); await p.evaluate('window.stop&&window.stop()').catch(() => {}) } catch { /* ignore */ } }
 
-  async screenshot(tabIdArg?: string, type: 'png' | 'jpeg' = 'jpeg', quality = 60): Promise<{ data: string; mime: string; width: number; height: number }> {
+  /* ★1120 显式表面：返回值必须自带「这张图是哪个标签的画面」。
+     以前只回 data/mime/width/height ⇒ 调用方只能拿**截图之前另读的列表**当来源，
+     一旦目标标签在读取后被关掉（getTab 会落到当前页）回执就会声称截了 A、画面其实是 B。
+     这里给出的是**本次截图真正用到的那个 page 对应的 tabId**（截图动作内解析，不是别处读来的）。
+     注意：页面 URL 依然**不**随截图返回（像素与 URL 无法在同一动作里绑定），调用方不得用任何
+     截图前后读到的地址冒充画面地址。 */
+  async screenshot(tabIdArg?: string, type: 'png' | 'jpeg' = 'jpeg', quality = 60): Promise<{ data: string; mime: string; width: number; height: number; tabId: string }> {
     const p = this.getTab(tabIdArg)
     /* ★C2（红线）：shell 模式下隐藏 view 的 page.screenshot 不可靠（P0-3：静态页 1/4、8s 内第 2 张必超时）
        ⇒ 可见就走 page.screenshot（27~78ms），不在屏走壳截图后台通道，两条都带超时。 */
     if (this.driver === 'shell') return await this.shellScreenshot(p, tabIdArg, type, quality)
+    const shotTabId = this.tabs.find(t => t.page === p)?.id || ''
     const buf = await withTimeout(p.screenshot({ type, quality: type === 'jpeg' ? quality : undefined, fullPage: false }), 20000, 'page.screenshot')
     this.touchIdle()
     const vp = p.viewportSize() || { width: 1280, height: 800 }
-    return { data: buf.toString('base64'), mime: `image/${type}`, width: vp.width, height: vp.height }
+    return { data: buf.toString('base64'), mime: `image/${type}`, width: vp.width, height: vp.height, tabId: shotTabId }
   }
 
   /** 当前生效预设：auto=面板自适应尺寸，其余查表 */

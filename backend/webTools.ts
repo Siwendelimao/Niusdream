@@ -450,7 +450,7 @@ function buildWebSearchTool(): AgentTool<typeof searchParams, any> {
   return {
     name: 'web_search',
     label: '联网搜索',
-    description: '联网搜索最新信息。适合：实时资讯、新技术方案、文档查找、价格对比等需要外部信息的场景。返回标题/链接/摘要列表。',
+    description: '联网搜索最新信息（surface=none：只返回文字，不打开任何页面或面板）。适合：实时资讯、新技术方案、文档查找、价格对比等需要外部信息的场景。用户说「只查资料 / 查一下 / 搜一下」这类只要内容不要界面的活就用本工具，别去开浏览器页。返回标题/链接/摘要列表。',
     parameters: searchParams,
     async execute(_callId, params, _signal, onUpdate) {
       const limit = Math.min(Math.max(params.limit || 6, 1), 10)
@@ -458,7 +458,7 @@ function buildWebSearchTool(): AgentTool<typeof searchParams, any> {
       onUpdate?.({ content: [], details: { engine, count: results.length } })
       const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
       return {
-        content: [{ type: 'text', text: `[搜索引擎: ${engine}] 共 ${results.length} 条\n\n${lines.join('\n\n')}` }],
+        content: [{ type: 'text', text: `[surface=none] [搜索引擎: ${engine}] 共 ${results.length} 条\n\n${lines.join('\n\n')}` }],
         details: { engine, count: results.length, query: params.query },
       }
     },
@@ -486,10 +486,18 @@ function buildWebFetchTool(): AgentTool<typeof fetchParams, any> {
   return {
     name: 'web_fetch',
     label: '读取网页',
-    description: '抓取指定 URL 的网页内容并转为纯文本。配合 web_search 使用（先搜后读），也可直接读取用户给出的链接。',
+    description: '抓取指定 URL 的网页内容并转为纯文本（surface=none：只返回文字，不打开任何页面或面板）。配合 web_search 使用（先搜后读），也可直接读取用户给出的链接。要在页面上点击/登录/填表/看渲染效果请用内置浏览器（wb_navigate + wb_click/wb_fill）；本工具只取内容。',
     parameters: fetchParams,
     async execute(_callId, params, _signal, onUpdate) {
       let target = params.url.trim()
+      /* ★显式协议闸门：必须在"补 https://"之前判。
+         以前 file:///C:/a.html 会被补成 https://file/… → 协议检查过关 → 到网络层才失败，
+         错误不指向真因（模型会以为网址不可达，而不是"这条路不抓本地文件"）。 */
+      const explicitProto = /^([a-z][a-z0-9+.-]*):\/\//i.exec(target)?.[1]?.toLowerCase()
+        || /^(file|javascript|data|blob|about):/i.exec(target)?.[1]?.toLowerCase() || ''
+      if (explicitProto && explicitProto !== 'http' && explicitProto !== 'https') {
+        throw new Error(`web_fetch 只抓 http/https 网络地址（收到 ${explicitProto}:）。本地文件请用 wb_preview_file（预览面板）或 wb_send_screenshot path=（截图发对话流）；要在页面上点击/填表请用内置浏览器 wb_navigate。`)
+      }
       if (!/^https?:\/\//i.test(target)) target = 'https://' + target
       // 只允许 http/https（禁 file:/ftp: 等）
       let parsed: URL
@@ -520,7 +528,7 @@ function buildWebFetchTool(): AgentTool<typeof fetchParams, any> {
 
       onUpdate?.({ content: [], details: { url: target, chars: text.length } })
       return {
-        content: [{ type: 'text', text: `[页面] ${target}\n${text}${text.length >= maxChars ? '\n…(截断)' : ''}` }],
+        content: [{ type: 'text', text: `[surface=none] [页面] ${target}\n${text}${text.length >= maxChars ? '\n…(截断)' : ''}` }],
         details: { url: target, chars: text.length, contentType },
       }
     },
@@ -539,7 +547,7 @@ function buildGithubSearchTool(): AgentTool<typeof ghParams, any> {
   return {
     name: 'github_search',
     label: 'GitHub 搜索',
-    description: '搜索 GitHub 开源仓库。支持限定符语法：language:xxx stars:>N topic:xxx in:name/readme。适合找开源实现参考、库选型对比。',
+    description: '搜索 GitHub 开源仓库（surface=none：只返回文字，不打开页面）。支持限定符语法：language:xxx stars:>N topic:xxx in:name/readme。适合找开源实现参考、库选型对比。',
     parameters: ghParams,
     async execute(_callId, params, _signal, onUpdate) {
       const limit = Math.min(Math.max(params.limit || 5, 1), 20)
@@ -571,7 +579,7 @@ function buildGithubSearchTool(): AgentTool<typeof ghParams, any> {
       const lines = repos.map((r: any, i: number) =>
         `${i + 1}. ⭐${r.stars} [${r.lang || '—'}] ${r.full_name}\n   ${r.url}\n   ${r.desc}${r.updated ? `\n   更新: ${r.updated}` : ''}`)
       return {
-        content: [{ type: 'text', text: lines.join('\n\n') || '(无匹配仓库)' }],
+        content: [{ type: 'text', text: `[surface=none]\n${lines.join('\n\n') || '(无匹配仓库)'}` }],
         details: { count: repos.length, total: data.total_count, query: params.query },
       }
     },

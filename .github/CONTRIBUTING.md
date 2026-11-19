@@ -5,15 +5,14 @@
 ## 提 Issue
 
 - 用仓库自带的模板（**Bug 报告** / **功能建议**）；
-- 安装、配置、模型接入这类问题，去 [Discussions](https://github.com/Siwendelimao/Niusdream/discussions) 更快；
-- 报 Bug 请带上：NiusDream 版本（设置 → 关于）、系统版本、复现步骤、报错截图或日志（日志在数据目录的 `logs/` 下）。
+- 安装、配置、模型接入这类问题，去 [Discussions](https://github.com/Siwendelimao/Nis/discussions) 更快；
+- 报 Bug 请带上：NIS 版本（设置 → 关于）、系统版本、复现步骤、报错截图或日志（日志在数据目录的 `logs/` 下）。
 
 ## 提 PR
 
 1. **先开一个 Issue 说清要改什么** —— 免得你做完发现方向不对（尤其大改动）；
 2. 保持现有代码风格，不要顺手重构无关文件；
-3. 技术栈：Node + TypeScript（HTTP + SSE + WebSocket）。在 `backend/` 里 `pnpm install && pnpm start` 起服务，
-   `curl http://127.0.0.1:8766/api/ping` 返回 `ok:true` 即算跑通；
+3. 技术栈：前端 Vue 3 + Vite，后端 Node + TypeScript，桌面壳 Tauri 2。改后端 `.ts` 后本地跑 `pnpm dev` 即可验证；
 4. PR 描述里写清两件事：**为什么改**、**怎么验证**（最好附上你实际跑过的命令与结果）。
 
 ## 分支与提交
@@ -24,7 +23,7 @@
 
 ## 平台适配
 
-目前只测过 **Windows 10/11**。后端里 Windows 专属的部分不多（DPAPI 密钥加密、无弹窗进程控制），macOS / Linux 适配的 PR 很欢迎。
+目前只测过 **Windows 10/11**。代码里 Windows 专属的部分不多（DPAPI 密钥加密、托盘、安装器），macOS / Linux 适配的 PR 很欢迎。
 
 ## 许可证
 

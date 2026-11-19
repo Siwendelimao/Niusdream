@@ -1529,8 +1529,42 @@ export function buildListDirTool(cwd: string): AgentTool<any> {
   }
 }
 
-/** schedule：定时任务（create/list/update/remove/run_now）—— scheduledTasks.ts 能力已有，0929 开工具口 */
-export function buildScheduleTools(): AgentTool<any>[] {
+/** ★1118：读「某条定时任务最近一次执行产出」的注入口。
+ *
+ *  为什么由 server 注入而不是 tools 里直接读：产出是**执行会话里的 assistant 文本**，
+ *  而会话表（sessions）是 server.ts 的模块级状态。tools 层不越界去摸它，依赖由上往里传
+ *  （与 setTaskRunner / setTaskSessionResolver 同一个思路，但不走全局单例）。
+ *
+ *  用途：**值守任务看执行层的产出** —— 执行层（定时任务）在自己会话里正常跑，
+ *  决策层（值守任务）到点读它的产出，再按值守规则决定「修 / 报 / 问」。 */
+export type ScheduleResultReader = (taskId: string, chars: number) => {
+  ok: boolean
+  sessionId?: string
+  text?: string
+  error?: string
+  runAt?: number
+  status?: string
+}
+
+/** schedule：定时任务（create/list/update/remove/run_now）—— scheduledTasks.ts 能力已有，0929 开工具口
+ *
+ *  ★1118：补 `target` / `watch` 两个口 —— 底层 `createTask`/`updateTask` 早就支持
+ *  `targetSessionId` / `watch`（scheduledTasks.ts），但工具层从来没接出来，结果
+ *  「AI 给自己在某个对话开值守」只能绕过工具去调 HTTP RPC，还得自己摸后端端口、猜会话 id。
+ *  这是**接口断裂**（不是缺功能），根源在工具层：参数没暴露 = 模型不知道有这个能力。
+ */
+export function buildScheduleTools(convId: string, readResult?: ScheduleResultReader): AgentTool<any>[] {
+  /** target 解析：'this'=当前对话 / 'own'=任务专属会话（默认）/ 其它按 sessionId 原样。
+   *  不做兜底：`'this'` 却拿不到 convId 属于调用环境错误（工具构建时没传），直接报错暴露。 */
+  const resolveTarget = (v: any): string => {
+    const s = String(v ?? '').trim()
+    if (!s || s === 'own') return 'own'
+    if (s === 'this') {
+      if (!convId) throw new Error("target='this' 但拿不到当前会话 id（buildScheduleTools 没收到 convId）")
+      return convId
+    }
+    return s
+  }
   const subs: any[] = [
     {
       name: 'schedule_create', label: '新建定时任务',
@@ -1544,7 +1578,8 @@ export function buildScheduleTools(): AgentTool<any>[] {
         weekdays: Type.Optional(Type.Array(Type.Number(), { description: '（weekly 用）周几（0=周日…6=周六），如 [1,3,5]' })),
         dayOfMonth: Type.Optional(Type.Number({ description: '（monthly 用）几号（1-28）' })),
         interval: Type.Optional(Type.Number({ description: '每 N 个周期（默认 1；hourly 最小粒度=小时，别建更高频）' })),
-        notify: Type.Optional(Type.String({ description: "'list'=结果进对话列表（默认，不抢 IM）；'none'=不通知" })),
+        target: Type.Optional(Type.String({ description: "'this'=绑到当前对话（开值守用）/ 'own'=任务专属会话（默认）/ 具体会话 id" })),
+        watch: Type.Optional(Type.Boolean({ description: 'true=值守任务（结果落进绑定的对话、只在输入框旁「值守」弹窗管理，不进定时任务列表）' })),
       }),
       async execute(_c: string, params: any) {
         const kind = String(params?.kind || '')
@@ -1553,7 +1588,12 @@ export function buildScheduleTools(): AgentTool<any>[] {
         const t = createTask({
           name: params.name, prompt: params.prompt,
           schedule: { kind, at: params.at, time: params.time, weekdays: params.weekdays, dayOfMonth: params.dayOfMonth, interval: params.interval },
-          notifyTargets: params?.notify === 'none' ? [] : [{ channel: 'list' }],
+          targetSessionId: resolveTarget(params?.target),
+          watch: params?.watch === true,
+          /* ★1118：不再默认塞 {channel:'list'} —— 「列表通知」这个通知目标已按 ★1119k 定案废掉
+             （任务永不进对话列表，task.notifyTargets 也不再 enumerate 出它），旧默认值只会给每条
+             新任务留一条无效配置（巡检任务就是这么带上它的）。真实推送目标现在由用户在任务详情页选。 */
+          notifyTargets: [],
         })
         return {
           content: [{ type: 'text', text: `已创建定时任务「${t.name}」（${describeSchedule(t.schedule)}）· id=${t.id} · 下次：${t.nextRunAt ? new Date(t.nextRunAt).toLocaleString('zh-CN', { hour12: false }) : '（无）'}` }],
@@ -1574,7 +1614,8 @@ export function buildScheduleTools(): AgentTool<any>[] {
     },
     {
       name: 'schedule_update', label: '改定时任务',
-      description: '改定时任务（停用/启用、换时间、改内容）。先 list 拿 id；改动哪个字段给哪个。',
+      description: '改定时任务（停用/启用、换时间、改内容、绑/解绑对话、开关值守）。先 list 拿 id；改动哪个字段给哪个。'
+        + '把已有任务变成本对话的值守任务：target="this" + watch=true。',
       parameters: Type.Object({
         id: Type.String({ description: '任务 id（schedule_list 返回）' }),
         name: Type.Optional(Type.String()),
@@ -1583,6 +1624,8 @@ export function buildScheduleTools(): AgentTool<any>[] {
         time: Type.Optional(Type.String({ description: '新的 HH:mm' })),
         kind: Type.Optional(Type.String({ description: '新的周期类型' })),
         at: Type.Optional(Type.String({ description: '（once）ISO 时间' })),
+        target: Type.Optional(Type.String({ description: "'this'=绑到当前对话（开值守用）/ 'own'=任务专属会话 / 具体会话 id" })),
+        watch: Type.Optional(Type.Boolean({ description: 'true=值守任务 / false=转回普通定时任务' })),
       }),
       async execute(_c: string, params: any) {
         const patch: any = {}
@@ -1590,9 +1633,12 @@ export function buildScheduleTools(): AgentTool<any>[] {
         if (params?.prompt !== undefined) patch.prompt = params.prompt
         if (params?.enabled !== undefined) patch.enabled = !!params.enabled
         if (params?.kind || params?.time || params?.at) patch.schedule = { kind: params.kind, time: params.time, at: params.at }
+        if (params?.target !== undefined) patch.targetSessionId = resolveTarget(params.target)
+        if (params?.watch !== undefined) patch.watch = !!params.watch
         const t = updateTask(String(params?.id || ''), patch)
         if (!t) throw new Error(`没有这个任务：${params?.id}（用 schedule_list 查）`)
-        return { content: [{ type: 'text', text: `已更新「${t.name}」：${describeSchedule(t.schedule)}｜${t.enabled ? '启用' : '停用'}` }], details: { ok: true, id: t.id } }
+        const where = t.watch ? `值守（结果落 ${String(t.targetSessionId || '').slice(0, 8)}）` : `投递 ${String(t.targetSessionId || 'own') === 'own' ? '任务专属会话' : String(t.targetSessionId).slice(0, 8)}`
+        return { content: [{ type: 'text', text: `已更新「${t.name}」：${describeSchedule(t.schedule)}｜${t.enabled ? '启用' : '停用'}｜${where}` }], details: { ok: true, id: t.id } }
       },
     },
     {
@@ -1615,6 +1661,29 @@ export function buildScheduleTools(): AgentTool<any>[] {
         return { content: [{ type: 'text', text: `已触发执行 ${params.id}${r.sessionId ? `（会话 ${r.sessionId.slice(0, 8)}）` : ''}` }], details: { ok: true, id: params.id } }
       },
     },
+    {
+      name: 'schedule_result', label: '读任务产出',
+      description: '读某条定时任务**最近一次执行**的产出（执行会话里最后一段 AI 文本全文）。'
+        + '值守任务的标准动作：先读执行层今天干了什么，再按值守规则决策/动手。'
+        + '返回值带 runAt（执行时间）——先核对是不是今天的，昨天的不算今日产出。',
+      parameters: Type.Object({
+        id: Type.String({ description: '任务 id（schedule_list 返回）' }),
+        chars: Type.Optional(Type.Number({ description: '最多返回多少字符（默认 4000，上限 20000）' })),
+      }),
+      async execute(_c: string, params: any) {
+        if (!readResult) throw new Error('当前会话没有注入「任务产出读取」能力（buildScheduleTools 没收到 readResult）')
+        const id = String(params?.id || '').trim()
+        if (!id) throw new Error('id 不能为空')
+        const chars = Math.min(20000, Math.max(200, Number(params?.chars) || 4000))
+        const r = readResult(id, chars)
+        if (!r?.ok) throw new Error(r?.error || '读取失败')
+        const when = r.runAt ? new Date(r.runAt).toLocaleString('zh-CN', { hour12: false }) : '—'
+        return {
+          content: [{ type: 'text', text: `「${id}」最近一次执行：${when}｜状态 ${r.status || '—'}｜会话 ${String(r.sessionId || '').slice(0, 8)}\n\n${r.text || '（无文本产出）'}` }],
+          details: { ok: true, id, sessionId: r.sessionId, runAt: r.runAt },
+        }
+      },
+    },
   ]
   return [buildFamilyTool({
     name: 'schedule',
@@ -1624,16 +1693,23 @@ export function buildScheduleTools(): AgentTool<any>[] {
     tab: 'system',
     risky: true,
     fullMemberDescriptions: false,
-    description: '定时任务工具箱（五动作）：到点自动把 prompt 发给 AI 执行（提醒/周期活）。'
-      + '· create：新建（kind=once/hourly/daily/weekly/monthly；提醒类 notify 默认 list=进对话列表，不抢 IM）。'
-      + '· list：看全部任务。· update：改/停用/启用（先 list 拿 id）。· remove：删（只想暂停就 update enabled=false）。'
-      + '· run_now：立刻跑一次（调试/补跑）。纪律：频率最小粒度=小时，别建分钟级；改删先 list 查 id；用户只要提醒就建 once/daily+notify=list，别整复杂。',
+    description: '定时任务工具箱（六动作）：到点自动把 prompt 发给 AI 执行（提醒/周期活）。'
+      + '· create：新建（kind=once/hourly/daily/weekly/monthly）。'
+      + '· list：看全部任务。· update：改/停用/启用/绑对话/开关值守（先 list 拿 id）。'
+      + '· remove：删（只想暂停就 update enabled=false）。· run_now：立刻跑一次（调试/补跑）。'
+      + '· result：读某任务**最近一次执行的产出全文**（含 runAt，先核对是不是今天的）。'
+      + '落点：默认 target="own"=任务专属会话（自己单独跑、自己产出，不进主列表）；'
+      + '要结果落在用户当前这个对话就传 target="this"，再加 watch=true 即建成**值守任务**'
+      + '（只在输入框旁「值守」弹窗里管理，输入框图标变绿）。'
+      + '★两层别混：执行任务（target="own"）自己跑自己产出；值守任务（watch=true + target="this"）到点用 result 读执行层的产出，再按值守规则决策。'
+      + '纪律：频率最小粒度=小时，别建分钟级；改删先 list 查 id；用户只要提醒就建 once/daily，别整复杂。',
     members: [
-      { action: 'create', tool: subs[0], required: ['name', 'prompt', 'kind'], summary: '建定时任务（提醒/周期活）' },
+      { action: 'create', tool: subs[0], required: ['name', 'prompt', 'kind'], summary: '建定时任务（提醒/周期活/值守）' },
       { action: 'list', tool: subs[1], summary: '列任务（周期/下次/状态）' },
-      { action: 'update', tool: subs[2], required: ['id'], summary: '改/停用/启用' },
+      { action: 'update', tool: subs[2], required: ['id'], summary: '改/停用/启用/绑对话/开关值守' },
       { action: 'remove', tool: subs[3], required: ['id'], summary: '删除任务' },
       { action: 'run_now', tool: subs[4], required: ['id'], summary: '立刻执行一次' },
+      { action: 'result', tool: subs[5], required: ['id'], summary: '读任务最近产出（值守用）' },
     ],
   })]
 }

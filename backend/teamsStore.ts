@@ -14,6 +14,21 @@ import { loadJsonOrBackup, writeJsonAtomic } from './jsonStore.ts'
 
 export const TEAMS_DIR = path.join(DATA_ROOT, 'teams')
 
+// Commit-side read model: status frames never invoke the migrating team-file reader.
+const memberRosters = new Map<string, ReadonlyMap<string, object>>()
+export function readTeamMemberRoster(id: string): ReadonlyMap<string, object> | undefined {
+  return memberRosters.get(id)
+}
+function recordMemberRoster(team: { id: string; members: ReadonlyArray<{ id: string }> }): void {
+  const ids = Array.isArray(team.members) ? team.members.map(member => member?.id) : undefined
+  if (!ids || ids.some(id => typeof id !== 'string' || !id.trim() || /^clone\d+$/i.test(id)) || new Set(ids).size !== ids.length) {
+    memberRosters.delete(team.id)
+    return
+  }
+  const previous = memberRosters.get(team.id)
+  memberRosters.set(team.id, new Map(ids.map(id => [id, previous?.get(id) ?? {}])))
+}
+
 export interface TeamMember {
   id: string
   type: 'preset'
@@ -349,6 +364,7 @@ export function saveTeam(input: any): { ok: true; team: TeamDef } | { ok: false;
   try {
     fs.mkdirSync(path.dirname(teamPath(id)), { recursive: true })
     writeJsonAtomic(teamPath(id), team)
+    recordMemberRoster(team)
     return { ok: true, team }
   } catch (e: any) {
     return { ok: false, error: `写入失败：${e?.message || e}` }
@@ -360,6 +376,7 @@ export function deleteTeam(id: string): string | null {
   const dir = path.join(TEAMS_DIR, id)
   try {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true })
+    memberRosters.delete(id)
     return null
   } catch (e: any) {
     return `删除失败：${e?.message || e}`
@@ -370,7 +387,9 @@ export function deleteTeam(id: string): string | null {
 export function initTeams(): void {
   try {
     fs.mkdirSync(TEAMS_DIR, { recursive: true })
-    if (listTeams().length > 0) return
+    const teams = listTeams()
+    for (const team of teams) recordMemberRoster(team)
+    if (teams.length > 0) return
     const sample = {
       id: 'software-dev-team',
       name: '软件开发小组',
@@ -387,6 +406,7 @@ export function initTeams(): void {
     }
     fs.mkdirSync(path.dirname(teamPath(sample.id)), { recursive: true })
     fs.writeFileSync(teamPath(sample.id), JSON.stringify(sample, null, 2) + '\n', 'utf-8')
+    recordMemberRoster(sample)
     console.log(`[teams] seeded sample team: ${sample.id}`)
   } catch (e) {
     console.error('[teams] init failed:', e)

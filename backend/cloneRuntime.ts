@@ -1,6 +1,11 @@
 /** Temporary read-only agents are awaited tools of the current parent turn.
  * No TeamCtx, member session, blackboard, detached dispatch or return notification.
  * Only the model transport, tool implementations and immutable run verdict are shared.
+ *
+ * 契约（老板第7项）：一次 spawn_clone 调用里，每个子任务**只执行一次**，全部真实状态一次返回；
+ * 工具不重派、也没有"每个分身最多 N 次模型轮"这类步数上限（跑完为止，停下只由取消负责）。
+ * 要重派，由主助手拿到结果后**新发一次** spawn_clone（新 callId/新 runId，可只带失败的那一个）。
+ * 模型层瞬时重试（限流/断连）是传输层语义，与这里的"是否重派子任务"无关。
  */
 import { randomUUID } from 'node:crypto'
 import { Type } from 'typebox'
@@ -109,15 +114,17 @@ function capture(run: CloneRun, messages: any[]): void {
   run.timing = { llmMs: (run.endedAt ?? Date.now()) - run.startedAt }
 }
 
-async function runOnce(ctx: CloneContext, callId: string, slot: number, task: string, attempt: number, signal: AbortSignal | undefined, batch: CloneRun[]): Promise<CloneRun> {
+/** 一次工具调用内每个子任务只执行一次：本函数没有内部重跑，attempt 恒为 1。
+ *  重派 = 主助手拿到结果后新发一次 spawn_clone（新 callId + 新 runId，天然可区分）。 */
+async function runOnce(ctx: CloneContext, callId: string, slot: number, task: string, signal: AbortSignal | undefined, batch: CloneRun[]): Promise<CloneRun> {
   const run: CloneRun = {
     runId: randomUUID(), callId, memberId: `clone${slot}`, memberName: `${ctx.name} 分身`, memberPreset: ctx.presetId,
-    task, model: ctx.model, attempt, status: 'running', startedAt: Date.now(), text: '', reasoning: '', finalized: false,
+    task, model: ctx.model, attempt: 1, status: 'running', startedAt: Date.now(), text: '', reasoning: '', finalized: false,
     segments: [], tools: [], timing: { llmMs: 0 },
   }
   batch.push(run)
   const ac = new AbortController()
-  let report = '', failure = '', turns = 0, partial: any = null, lastPublish = 0
+  let report = '', failure = '', partial: any = null, lastPublish = 0
   const findings: string[] = []
   const system = `你是「${ctx.name} 分身 #${slot}」，本次任务的一次性只读调研员，不是团队成员。\n工作目录：${ctx.workDir}\n只处理任务单；只能使用实际提供的只读工具，不能改文件、跑命令、派活或询问用户。\n中途发现可用 bb_write(finding=...) 保存；完成后用 bb_write(result=完整结论, finish=true) 交回主 agent。\n没有文件写入能力，不要声称已落盘。汇报必须包含证据位置或来源，遇阻如实报告。\n大文件先搜索再按行读，不要整份读取。`
   const reportTool: AgentTool<any> = {
@@ -144,8 +151,9 @@ async function runOnce(ctx: CloneContext, callId: string, slot: number, task: st
     initialState: { systemPrompt: system, tools: [...readTools(ctx.tools), reportTool] },
     sessionId: run.runId,
     finishTurn: toFinishTurn(st => {
+      /* 结束条件只有两种事实：模型自己不再要工具（自然 stop），或汇报里 finish:true 交卷。
+         **没有轮数/步数上限** —— 分身读证据要用几轮就几轮，跑到完成；中途停下由取消（abort）负责。 */
       if (run.finalized) return true
-      if (++turns >= 30) { failure = '分身达到 30 次模型调用上限'; return true }
       return String(st.message?.stopReason || '') !== 'toolUse'
     }),
     beforeToolCall: async tool => {
@@ -207,11 +215,11 @@ async function runOnce(ctx: CloneContext, callId: string, slot: number, task: st
 export function buildCloneTools(ctx: CloneContext): AgentTool<any>[] {
   return [{
     name: 'spawn_clone', label: '派出分身',
-    description: `在当前用户轮内并行执行 2~${MAX_CLONES} 个互相独立的只读子任务。不是团队成员派活。工具会等待全部分身结束并直接返回结果，主 agent 随后在同一轮汇总，不收轮、不发回归通知。分身不能改文件或跑命令，任务单须写清目标、边界、证据要求。失败 1 个由主 agent 补做；失败至少 2 个由工具重派一次，仍失败由主 agent 处理。`,
-    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String({ description: '目标、边界与证据要求' }) }), { minItems: 2, maxItems: MAX_CLONES }) }),
+    description: `在当前用户轮内并行执行 1~${MAX_CLONES} 个互相独立的只读子任务。不是团队成员派活。工具会等全部分身结束，把每个分身的真实状态（完成/失败及原因）一次返回；主 agent 随后在同一轮汇总，不收轮、不发回归通知。每次调用对每个子任务**只执行一次**：失败的如实返回，工具不会自动重派。需要重派时，主 agent 收到结果后自己再发一次新的工具调用，可以只派失败的那一个（新调用=新 callId/新 runId，可区分）。分身不能改文件或跑命令，任务单须写清目标、边界、证据要求。模型层的瞬时重试（限流/断连）由传输层负责，与本工具无关。`,
+    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String({ description: '目标、边界与证据要求' }) }), { minItems: 1, maxItems: MAX_CLONES }) }),
     async execute(callId, params: { tasks: Array<{ task: string }> }, signal) {
       const tasks: Array<{ task: string }> = params.tasks
-      if (tasks.length < 2 || tasks.length > MAX_CLONES || tasks.some(t => !t.task.trim())) throw new Error(`分身必须是 2~${MAX_CLONES} 个非空只读任务`)
+      if (!tasks.length || tasks.length > MAX_CLONES || tasks.some(t => !t.task.trim())) throw new Error(`分身必须是 1~${MAX_CLONES} 个非空只读任务`)
       signal?.throwIfAborted()
       const used = slots.get(ctx.sessionId) || new Set<number>()
       const free = Array.from({ length: MAX_CLONES }, (_, i) => i + 1).filter(n => !used.has(n))
@@ -220,14 +228,8 @@ export function buildCloneTools(ctx: CloneContext): AgentTool<any>[] {
       own.forEach(n => used.add(n)); slots.set(ctx.sessionId, used)
       const batch: CloneRun[] = []
       try {
-        const result = await Promise.all(tasks.map((t, i) => runOnce(ctx, callId, own[i], t.task, 1, signal, batch)))
-        if (!signal?.aborted && !result.some(r => r.status === 'interrupted')) {
-          const retry = result.map((r, i) => r.status === 'error' && !/429|rate.?limit|速率|too many/i.test(r.error || '') ? i : -1).filter(i => i >= 0)
-          if (retry.length >= 2) {
-            const retried = await Promise.all(retry.map(i => runOnce(ctx, callId, own[i], tasks[i].task, 2, signal, batch)))
-            retried.forEach((r, i) => { result[retry[i]] = r })
-          }
-        }
+        /* 只跑一次：不在这里重派任何失败。真实状态原样回给主助手，重派由它的下一次显式调用决定。 */
+        const result = await Promise.all(tasks.map((t, i) => runOnce(ctx, callId, own[i], t.task, signal, batch)))
         const text = result.map(r => `[${r.memberName} #${r.memberId.slice(5)}] ${r.status}\n${r.error || ''}\n${r.text}`).join('\n\n')
         return { content: [{ type: 'text', text }], details: { spawned: tasks.length, completed: result.filter(r => r.status === 'done').length, aborted: result.some(r => r.status === 'interrupted') } }
       } finally {
