@@ -12,6 +12,8 @@ import { Type } from 'typebox'
 import type { AgentTool } from './agentCompat.ts'
 import { buildFamilyTool } from './familyTool.ts'
 import { DATA_ROOT, BACKEND_ROOT } from './paths.ts'
+/* ★1126：用户画像(USER.md)/项目记忆(MEMORY.md)——每轮注入的两份 Markdown，与 SQLite 记忆库的生命周期完全不同 */
+import { addEntry, patchEntry, removeEntry, readProfile, profileTitle, parseProfileLinks, type ProfileKind } from './memoryProfile.ts'
 
 /* ── 内核脚本路径（0917 支持 env 覆盖 / **0918 改为随应用自带**）──────
  * 背景（双版本隔离）：以前打包版（版本1）与开发版（版本2）都 spawn 网页版目录里那一份内核脚本
@@ -685,6 +687,38 @@ function buildMemoryStoreTool(): AgentTool<any> {
 }
 
 /** knowledge_query：检索本地知识库 */
+/** ★1126：知识检索范围（由 server.ts 按项目绑定注入）。
+ *  模型与 KnowledgeScopePicker 一致：cats=分组 id、entryIds=单条 id；allowExternal=false ⇒ 只能搜这些。 */
+let knowledgeScope: { cats: string[]; entryIds: string[]; allowExternal: boolean } | null = null
+export function setKnowledgeScope(v: { cats?: string[]; entryIds?: string[]; allowExternal: boolean } | null): void {
+  if (!v) { knowledgeScope = null; return }
+  const cats = Array.isArray(v.cats) ? v.cats.map(String) : []
+  const entryIds = Array.isArray(v.entryIds) ? v.entryIds.map(String) : []
+  knowledgeScope = (cats.length || entryIds.length) ? { cats, entryIds, allowExternal: !!v.allowExternal } : null
+}
+
+/** ★1126：范围内知识条目的 id 集合（120 秒缓存）。
+ *  为什么需要它：`knowledge_query` 的返回条目不带 parent_id，没法直接按分组过滤；
+ *  而 `knowledge_list` 带 parent_id —— 用它算一次 id 集合，再拿 id 去过滤 query 结果。 */
+let _allowedIdsCache: { key: string; at: number; ids: Set<string> } | null = null
+async function allowedEntryIds(cats: Set<string>, ids: Set<string>): Promise<Set<string>> {
+  const key = [...cats].sort().join(',') + '|' + [...ids].sort().join(',')
+  if (_allowedIdsCache && _allowedIdsCache.key === key && Date.now() - _allowedIdsCache.at < 120_000) return _allowedIdsCache.ids
+  const out = new Set<string>(ids)
+  try {
+    const r: any = await Promise.race([
+      memoryBridge.call('knowledge_list', { project_id: '' }),
+      new Promise((res) => setTimeout(() => res(null), 1500)),
+    ])
+    for (const e of (Array.isArray(r?.entries) ? r.entries : [])) {
+      const pid = String(e?.parent_id || '')
+      if (pid && cats.has(pid)) out.add(String(e.id))
+    }
+  } catch { /* 桥不可用就用传进来的 ids（至少单条绑定的能用） */ }
+  _allowedIdsCache = { key, at: Date.now(), ids: out }
+  return out
+}
+
 function buildKnowledgeQueryTool(projectId = ''): AgentTool<any> {
   return {
     name: 'knowledge_query',
@@ -699,18 +733,50 @@ function buildKnowledgeQueryTool(projectId = ''): AgentTool<any> {
     }),
     async execute(_callId, params: any) {
       // ★0930 知识库项目绑定：带 project_id → 内核只返回该项目归属的知识（空=全库可见）
+      /* ★1126：绑了分组又不允许搜外部时，**多取一些再过滤**（否则过滤完可能只剩 1 条） */
+      const restricted = !!(knowledgeScope && !knowledgeScope.allowExternal)
+      const want = Math.min(params.top_k || 5, 20)
+      /* ★1126：绑了范围就用**范围**判，不再叠加老的"归属制"过滤（那个按 project_id 改知识归属，会漏掉别的项目的知识）。
+         没绑范围才沿用旧口径（project_id 归属过滤）。 */
       const result = await memoryBridge.call('knowledge_query', {
         query: params.query,
-        top_k: Math.min(params.top_k || 5, 20),
-        project_id: projectId || '',
+        top_k: restricted ? Math.min(want * 4, 40) : want,
+        project_id: restricted ? '' : (projectId || ''),
       })
+      let entries: any[] = Array.isArray(result.entries) ? result.entries : []
+      let filteredOut = 0
+      if (restricted) {
+        const allowCats = new Set(knowledgeScope!.cats)
+        const allowIds = new Set(knowledgeScope!.entryIds)
+        /* ★1126 修（实测踩到）：`knowledge_query` 返回的条目**没有 parent_id**，
+           直接按 parent_id 过滤会把结果全滤光（AI 回复"正文取不到、被权限挡住"）。
+           正确做法：先用 knowledge_list 把「范围内条目」的 **id 集合**算出来，再按 id 过滤。
+           120 秒缓存，别每轮都拉全量。 */
+        const ids = await allowedEntryIds(allowCats, allowIds)
+        const before = entries.length
+        entries = entries.filter((e: any) => ids.has(String(e?.id || '')))
+        filteredOut = before - entries.length
+        if (filteredOut) {
+          try { console.log('[knowledge_query] 项目绑定限制：过滤掉 ' + filteredOut + ' 条不在绑定分组内的知识') } catch { /* ignore */ }
+        }
+        if (!entries.length && before > 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: '【范围内无结果】命中的 ' + before + ' 条都不在本项目绑定的知识分组里。\n'
+                + '本项目只允许检索绑定的分组；确实需要别的分组内容，请在「项目 → 知识库绑定」里勾选，或让用户确认。',
+            }],
+            details: { hit: false, count: 0, filteredOut },
+          }
+        }
+      }
       const cats = (result.categories || []) as Array<{ name?: string }>
       const catLine = cats.length
         ? '\n\n【现有分类】' + cats.map((c) => String(c?.name || '')).filter(Boolean).join(' / ')
         : '\n\n【现有分类】（还没有分类，可按需新建）'
       return {
-        content: [{ type: 'text', text: formatEntries(result.entries) + catLine }],
-        details: { hit: !!result.hit, count: result.entries?.length || 0, categories: cats.length },
+        content: [{ type: 'text', text: formatEntries(entries) + catLine }],
+        details: { hit: !!result.hit, count: entries.length, categories: cats.length, filteredOut },
       }
     },
   }
@@ -831,6 +897,104 @@ function buildKnowledgeDeleteTool(): AgentTool<any> {
   }
 }
 
+/** ★1126：画像/项目记忆的写入开关（由 server.ts 按人格设置注入；默认 false = 直接写）
+ *  true ⇒ 写入前先返回 needsConfirm，让模型用 ask_user 问一句，用户同意后再带 confirmed:true 重调。 */
+let profileWriteConfirm = false
+export function setProfileWriteConfirm(v: boolean): void { profileWriteConfirm = !!v }
+
+/** ★1126：编辑「用户画像」(USER.md ≤1400) / 「项目记忆」(MEMORY.md ≤2200)。
+ *  为什么单独一个动作：这两份是**每轮注入**的常驻内容，和 SQLite 记忆库完全不同的生命周期
+ *  （见 memoryProfile.ts 头注释）。超上限会报错、不自动压缩 —— 逼模型自己合并取舍。 */
+function buildProfileTool(): AgentTool<any> {
+  return {
+    name: 'profile_edit',
+    label: '画像/项目记忆',
+    description: '编辑「用户画像」(USER.md ≤1400 字) 或「项目记忆」(MEMORY.md ≤2200 字)——这两份**每轮都注入**，'
+      + '所以只放长期稳定的内容。'
+      + '【判据】用户表达**怎么跟我说话/他是谁** → target=user（分组：说话风格/喜欢/讨厌/协作/背景）；'
+      + '**环境事实或铁律**（工具路径、必须遵守的规矩）→ target=agent（分组：环境/铁律）；'
+      + '**具体技术教训/决策** → 走 memory(action=store)，别写这里。'
+      + '【超上限会报错】不自动压缩，要自己合并或删旧条目再写。',
+    parameters: Type.Object({
+      target: Type.String({ description: 'user=用户画像 / agent=项目记忆' }),
+      mode: Type.String({ description: 'add=追加一条 / patch=改一条（给 oldText）/ remove=删一条（给 oldText）/ read=看全文' }),
+      section: Type.Optional(Type.String({ description: '分组名（user: 说话风格/喜欢/讨厌/协作/背景；agent: 环境/铁律；也可自建新分组）' })),
+      content: Type.Optional(Type.String({ description: 'add/patch 的内容（一句话，简洁；不要写成长段落）' })),
+      oldText: Type.Optional(Type.String({ description: 'patch/remove 要匹配的旧条目片段（包含匹配即可）' })),
+      confirmed: Type.Optional(Type.Boolean({ description: '设了「记录前询问」时必须先问过用户，确认后带 true 重调' })),
+    }),
+    async execute(_c: string, params: any) {
+      const target = String(params?.target || '').trim() as ProfileKind
+      if (target !== 'user' && target !== 'agent') throw new Error('target 只能是 user 或 agent')
+      const mode = String(params?.mode || 'add').trim()
+      if (mode === 'read') {
+        const doc = readProfile(target)
+        return {
+          content: [{ type: 'text', text: `${profileTitle(target)}（${doc.chars}/${doc.limit} 字符）\n\n${doc.content}` }],
+          details: { ok: true, chars: doc.chars, limit: doc.limit },
+        }
+      }
+      const content = String(params?.content || '').trim()
+      const oldText = String(params?.oldText || '').trim()
+      /* 记录前询问（人格设置开关）：先不写，把要写的东西原样交回，让模型去 ask_user。 */
+      if (profileWriteConfirm && params?.confirmed !== true) {
+        const what = mode === 'remove' ? `删掉含「${oldText}」的条目` : `记下：${content || oldText}`
+        return {
+          content: [{
+            type: 'text',
+            text: `【需要用户确认】设置里开了「记录前询问」。请用 ask_user 问一句，例如：`
+              + `「要把它记进${profileTitle(target)}吗——${what}？」\n`
+              + `用户同意后，带上 confirmed:true 再调一次本工具即可写入；不同意就不写。`,
+          }],
+          details: { ok: false, needsConfirm: true, target, mode },
+        }
+      }
+      /* ★1126 关联**在写入时展开**（不是注入时）：
+         注入每轮都跑，桥一挂就展开失败（实测：memory_graph not ready → 裸 id 进了 prompt）；
+         写入是低频、失败还能报错给模型重试。所以在这里把 `→ mem_xxx` 换成摘要**存进 md**，
+         之后注入直接读文件、零依赖。查不到就明确报错（不吞、不留裸 id）。 */
+      let finalContent = content
+      const links = parseProfileLinks(content || oldText)
+      if (links.length && mode !== 'remove') {
+        try {
+          const g: any = await memoryBridge.call('memory_graph', { scope: 'all' })
+          const nodes: any[] = Array.isArray(g?.nodes) ? g.nodes : []
+          for (const l of links) {
+            const n = nodes.find((x: any) => String(x?.id) === l.memId)
+            if (!n) {
+              return {
+                content: [{ type: 'text', text: `【写入失败】关联的 ${l.memId} 在记忆库里查不到（可能已删）。\n请先 memory(action="search") 确认 id，或把箭头去掉只保留描述。` }],
+                details: { ok: false, error: 'link-not-found', memId: l.memId },
+              }
+            }
+            const sum = String(n?.summary || n?.content || '').replace(/\s+/g, ' ').trim().slice(0, 36)
+            finalContent = finalContent.split(l.raw).join(`→ ${l.memId.slice(-6)}「${sum}」`)
+          }
+        } catch (e: any) {
+          return {
+            content: [{ type: 'text', text: `【写入失败】展开关联失败（记忆桥不可用）：${String(e?.message || e).slice(0, 120)}\n先去掉「→ mem_xxx」再写，或稍后重试。` }],
+            details: { ok: false, error: 'bridge-unavailable' },
+          }
+        }
+      }
+      const r = mode === 'patch' ? patchEntry(target, oldText, finalContent)
+        : mode === 'remove' ? removeEntry(target, oldText)
+          : addEntry(target, String(params?.section || ''), finalContent)
+      if (!r.ok) return { content: [{ type: 'text', text: `【写入失败】${r.error}` }], details: { ok: false, error: r.error } }
+      const doc = readProfile(target)
+      return {
+        content: [{
+          type: 'text',
+          text: `已写入${profileTitle(target)}（${r.action}，分组「${r.section || '-'}」）——现 ${doc.chars}/${doc.limit} 字符`
+            + (doc.nearFull ? '\n⚠ 已接近上限：下次写入前请先合并或删掉旧条目。' : '')
+            + `\n（下一轮生效：本轮的注入块是会话开始时的快照。）`,
+        }],
+        details: { ok: true, action: r.action, chars: doc.chars, limit: doc.limit, nearFull: doc.nearFull },
+      }
+    },
+  }
+}
+
 /** 记忆/知识库工具集（随 Agent 会话挂载）—— ★ 0929 刀①：7 个合并成 memory(4 动作) + knowledge(3 动作) */
 export function buildMemoryTools(opts?: { projectId?: string }): AgentTool<any>[] {
   /* ★0930（知识库项目绑定·客服铺垫）：projectId=会话所属项目 —— knowledge_query/add 只读/落入
@@ -844,6 +1008,7 @@ export function buildMemoryTools(opts?: { projectId?: string }): AgentTool<any>[
     buildKnowledgeAddTool(pid),    // 4
     buildKnowledgeDeleteTool(),    // 5
     buildMemoryDistillTool(),      // 6
+    buildProfileTool(),            // 7 ★1126：画像/项目记忆编辑（每轮注入的两份 md）
   ] as any[]
   return [
     buildFamilyTool({
@@ -854,6 +1019,11 @@ export function buildMemoryTools(opts?: { projectId?: string }): AgentTool<any>[
       tab: 'special',
       fullMemberDescriptions: false,
       description: '记忆工具箱（四动作）：长期记忆（用户偏好/决策/教训/项目进度）。'
+        + '【★三个去处，先判这个再动手】'
+        + '① 用户说"**以后跟我说话…/别整术语/先给结论**"这类**沟通方式** → **必须用 profile(target="user")**，不要丢进 store；'
+        + '② 用户说"**这台机器/这个环境的固定事实或规矩**"（工具路径、版本、端口、必须遵守的硬规矩） → **profile(target="agent")**；'
+        + '③ 其他**具体技术教训/决策/事实/进度**（踩的坑、拍板的方案、调研结论） → store。'
+        + '⚠️ 库存 90% 的内容走 store；profile 只放"最稳、每轮都该知道"的少数几条（有硬字符上限）。'
         + '【分清】记忆 = 该记住的长期信息；知识库 = 资料收藏（knowledge 工具）；便签 = 用户要办的事（notebook 工具）。\n'
         + '· search：检索（query=关键词或语义描述；top_k 默认 5 最多 20；detail=true 才给全文，默认摘要+节选）。'
         + '【主动读纪律★0930】用户提到/询问偏好、历史决定、项目进度、教训、"上次/之前/还记得"类问题，或第一次接手某项目/任务——**先 search 再回答**，别等用户点名。'
@@ -864,15 +1034,21 @@ export function buildMemoryTools(opts?: { projectId?: string }): AgentTool<any>[
         + 'decision=重要决定、lesson=踩过的坑/教训、pattern=可复用做法/规律、fact=项目事实与进度、profile=用户是谁（称呼/长期画像）；'
         + 'summary=一句话摘要（≤60 字，进检索索引层；不填取首句）；'
         + 'importance=重要度 0~1（不填按类型给保底）：0.9 铁律/否决 0.8 已定决策/画像 0.7 偏好 0.6 教训/做法 0.4 能查到的事实。'
-        + '只在用户明确表达、被纠正/踩坑或你确认重要时调用。\n'
+        + '只在用户明确表达、被纠正/踩坑或你确认重要时调用。'
+        + '⚠️ **例外**：如果这话是"以后跟我说话白话点/别这么啰嗦/先给结论"这类**沟通风格**，'
+        + '或者"这台机器 Node 在哪个路径/端口是多少"这类**环境固定事实**，请改用 `profile` 动作，别存进库。\n'
         + '· delete：id 精确删（hard=true 物理删，缺省=软删）或 query 按内容删匹配。\n'
         + '· distill：同主题散碎记忆合并成主题记忆草案（进待确认）——记忆条目多而碎时用；少或没同主题就不用调。\n'
+        + '· profile：改「用户画像 USER.md（≤1400 字）」或「项目记忆 MEMORY.md（≤2200 字）」——这两份**每轮注入**。'
+        + '判据：**怎么跟我说话/他是谁** → target=user；**环境事实或铁律** → target=agent；**具体技术教训/决策** → 走 store。'
+        + 'mode=add/patch/remove/read；超上限会报错（不自动压缩，要自己合并）。\n'
         + memoryLocationHint(),
       members: [
         { action: 'search', tool: subs[0], required: ['query'], summary: '检索长期记忆（偏好/决策/教训/进度）' },
         { action: 'store', tool: subs[1], required: ['content'], summary: '写入一条长期记忆（必须归 category）' },
         { action: 'delete', tool: subs[2], summary: '删除记忆（id 精确删或 query 匹配删）' },
         { action: 'distill', tool: subs[6], summary: '蒸馏：同主题散碎记忆合并成草案（进待确认）' },
+        { action: 'profile', tool: subs[7], required: ['target', 'mode'], summary: '★说话方式/环境固定事实走这里（user=画像 / agent=项目记忆；每轮注入）' },
       ],
     }),
     buildFamilyTool({

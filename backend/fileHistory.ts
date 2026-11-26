@@ -405,6 +405,88 @@ export function diffStat(before: Buffer | null, after: Buffer | null): { diffAdd
   return { diffAdded: m - lcs, diffRemoved: n - lcs }
 }
 
+/** ★1127e：**生成可读的 unified diff 文本**（工作区"看这轮改了什么"用）。
+ *  和 `diffStat` 的区别：那个只算行数，这个要给出**逐行对齐**的内容（前端 DiffBlock 直接渲染）。
+ *  口径：
+ *   · 行数超限（默认 1200 行）返回 `null` —— 前端显示"文件过大，只看行数"，绝不截断成半份 diff 骗人；
+ *   · 只保留变更行前后 `ctx` 行的上下文（默认 3），和 git 的 hunk 口径一致；
+ *   · CRLF/LF 统一按行拆，输出一律 `\n`（DiffBlock 按行渲染，不关心原文件行尾）。 */
+export function unifiedDiff(before: string, after: string, opts?: { ctx?: number; maxLines?: number }): string | null {
+  /* ⚠️ 别用 `Number(x) ?? 默认值`：`Number(undefined)` 是 NaN，`??` 拦不住 NaN
+     （自检当场踩到：ctx=NaN ⇒ keep 全 false ⇒ 永远吐空 diff）。 */
+  const ctxRaw = Number(opts?.ctx)
+  const ctx = Number.isFinite(ctxRaw) ? Math.max(0, ctxRaw) : 3
+  const maxRaw = Number(opts?.maxLines)
+  const maxLines = Number.isFinite(maxRaw) ? Math.max(50, maxRaw) : 200_000
+  /* 空内容 = **0 行**（不是 1 个空行）。否则"新建空文件/文件被清空"会多出一条无意义的 `-` 行。 */
+  const splitLines = (s: string): string[] => (s === '' ? [] : s.split(/\r\n|\r|\n/))
+  const A = splitLines(String(before ?? ''))
+  const B = splitLines(String(after ?? ''))
+  const n = A.length, m = B.length
+  /* ⚠️ 总行数只做一个"防内存炸"的硬上限（20 万行），**不能**拿它当"文件太大就不给看"的判据：
+     老板实测 server.ts 3.3 万行、只改 75 行 —— 上一版因为这个检查在**剥前后缀之前**，
+     大文件直接死在门口（截图就是它）。真正的判据是下面的"中间段面积"。 */
+  if (n > maxLines || m > maxLines) return null
+  /* ★1127e-2：**先剥公共前缀/后缀**（git 的标准优化）。
+     实测必要性：streamTurns.ts 1175 行、只改 37 行，全量 DP 是 1175×1212×4B ≈ 5.7MB；
+     剥完只剩中间几十行，内存和耗时都掉两个数量级 ⇒ 大文件也能出 diff，不必设成"超 1200 行就不给看"。 */
+  let pre = 0
+  while (pre < n && pre < m && A[pre] === B[pre]) pre++
+  let suf = 0
+  while (suf < n - pre && suf < m - pre && A[n - 1 - suf] === B[m - 1 - suf]) suf++
+  const a2 = A.slice(pre, n - suf)
+  const b2 = B.slice(pre, m - suf)
+  const n2 = a2.length, m2 = b2.length
+  if (n2 * m2 > 16_000_000) return null          // 中间段也爆炸（整文件重写）⇒ 如实回 null，别卡死后端
+  /* 只对中间段做 DP（要回溯路径，滚动数组不够） */
+  const w = m2 + 1
+  const dp = new Uint32Array((n2 + 1) * w)
+  for (let i = n2 - 1; i >= 0; i--) {
+    for (let j = m2 - 1; j >= 0; j--) {
+      dp[i * w + j] = a2[i] === b2[j]
+        ? dp[(i + 1) * w + (j + 1)] + 1
+        : Math.max(dp[(i + 1) * w + j], dp[i * w + (j + 1)])
+    }
+  }
+  const mid: Array<{ t: ' ' | '-' | '+'; s: string }> = []
+  let i = 0, j = 0
+  while (i < n2 && j < m2) {
+    if (a2[i] === b2[j]) { mid.push({ t: ' ', s: a2[i] }); i++; j++ }
+    else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) { mid.push({ t: '-', s: a2[i] }); i++ }
+    else { mid.push({ t: '+', s: b2[j] }); j++ }
+  }
+  while (i < n2) mid.push({ t: '-', s: a2[i++] })
+  while (j < m2) mid.push({ t: '+', s: b2[j++] })
+  /* 剥掉的前后缀要**按 ctx 补回来当上下文行**，否则 hunk 头上方/下方一行上下文都没有 */
+  const headCtx = A.slice(Math.max(0, pre - ctx), pre).map((s) => ({ t: ' ' as const, s }))
+  const tailCtx = A.slice(n - suf, Math.min(n, n - suf + ctx)).map((s) => ({ t: ' ' as const, s }))
+  const ops = [...headCtx, ...mid, ...tailCtx]
+  const baseOld = pre - headCtx.length
+  /* 只留变更附近 ctx 行：先标记要留的区间，再拼 hunk 头 */
+  const keep = new Array(ops.length).fill(false)
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].t === ' ') continue
+    for (let d = Math.max(0, k - ctx); d <= Math.min(ops.length - 1, k + ctx); d++) keep[d] = true
+  }
+  const lines: string[] = []
+  let k = 0
+  while (k < ops.length) {
+    if (!keep[k]) { k++; continue }
+    /* 一个 hunk：连续保留区 */
+    let end = k
+    while (end + 1 < ops.length && keep[end + 1]) end++
+    /* 数一下 hunk 里的旧/新行号（给 @@ 头用；`baseOld` 是剥掉的前缀偏移，别漏） */
+    let oldStart = baseOld + 1, newStart = baseOld + 1
+    for (let q = 0; q < k; q++) { if (ops[q].t !== '+') oldStart++; if (ops[q].t !== '-') newStart++ }
+    let oldCount = 0, newCount = 0
+    for (let q = k; q <= end; q++) { if (ops[q].t !== '+') oldCount++; if (ops[q].t !== '-') newCount++ }
+    lines.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`)
+    for (let q = k; q <= end; q++) lines.push(ops[q].t + ops[q].s)
+    k = end + 1
+  }
+  return lines.length ? lines.join('\n') : ''
+}
+
 /** 精确快照：写/删/改名前调用。返回 changeId（异常静默——快照失败不阻塞业务） */
 export function snapshotFile(opts: {
   workDir: string

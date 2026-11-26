@@ -165,7 +165,7 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
   },
   // ── 团队指挥官（内置第 5 预设：团队模式的主 agent；团队工具仅团队会话运行时挂载） ──
   {
-    id: 'team-lead', name: '团队指挥官', version: 30,   // ★h2x：role 追加「验收与编排纪律」（需求：团队纪律改到指挥官预设里）。bump 否则存量 preset.json 不刷新。前史 ★m1x：+ check_run（验收可真跑，仍禁 fs_write/fs_edit/run_command）；★1036-S3 补 sub_read
+    id: 'team-lead', name: '团队指挥官', version: 31,   // ★1126：移除 check_run（v30→31 触发存量 preset.json 刷新）。前史 ★h2x：role 追加「验收与编排纪律」；★m1x：+ check_run；★1036-S3 补 sub_read
 
     description: '团队模式主 agent：拆解任务、派发成员、追踪进度、审核产出、汇总答复。不亲自干活。',
     role: `职责：编排团队完成任务，不亲自执行成员职责内的工作。
@@ -174,9 +174,8 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
 - 任务不涉及工作区文件（咨询/问答）→ 直接回答，不进编排流程
 - **任何要动工作区文件的活（哪怕只改一个词/一处样式、哪怕只是新建一个空文件）→ 一律派给成员**。
   你没有 fs_write / fs_edit / run_command（这是硬约束，不是建议）。
-  ⚠️ **check_run 只用于验收**（跑测试/类型检查/构建，只拿退出码）：**绝不许**拿它当干活手段
-  （例如 \`cmd /c echo x> file\`、\`git commit\`、\`npm install\`）—— 那等于你自己干了活、又绕过了团队的验收与账本，
-  用户开团队模式就是为了让成员干这些。想改文件却改不了，正确的做法是**派给成员**，不是找后门。
+  ⚠️ **你没有验收命令工具**（check_run 已于 1126 从指挥官预设移除）：验收由「成员交回的判据+证据」和后端
+  自动验收承担，你只负责核对，不要试图自己跑命令（跑不了）。想改文件却改不了，正确的做法是**派给成员**，不是找后门。
   只有一种例外：**你只是读/排查**（读代码、搜符号、看历史、回答技术问题、给方案建议）→ 自己用只读工具做，
   别为读一个文件去派活。
 
@@ -245,7 +244,7 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
     tools: ['fs_read', 'fs_grep', 'list_dir', 'repo', 'memory', 'knowledge', 'notebook', 'plan_write', 'ask_user', 'use_skill', 'spawn_clone',
       'team_dispatch', 'member_tell', 'member_new_session', 'bb_goal', 'bb_write', 'bb_read', 'team_info', 'sub_read',
       'web_search', 'web_fetch', 'github_search',
-      'check_run', 'image', 'video'],   // 共 25 个（+ 生成图片/视频）（内置 11 + 团队 8 + 联网 3 + 验收 1）   // ★1036-S2（需求「指挥官彻底不自己干活」）：删 run_command / fs_write / git（能改能提交）；再删 history（它的 restore 能回滚文件=写操作）；保留 spawn_clone（分身是只读调研员，属于"读"）
+      'image', 'video'],   // 共 24 个（★1126 移除 check_run：指挥官的验收改由"成员交判据+证据"与后端自动验收承担；工具本体仍保留给计划卡验收 maybeAutoVerify）
     toolsets: [],
     builtin: true, createdAt: 0,
   },

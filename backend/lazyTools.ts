@@ -43,12 +43,14 @@ export const LAZY_FAMILIES: Record<string, { label: string; match: (name: string
     match: (n) => /^mcp__nis-browser__wb_/.test(n),
     hint: '打开网页/点击/填表单/读页面 等【内置浏览器】操作（真实浏览器，用户可见；不是用户的 Chrome/系统外部浏览器）。截图见 screenshot 包',
   },
-  /* 系统管理（13 件，三处来源：安装助手 6 + 预设管理 4 + 自定义工具 3）：改的是 NiusDream 自身配置，
-     只在"装东西 / 造预设 / 造工具"场景用，普通干活轮次里 100% 不会被调。 */
+  /* 系统管理（14 件，三处来源：安装助手 6 + 预设管理 4 + 自定义工具 3 + 改全局设置 1）：改的是 NiusDream 自身配置，
+     只在"装东西 / 造预设 / 造工具 / 改我自己叫什么"场景用，普通干活轮次里 100% 不会被调。
+     ★1126：settings_update 并入本包（原来常驻）—— 它改的正是"本产品自身配置"，与 admin 包的语义完全同一，
+       不必为它单开一个只有 1 件的包（那会多占一行能力包目录）；零调用记录（"以后叫我X"这种一年几次）。 */
   admin: {
     label: '系统管理能力包',
-    match: (n) => /^(list_installed|install_skill|uninstall_skill|scan_skill|install_mcp|uninstall_mcp|list_tools|read_preset|save_preset|delete_preset|list_custom_tools|save_custom_tool|delete_custom_tool)$/.test(n),
-    hint: '装/卸技能与 MCP、扫描已装、预设增删改查、自定义工具增删查 等 13 件系统管理操作',
+    match: (n) => /^(list_installed|install_skill|uninstall_skill|scan_skill|install_mcp|uninstall_mcp|list_tools|read_preset|save_preset|delete_preset|list_custom_tools|save_custom_tool|delete_custom_tool|settings_update)$/.test(n),
+    hint: '装/卸技能与 MCP、扫描已装、预设增删改查、自定义工具增删查、改全局设置（用户名/AI 名/性格）等 14 件',
   },
   /* 团队成员管理（5 件；⚠️ bb_* 黑板工具**不在包内**，团队协作要常驻）。 */
   member: {
@@ -61,6 +63,26 @@ export const LAZY_FAMILIES: Record<string, { label: string; match: (name: string
     label: '知识库能力包',
     match: (n) => /^knowledge(_query|_add|_delete)?$/.test(n),
     hint: '资料收藏（与"记忆=长期偏好/教训"分开）：query 查 / add 添 / delete 删 —— 1 件家族工具，action 切换',
+  },
+  /* 媒体生成（1126）：image（生图/图生图）+ video（文生/图生视频）—— 2 件，2,169 字符 ≈ 900 token。
+     ★为什么现在才进懒包：1126 加 image 时家族里只有 1 件，`shouldMountLoader` 要求"能藏 ≥2 件才值得"
+       （藏 1 件却多挂加载器 = 净亏），当时 server.ts 明确留了"等 video 加进来变 2 件，再一起进懒包"。
+       现在 video 已加入（0c4f8be），条件成立。
+     为什么可以懒：两件都属于"用户不明确要图/视频就不会调"的低频工具，常驻在每份请求里只占成本不产生调用。
+     ⚠️ 顺序无忧：本包 match 是精确名（image/video），与上面 mcp__/家族名的前缀匹配都不冲突。 */
+  media: {
+    label: '媒体生成能力包',
+    match: (n) => /^(image|video)$/.test(n),
+    hint: '生成图片（文生图/图生图）与生成视频（文生视频/图生视频，提交即返回跑后台）—— 2 件',
+  },
+  /* 定时任务（1126）：schedule 家族（create/list/update/remove/run_now/result 六动作，2,473 字符）。
+     老板实测判断：用得少（1126 统计全库 11-01 起仅数次手动使用），而它在每份请求里占 8% 工具表。
+     与 media 同理：工具照旧挂载，未加载时不发说明书；说"每天提醒我/每周跑一次"时模型从目录行
+     看到本包 ⇒ 先 load_tools('schedule') 再建。 */
+  schedule: {
+    label: '定时任务能力包',
+    match: (n) => /^schedule$/.test(n),
+    hint: '建/改/查/停定时任务与值守任务（每天几点、每小时、每周几；可绑当前对话）—— 1 件家族工具，action 切换',
   },
 }
 

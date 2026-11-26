@@ -2035,52 +2035,139 @@ export function buildImageTool(opts: {
   }
 }
 
+/** ★1126：目录是否"像代码仓库"——防把聊天数据目录当项目索引。
+    实测（老板实拍）：会话工作区是 `NisData/chat_xxx`，repo 照样拿它建索引，
+    模型搜完只能得出"结果明显是工作区里的临时副本，不是真正的项目源码，该在 D:\nis0924"——白跑一趟还误导。
+    ⚠️ 判据不能只数代码文件：聊天目录里躺着 4,000+ 个历史探针脚本（实测 4,115 个 .ts/.mjs），数得比真项目还多。
+    所以判据是 **有 .git 才算项目根**；非 git 目录必须由调用方**显式传 path** 才允许索引（人明确了才做）。 */
+function looksLikeCodeDir(dir: string, explicitPath = false): { ok: boolean; codeFiles: number; hasGit: boolean; reason?: string } {
+  /* ★1126 第 0 条（最关键）：**NIS 自己的聊天工作区**（`…/NisData/chat_xxx`）一律不算项目根。
+     为什么单列这一条：这些目录里**也有 .git** —— NIS 的文件历史（fileHistory）会给每个会话工作区建快照仓库，
+     所以"有 .git 就是项目"在这里会判错（实测：chat 目录被当成仓库索引了 4,115 个历史探针脚本）。
+     老板拍的就是这个现象。用户真要索引它，显式传 path 即可（下面 explicitPath 放行）。 */
+  if (!explicitPath && /[\\/]NisData[\\/][^\\/]+[\\/]?$/i.test(String(dir))) {
+    return { ok: false, codeFiles: 0, hasGit: true, reason: 'nis-chat-workspace' }
+  }
+  try { if (fs.existsSync(path.join(dir, '.git'))) return { ok: true, codeFiles: -1, hasGit: true } } catch { /* ignore */ }
+  const CODE = new Set(['.ts', '.js', '.mjs', '.cjs', '.tsx', '.jsx', '.vue', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.rb', '.php', '.swift', '.c', '.h', '.cpp'])
+  let codeFiles = 0
+  const t0 = Date.now()
+  const stack: Array<[string, number]> = [[dir, 0]]
+  while (stack.length && codeFiles < 50 && Date.now() - t0 < 400) {
+    const [cur, depth] = stack.pop()!
+    let ents: fs.Dirent[]
+    try { ents = fs.readdirSync(cur, { withFileTypes: true }) } catch { continue }
+    for (const e of ents) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue
+      const abs = path.join(cur, e.name)
+      if (e.isDirectory()) { if (depth < 2) stack.push([abs, depth + 1]); continue }
+      if (CODE.has(path.extname(e.name).toLowerCase())) codeFiles++
+    }
+  }
+  if (explicitPath) return { ok: true, codeFiles, hasGit: false, reason: 'explicit-non-git' }
+  return { ok: false, codeFiles, hasGit: false, reason: 'non-git-without-path' }
+}
+
 export function buildRepoTools(cwd: string): AgentTool<any>[] {
   const subs: any[] = [
     {
       name: 'repo_map', label: '仓库地图',
-      description: '仓库结构概览：目录树（深度 2）+ 文件数/大小 + 语言分布。进大仓库先看地图，比逐个翻目录快。',
-      parameters: Type.Object({}),
-      async execute() {
-        return { content: [{ type: 'text', text: repoMap(cwd) }], details: { ok: true } }
+      description: '仓库结构概览：目录树（深度 2）+ 文件数/大小 + 语言分布。进大仓库先看地图，比逐个翻目录快。'
+        + '默认看**当前会话工作区**；源码在别处（例如工作区是聊天数据目录、代码在别的盘）时用 path 指定。',
+      parameters: Type.Object({
+        path: Type.Optional(Type.String({ description: '要看的目录（绝对路径或相对会话工作区）；不传=会话工作区' })),
+      }),
+      async execute(_c: string, params: any) {
+        const target = params?.path ? resolvePath(cwd, String(params.path)) : cwd
+        const probe = looksLikeCodeDir(target, !!params?.path)
+        if (!probe.ok) {
+          return { content: [{ type: 'text', text: `⚠ 「${target}」不是 git 仓库，按"项目根"判不了（2 层内有 ${probe.codeFiles} 个代码文件——聊天目录里常有一堆历史探针脚本，数它没用）。\n若确定要索引这个目录，请显式传 path（例如 path="${target}"）；源码在别处请直接指过去（例如 path="D:/nis0924"）。` }], details: { ok: false, reason: probe.reason, target } }
+        }
+        return { content: [{ type: 'text', text: repoMap(target) }], details: { ok: true } }
       },
     },
     {
       name: 'repo_search', label: '代码语义搜索',
       description: '按**符号/概念**找代码位置（"用户校验在哪个文件""调度器的实现"这类问题）——比 fs_grep 撞字面聪明：'
-        + '符号名/路径词加权打分，返回 文件:定义行 + 上下文。没有索引会自动建（首次稍慢）。找具体文本内容请用 fs_grep。',
+        + '符号名/路径词加权打分，返回 文件:定义行 + 上下文。没有索引会自动建（首次稍慢）。找具体文本内容请用 fs_grep。'
+        + '默认搜**当前会话工作区**；源码在别处（工作区是聊天数据目录等）时用 path 指定源码根，例如 path="D:/nis0924"。',
       parameters: Type.Object({
         query: Type.String({ description: '符号名或概念词（如 loadSessions、定时任务、用户校验）' }),
         limit: Type.Optional(Type.Number({ description: '最多返回多少个文件（默认 15）' })),
+        path: Type.Optional(Type.String({ description: '要搜的目录（绝对路径或相对会话工作区）；不传=会话工作区' })),
       }),
       async execute(_c: string, params: any) {
-        let idx = loadIndex(cwd)
-        if (!idx) idx = buildIndex(cwd)
-        const theIdx = idx
         const q = String(params?.query || '').trim()
         if (!q) throw new Error('query 不能为空')
-        const rows = searchIndex(idx, cwd, q, Math.min(50, Number(params?.limit) || 15))
-        /* ★1010：索引新鲜度校验 —— 命中的文件若有比索引更新的（内容改过），必须明说"可能陈旧"。
-           此前索引一旦落盘就被无条件信任（本工作区那份索引实测是 10 天前建的），搜出来是旧代码却无人知。 */
-        const stale = rows.filter(r => { try { return fs.statSync(path.join(cwd, r.rel)).mtimeMs > theIdx.builtAt } catch { return false } })
-        const ageMs = Date.now() - theIdx.builtAt
-        const age = ageMs < 3600000 ? `${Math.max(1, Math.round(ageMs / 60000))} 分钟` : ageMs < 48 * 3600000 ? `${(ageMs / 3600000).toFixed(1)} 小时` : `${Math.round(ageMs / 86400000)} 天`
-        /* ★1010c：警告改成**前置**（原先跟在结果末尾，容易被"扫一眼就走"的读法忽略） */
-        const warn = stale.length
-          ? `⚠ 索引可能陈旧（建于 ${age}前）：${stale.slice(0, 3).map(r => r.rel).join('、')}${stale.length > 3 ? ` 等 ${stale.length} 个文件` : ''} 在索引之后改过 —— 要最新结果请调 repo(action="build") 重建。\n`
-          : ''
-        if (!rows.length) return { content: [{ type: 'text', text: `${warn}（没找到与「${q}」相关的符号/概念；换个说法或用 fs_grep 撞字面。索引建于 ${age}前｜${Object.keys(theIdx.files).length} 个文件）` }], details: { count: 0 } }
+        const target = params?.path ? resolvePath(cwd, String(params.path)) : cwd
+        /* ★1126：**先判这是不是代码目录**（老板实拍踩到）——聊天数据目录里只有 md/json，
+           拿它建索引会让模型得出"结果明显是临时副本，不是真正的项目源码"，白跑还误导。
+           不是代码目录就直说，并告诉它该用 path 指哪。 */
+        const probe = looksLikeCodeDir(target, !!params?.path)
+        if (!probe.ok) {
+          return {
+            content: [{
+              type: 'text',
+              text: `⚠ 「${target}」不是 git 仓库，没法确认它是项目根（2 层内有 ${probe.codeFiles} 个代码文件——聊天目录里常躺着几千个历史探针脚本，靠数文件判不出来）。\n`
+                + `当前会话工作区 = ${cwd}\n`
+                + `如果项目源码在别处，请用 path 指定，例如：repo(action="search", query="${q}", path="D:/nis0924")。\n`
+                + `（在这个目录硬建索引只会索引到聊天存档和临时脚本，搜不出真正的代码位置。）`,
+            }],
+            details: { ok: false, reason: probe.reason || 'not-a-code-dir', target, codeFiles: probe.codeFiles },
+          }
+        }
+        /* ★1126：新鲜度判据换成**源指纹**（git HEAD+未提交改动 / 目录 mtime），并且
+           stale 就**当场重建**——旧版只比对"命中结果里那几个文件"的 mtime、还只警告不重建，
+           等于把"要不要用旧数据"丢给模型自觉（实测：索引 58 天没动，搜出来全是过期位置）。
+           现在：指纹不一致 ⇒ 这份索引不可信 ⇒ 重建后再答，不存在"边警告边用旧数据"。 */
+        const t0 = Date.now()
+        let loaded = loadIndex(target)
+        const checkedMs = loaded?.checkedMs ?? 0
+        let rebuiltMs = 0
+        if (!loaded || loaded.stale) {
+          /* ★1126：把旧索引传进去做**增量**（mtime 没变的文件直接复用）—— 首次全量约 20s，
+             之后每次重建只重算改动文件（毫秒级）。 */
+          const rb = buildIndex(target, loaded?.idx)
+          rebuiltMs = Date.now() - t0
+          loaded = { idx: rb, stale: false, checkedMs }
+        }
+        const theIdx = loaded.idx
+        const rows = searchIndex(theIdx, target, q, Math.min(50, Number(params?.limit) || 15))
+        const fileCount = Object.keys(theIdx.files).length
+        let head = ''
+        if (rebuiltMs) head += `（索引已重建：${rebuiltMs}ms ｜ ${fileCount} 个文件）\n`
+        /* truncated：预算不够没扫全 —— 必须让模型知道"搜不到 ≠ 不存在"，这是同一类坑 */
+        if (theIdx.truncated) head += `⚠ 索引只覆盖了 ${fileCount} 个文件就触到预算上限（没扫全）：搜不到**不代表不存在**，请改用 fs_grep 或先缩小到具体目录。\n`
+        if (!rows.length) {
+          return {
+            content: [{ type: 'text', text: `${head}（没找到与「${q}」相关的符号/概念；换个说法或用 fs_grep 撞字面。已索引 ${fileCount} 个文件）` }],
+            details: { count: 0, indexed: fileCount, truncated: !!theIdx.truncated, rebuiltMs, checkedMs },
+          }
+        }
         const lines = rows.map(r => `▸ ${r.rel}${r.line ? `:${r.line}` : ''}（${r.score.toFixed(1)}分｜${r.hits.join('、')}）${r.context ? `\n    ${r.context.split('\n')[0].trim().slice(0, 120)}` : ''}`)
-        return { content: [{ type: 'text', text: `${warn}「${q}」相关位置（${rows.length} 处）：\n${lines.join('\n')}\n（索引建于 ${age}前｜${Object.keys(theIdx.files).length} 个文件）` }], details: { count: rows.length, indexed: Object.keys(theIdx.files).length, stale: stale.length } }
+        return {
+          content: [{ type: 'text', text: `${head}「${q}」相关位置（${rows.length} 处）：\n${lines.join('\n')}\n（索引 ${fileCount} 个文件｜校验 ${checkedMs}ms${rebuiltMs ? `｜重建 ${rebuiltMs}ms` : ''}）` }],
+          details: { count: rows.length, indexed: fileCount, truncated: !!theIdx.truncated, rebuiltMs, checkedMs },
+        }
       },
     },
     {
       name: 'repo_build', label: '重建代码索引',
-      description: '建/刷新代码索引（repo_search 的数据源）。大仓库改动很多后手动刷一次；平时 search 会自动建/沿用。',
-      parameters: Type.Object({}),
-      async execute() {
-        const idx = buildIndex(cwd)
-        return { content: [{ type: 'text', text: `索引已重建：${Object.keys(idx.files).length} 个文件${idx.truncated ? '（触到预算上限，已截断）' : ''}` }], details: { ok: true, files: Object.keys(idx.files).length } }
+      description: '建/刷新代码索引（repo_search 的数据源）。大仓库改动很多后手动刷一次；平时 search 会自动建/沿用。'
+        + '默认刷**当前会话工作区**；源码在别处时用 path 指定。',
+      parameters: Type.Object({
+        path: Type.Optional(Type.String({ description: '要建索引的目录（绝对路径或相对会话工作区）；不传=会话工作区' })),
+      }),
+      async execute(_c: string, params: any) {
+        const target = params?.path ? resolvePath(cwd, String(params.path)) : cwd
+        const probe = looksLikeCodeDir(target, !!params?.path)
+        if (!probe.ok) {
+          return { content: [{ type: 'text', text: `⚠ 「${target}」不是 git 仓库，没法确认是项目根，未建索引。\n源码在别处请用 path 指定（例如 path="D:/nis0924"）；确定要索引本目录请显式传 path="${target}"。` }], details: { ok: false, reason: probe.reason, target } }
+        }
+        /* ★1126：手动重建也走增量（复用没变的文件）—— 否则大仓库每次点一下都要跑满 20 秒 */
+        const cur = loadIndex(target)
+        const idx = buildIndex(target, cur?.idx)
+        return { content: [{ type: 'text', text: `索引已重建（${target}）：${Object.keys(idx.files).length} 个文件${idx.truncated ? '（触到预算上限，已截断）' : ''}` }], details: { ok: true, files: Object.keys(idx.files).length } }
       },
     },
   ]
@@ -2093,7 +2180,8 @@ export function buildRepoTools(cwd: string): AgentTool<any>[] {
     fullMemberDescriptions: false,
     description: '仓库导航工具箱（三动作）：进陌生/大型代码库先用它建立全局观。'
       + '· map：结构概览（目录树+规模+语言分布）。· search：按符号/概念找代码位置（打分排序，带定义行上下文；索引自动建，首次稍慢）。'
-      + '· build：重建索引（大改动后手动刷）。定位：repo 找"东西在哪"，fs_grep 找"文本在哪"，两者互补不重复。',
+      + '· build：重建索引（大改动后手动刷）。定位：repo 找"东西在哪"，fs_grep 找"文本在哪"，两者互补不重复。'
+      + '⚠️ 三者默认都作用于**当前会话工作区**；若工作区是聊天数据目录而源码在别处（如 D:/nis0924），必须传 path 指定源码根，否则只会索引到聊天存档。',
     members: [
       { action: 'map', tool: subs[0], summary: '仓库结构概览（目录树/规模/语言）' },
       { action: 'search', tool: subs[1], required: ['query'], summary: '按符号/概念找代码位置' },

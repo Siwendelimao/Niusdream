@@ -34,6 +34,12 @@ interface ProjectRecord {
   updatedAt: number
   members: any[]
   pinned?: boolean
+  /** ★1126：知识库绑定 —— 与既有 `KnowledgeScopePicker` 同一套模型：
+   *  `cats`=分组(folder) id、`entryIds`=单条 id；两者都空 = 不限（全库可见）。
+   *  `allowExternal=false` 且选了范围 ⇒ AI 只能搜这些；true ⇒ 可搜全库。 */
+  knowledgeBindings?: { cats: string[]; entryIds: string[]; allowExternal: boolean }
+  /** ★1126：回答强度。strict=必须引用、查不到就拒答转人工；prefer=有资料就引没有正常答（**默认**）；free=不注入知识 */
+  answerPolicy?: 'strict' | 'prefer' | 'free'
 }
 
 interface StoreShape { version: number; projects: ProjectRecord[] }
@@ -136,7 +142,7 @@ export function createProject(input: { name: string; root_path: string; descript
 }
 
 /** 更新项目（部分字段；id 不可改）。patch 为 undefined 的字段不动 */
-export function updateProject(id: string, patch: { name?: string; description?: string; status?: string; members?: any[]; pinned?: boolean }): { ok: true; project: ProjectRecord } | { ok: false; error: string } {
+export function updateProject(id: string, patch: { name?: string; description?: string; status?: string; members?: any[]; pinned?: boolean; knowledgeBindings?: { groups: string[]; allowExternal: boolean }; answerPolicy?: string }): { ok: true; project: ProjectRecord } | { ok: false; error: string } {
   const store = load()
   const p = store.projects.find(x => x.id === id)
   if (!p) return { ok: false, error: `项目不存在：${id}` }
@@ -154,6 +160,22 @@ export function updateProject(id: string, patch: { name?: string; description?: 
     p.members = patch.members
   }
   if (patch.pinned !== undefined) p.pinned = !!patch.pinned
+  /* ★1126：知识库绑定 + 回答强度（模型与 KnowledgeScopePicker 一致：cats + entryIds） */
+  if (patch.knowledgeBindings !== undefined) {
+    const kb = patch.knowledgeBindings as any
+    if (kb) {
+      const cats = Array.isArray(kb.cats) ? kb.cats.map(String) : []
+      const entryIds = Array.isArray(kb.entryIds) ? kb.entryIds.map(String) : []
+      p.knowledgeBindings = { cats, entryIds, allowExternal: !!kb.allowExternal }
+    } else {
+      p.knowledgeBindings = undefined
+    }
+  }
+  if (patch.answerPolicy !== undefined) {
+    const ap = String(patch.answerPolicy)
+    if (ap !== 'strict' && ap !== 'prefer' && ap !== 'free') return { ok: false, error: 'answerPolicy 只能是 strict / prefer / free' }
+    p.answerPolicy = ap as 'strict' | 'prefer' | 'free'
+  }
   p.updatedAt = Date.now()
   persist()
   return { ok: true, project: p }

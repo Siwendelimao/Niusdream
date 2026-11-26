@@ -72,8 +72,10 @@ import { buildNoteDigest } from './noteDigest.ts'
 /* ★1012i：工具输出 spill（全文落盘 + 确切取回路径）—— 共享模块，与 tools.ts 同一份实现 */
 import { omitNotice } from './spillStore.ts'
 import { LAZY_FAMILIES, familyIndexLine, splitToolsForRequest, shouldMountLoader } from './lazyTools.ts'
-import { listChanges, readObject, checkConflict, restoreChange, putObject, saveChanges, listOrphanWorkdirs, setWorkdirsRootProvider, removeWorkdir, diffStatByHash, resolveChangePath, changeStatus, turnSummaries, enforceBudget, setHistoryQuota, historyStats, autoCleanHistory, type HistoryChange } from './fileHistory.ts'
-import { memoryBridge, buildMemoryTools, resetMemoryPython, BRIDGE_SCRIPT, USING_BUNDLED_KERNEL, currentMemoryDir, defaultMemoryDir, setDistillLlm, coreDigestLine, memoryPythonCommand } from './memoryBridge.ts'
+/* ★1126：用户画像（USER.md）+ 项目记忆（MEMORY.md）——两个 md 文件，取代原「近3天常驻记忆」 */
+import { buildProfileBlock, parseProfileLinks, profileEntries, readProfile, writeProfile } from './memoryProfile.ts'
+import { listChanges, readObject, checkConflict, restoreChange, putObject, saveChanges, listOrphanWorkdirs, setWorkdirsRootProvider, removeWorkdir, diffStatByHash, resolveChangePath, changeStatus, turnSummaries, enforceBudget, setHistoryQuota, historyStats, autoCleanHistory, unifiedDiff, type HistoryChange } from './fileHistory.ts'
+import { memoryBridge, buildMemoryTools, setProfileWriteConfirm, setKnowledgeScope, resetMemoryPython, BRIDGE_SCRIPT, USING_BUNDLED_KERNEL, currentMemoryDir, defaultMemoryDir, setDistillLlm, coreDigestLine, memoryPythonCommand } from './memoryBridge.ts'
 import { listPinned, pinPinned, unpinPinned, type PinnedKind } from './pinnedStore.ts'
 import { extractEntityKeywords } from './keywordTerms.ts'
 import { buildNotebookTools } from './notebookTools.ts'
@@ -2214,7 +2216,13 @@ const CTX_ARCHIVE_MAX_CHARS = 12 * 1024 * 1024
     开始变的**，不用再靠推断。
     成本：一行日志/跳（约 200 字符）；失败绝不影响请求（整段 try 包住）。 */
 let _fpSeq = 0
-function logRequestFingerprint(sessionId: string, messages: any[]): void {
+/* ★1126：加 `toolsForRequest` —— 原来这里记的是 `agents.get(sessionId).state.tools`（**全量**），
+   而实际发出去的是 `splitToolsForRequest(...)` 过滤后的那份（懒包未加载时整包被藏）。后果：
+   ① 指纹里的 tools 长度**恒定**，改懒包/藏工具它都不会变 ⇒ 用它验证懒加载只会得出"没生效"的错觉（1126 实测踩到）；
+   ② 它本来是用来定位"重启后哪一段变了"的，记一份没发出去的工具表同样会误导。
+   现在由调用方把**真正要发的**那份传进来（调用点已挪到 `_toolsForRequest` 之后），
+   不传时才退回 state.tools（兼容其它调用路径）。 */
+function logRequestFingerprint(sessionId: string, messages: any[], toolsForRequest?: any[]): void {
   try {
     _fpSeq++
     /* 只记本进程的前 100 跳：足够覆盖"重启后第一轮"（对比需要的就是**每次启动后那几跳**的指纹），
@@ -2224,7 +2232,7 @@ function logRequestFingerprint(sessionId: string, messages: any[]): void {
     const list = Array.isArray(messages) ? messages : []
     const ag = agents.get(sessionId) as any
     const sys = String(ag?.state.systemPrompt || '')
-    const toolsTxt = JSON.stringify(ag?.state.tools || [])
+    const toolsTxt = JSON.stringify(toolsForRequest ?? ag?.state.tools ?? [])
     const segLen = Math.max(1, Math.ceil(list.length / 10))
     const segs: string[] = []
     for (let k = 0; k < list.length; k += segLen) segs.push(h(JSON.stringify(list.slice(k, k + segLen))))
@@ -3049,8 +3057,10 @@ async function writeMemoryNode(item: any): Promise<string | null> {
 }
 
 /** memory.extract：对话 → 候选记忆条目（含查重判定 outcome）。dryRun=false 时直接落盘。
- *  auto=true（主动记忆·无人值守）→ 写入时打 pending_review 标记，进记忆库「待确认」审核区。 */
-async function memoryExtractDirect(content: string, projectRoot: string, dryRun: boolean, override?: { provider?: string; model_id?: string } | null, auto = false) {
+ *  ★1126：原 `auto=true`（0913 主动记忆·无人值守，打 pending_review 进待确认区）已删除 ——
+ *  老板拍板：这两个开关他从来没用过，且"轮结束自动提炼"会烧 token、写歪了没人管。
+ *  现在只有**手动提炼**：前端 MemoryExtractModal 用户点按钮 → dryRun 出候选 → 勾选后 commit。 */
+async function memoryExtractDirect(content: string, projectRoot: string, dryRun: boolean, override?: { provider?: string; model_id?: string } | null) {
   const src = String(content || '').trim()
   if (!src) return { ok: false, saved: 0, items: [], llm_used: false, msg: '内容为空' }
   let raw = ''
@@ -3108,10 +3118,7 @@ async function memoryExtractDirect(content: string, projectRoot: string, dryRun:
         ...it,
         scope: 'global',
         project_id: projectRoot || '',
-        // 0913 主动记忆（无人值守）：进「待确认」审核区（记忆库可采纳/丢弃）
-        tags: auto
-          ? [...(Array.isArray((it as any)?.tags) ? (it as any).tags : []), 'pending_review', 'from_auto_memory']
-          : (it as any)?.tags,
+        tags: (it as any)?.tags,
       })
       it.outcome = 'created'
       it.hit_id = newId || undefined
@@ -4552,9 +4559,9 @@ function createStreamFn(systemPrompt: string, sessionId: string, opts?: { llmOve
           requestMessages = _tr.messages
           _pruneInfo = { changed: _tr.changed, savedChars: _tr.savedChars }
         }
-        /* ★1012k：请求指纹（探针）—— 记录本次真正要发的 messages 结构，用于定位"重启后第一轮
-           固定丢 4.6 万 token"到底是哪一段变了。详见 logRequestFingerprint 注释。 */
-        logRequestFingerprint(sessionId, requestMessages)
+        /* ★1126：请求指纹的调用点已挪到 `_toolsForRequest` 算完之后（约 5186 行）——
+           它必须记**真正发出去的工具表**（懒包过滤后那份），否则指纹里 tools 恒定、无法用来验证/定位。
+           详见 logRequestFingerprint 的注释。 */
       }
       if (_s && !opts?.sub && globalSettings.contextCompaction !== false) {
         try {
@@ -5183,6 +5190,10 @@ ${_summary}${_quotesBlock}` }] }
             (_stateTools.length ? _stateTools : (context?.tools || [])) as any[],
             lazyLoadedBySession.get(sessionId),
           ) as any
+          /* ★1126：请求指纹挪到这里 —— 记**真正发出去的工具表**（懒包过滤后那份），
+             不再记 agent.state.tools 全量（那会让 tools 指纹恒定、既验证不了懒加载也定位不了断点）。
+             成本同前：一行日志/跳，整段 try 包住，失败不影响请求。 */
+          logRequestFingerprint(sessionId, requestMessages, _toolsForRequest)
           const piCtx = toTranscriptCtx(
             (context?.systemPrompt || systemPrompt),
             requestMessages as any,
@@ -10248,6 +10259,20 @@ function getOrCreateAgent(sessionId: string): Agent {
        toolset 白名单（agentPresetsStore.VALID_TOOLSETS）里的 self-modify 同步移除。 */
     const tools = buildSessionTools(session?.workDir?.trim() || process.cwd(), undefined, sessionId)
     // 记忆/知识库工具：全局共享（Python 子进程桥接，不依赖 cwd）
+    /* ★1126：画像写入的「记录前询问」开关（人格设置项，默认关=直接写）。
+       开了之后 profile 动作先返回 needsConfirm，模型必须用 ask_user 问一句、用户同意才落盘。 */
+    setProfileWriteConfirm((globalSettings as any).memoryWriteConfirm === true)
+    /* ★1126：知识检索范围按**项目绑定**限制 —— 绑了分组且 allowExternal=false ⇒ knowledge_query 只能搜这些分组。
+       没绑（或 allowExternal=true）⇒ 传 null，行为与以前一致（全库）。 */
+    {
+      const _proj: any = listProjects().find((x: any) => String(x.id) === String(session?.projectId || ''))
+      const _kb = _proj?.knowledgeBindings
+      const _cats: string[] = Array.isArray(_kb?.cats) ? _kb.cats : []
+      const _ids: string[] = Array.isArray(_kb?.entryIds) ? _kb.entryIds : []
+      setKnowledgeScope(_cats.length || _ids.length
+        ? { cats: _cats, entryIds: _ids, allowExternal: !!_kb.allowExternal }
+        : null)
+    }
     const memoryTools = buildMemoryTools({ projectId: String(session?.projectId || '') })
     // 用户记事本工具（0920）：用户与 AI 共用的一本，落 <数据根>/notebook.json，纯 Node 不依赖 cwd
     const notebookTools = buildNotebookTools()
@@ -10336,9 +10361,11 @@ function getOrCreateAgent(sessionId: string): Agent {
        原来无参 ⇒ 工具层既拿不到会话身份、也读不到别的任务产出 ⇒ AI 只能绕过工具去打 HTTP RPC。 */
     ...buildScheduleTools(sessionId, readTaskResult),
     ...buildRepoTools(session?.workDir?.trim() || process.cwd()),
-    /* ★1126：生成图片（**常驻**，不进懒包）。
-       为什么常驻：家族里现在只有 1 件工具，而 lazyTools 的 shouldMountLoader 要求"能藏 ≥2 件才值得"，
-       藏 1 件却多挂一个 load_tools = 净亏。等 video 工具加进来变 2 件，再一起进懒包。
+    /* ★1126：生成图片 / 生成视频（**已进懒包 `media`**，见 lazyTools.ts 的 LAZY_FAMILIES）。
+       工具照旧挂在这里（能力不减），只是未加载时**不发进请求**：系统提示只留一行能力包目录，
+       模型要生图/生视频时先 `load_tools('media')` 展开说明书。
+       1126 加 image 时，家族里只有 1 件而 shouldMountLoader 要求"能藏 ≥2 件"，故当时常驻并留了 TODO；
+       现在 video 已加入，两件一起进懒包（2,169 字符 ≈ 900 token，从每份请求里省掉）。
        落盘走 persistShot（同一个会话工作区 + details.shotRef），前端现有渲染直接出图。 */
     buildImageTool({
       saveImage: (b64: string, mime: string, meta: any) => persistShot(sessionId, b64, mime, meta),
@@ -15130,18 +15157,62 @@ function turnOrdMapOf(msgs: any[], session: any): Map<number, number> {
  *  口径与 `buildTurns` / `buildTurnProjection` **同一个函数**（`turnOrdMapOf`）；
  *  消息还没进装配基准（极早期）⇒ 返回 0，前端据此留痕、不猜位置。
  */
+/* ★1127（结构性）：**算不出轮序 = 缺陷，必须留证据**。
+   原来这里静默 `return 0`，于是"某轮没有位置"这件事在后端一点痕迹都没有，
+   排查只能靠前端 console —— 而老板的安装版屏蔽了快捷键，现场根本取不到。
+   现在：0 一律写会话日志（含原因分类 + 那条消息到底在不在装配基准里），同 (sid,oid) 只报一次。 */
+const _ordMissReported = new Set<string>()
 function turnOrdOfOpeningId(sessionId: string, openingMsgId: string): number {
   const sid = String(sessionId || '')
   const oid = String(openingMsgId || '')
   if (!sid || !oid) return 0
   const session = sessions.get(sid)
   if (!session) return 0
+  let msgs: any[] = []
+  let why = ''
   try {
-    const msgs = renderMessagesOf(sid, session, { withSubRuns: false })
+    msgs = renderMessagesOf(sid, session, { withSubRuns: false })
     const map = turnOrdMapOf(msgs, session)
     for (const [i, ord] of map) if (String((msgs[i] as any)?.id || '') === oid) return ord
-  } catch { /* 装配失败 ⇒ 0（前端留痕，不猜） */ }
+    const inBase = msgs.some((m: any) => String(m?.id || '') === oid)
+    why = inBase
+      ? '消息在装配基准里但不是轮起点（turnOrdMapOf 没给它 ord）'
+      : '消息还没进装配基准（广播早于落盘/装配）'
+  } catch (e: any) {
+    why = '装配抛错：' + String(e?.message || e).slice(0, 160)
+  }
+  const key = sid + '|' + oid
+  if (_ordMissReported.size > 500) _ordMissReported.clear()
+  if (!_ordMissReported.has(key)) {
+    _ordMissReported.add(key)
+    sessionLog(sid, 'error', 'lifecycle', `[轮序缺失] 算不出 openingId=${oid.slice(0, 12)} 的稳定轮序 —— ${why}。前端拿不到位置就无法定位这一轮（缺陷，不是正常态）`, { openingMsgId: oid, msgsCount: msgs.length })
+  }
   return 0
+}
+
+/* ★1127（**提示词幂等判据**）：同一个 `rpcId` 是否已经被收下过。
+   判据只用**已有的真实数据**，不新建账本（宁可查三处，不多养一份状态去跟三处对账）：
+     · `pendingUserRpcId` 还挂着它 ⇒ 上一轮正在跑（已收下、还没落盘）
+     · 队列里有同 id 的项 ⇒ 已经排着队
+     · transcript 末尾已有 `role=user` 且 id 相同 ⇒ 已经落盘跑过
+   实测背景（老板 11-26 远程手机）：同一条消息在 16:58:06 / 16:59:44 被投递两次，**rpcId 完全相同**，
+   后端当成两条独立消息 ⇒ 落两条 user 消息、开两轮、还造出两个 turnId 相同的轮（前端 Vue key 撞车）。 */
+function promptDupReason(sessionId: string, rpcId: string): 'running' | 'queued' | 'landed' | null {
+  const sid = String(sessionId || '')
+  const rid = String(rpcId || '')
+  if (!sid || !rid) return null
+  if (pendingUserRpcId.get(sid) === rid) return 'running'
+  try {
+    if (queueSnapshot(sid).some((q: any) => String(q?.id || '') === rid)) return 'queued'
+  } catch { /* 队列快照取不到不影响其余判据 */ }
+  const s: any = sessions.get(sid)
+  const t: any[] = Array.isArray(s?.transcript) ? s.transcript : []
+  /* 只扫末尾 200 条：同一条消息的重复投递必然发生在最近这一段（全表扫是纯浪费） */
+  for (let i = t.length - 1; i >= 0 && i >= t.length - 200; i--) {
+    const m = t[i]
+    if (m?.role === 'user' && String(m?.id || '') === rid) return 'landed'
+  }
+  return null
 }
 
 function buildTurnProjection(sessionId: string, opts?: { requireRunning?: boolean }): any | null {
@@ -22903,6 +22974,25 @@ const server = http.createServer(async (req, res) => {
       return
     }
     const rpcMethod = String((body as any).method || '')
+    /* ★1127（**入站来源存证**）：用户发话类 RPC 记下"这一条从哪来的"。
+       实测痛点：同一条消息被投递两次时，会话日志里只有"收到一条消息"，**没有来源**
+       ⇒ 无法判定是手机浏览器重发、还是远程中转重放，只能靠推理。
+       只记两个方法（其余高频 RPC 记了全是噪音），一条一行：ip / host / origin / ua + rpcId。 */
+    if (rpcMethod === 'session.prompt' || rpcMethod === 'session.steer') {
+      try {
+        const pl: any = (body as any).payload || {}
+        const sid = String(pl.sessionId || '')
+        const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+        const ip = fwd || String((req.socket && req.socket.remoteAddress) || '')
+        const ua = String(req.headers['user-agent'] || '').slice(0, 140)
+        const org = String(req.headers['origin'] || '').slice(0, 80)
+        const host = String(req.headers['host'] || '').slice(0, 80)
+        const rid = String(pl.rpcId || pl.clientMessageId || '')
+        const line = `[入站] ${rpcMethod} rpcId=${rid.slice(0, 12) || '-'} ip=${ip || '-'} host=${host || '-'} origin=${org || '-'} ua=${ua || '-'}`
+        if (sid) sessionLog(sid, 'info', 'lifecycle', line, { rpcId: rid, ip, ua, origin: org, host })
+        else console.info(line)
+      } catch { /* 存证失败绝不拦业务（它只是观测，不是业务路径） */ }
+    }
     if (RESET_GRACE && FACTORY_EPOCH && req.headers['x-nis-epoch'] !== FACTORY_EPOCH && rpcMethod !== 'uiState.load') {
       res.writeHead(409, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'NiusDream 已恢复出厂设置，请重新加载此窗口' }))
@@ -23451,6 +23541,62 @@ function memHitItem(item: any, kind: 'memory' | 'knowledge', max = 80): MemHitIt
    共用一个缓存会互相串味（聊天里拿到项目档的长块、或反之）。
    ★A：缓存**只装常驻块**（[强化记忆]/[强化知识] 每轮现算，钉/取消钉必须立刻生效）。 */
 let _l0Cache: Record<string, { at: number; block: string; ids: string[]; candN: number; items: Array<{ id: string; type: string; summary: string }> }> = {}
+/** ★1126：项目知识目录（每轮注入的"知识索引"，不是正文）。
+ *  · 注入**标题**而不是正文：11 条 × 2000+ 字 = 2.5 万字，每轮白烧 token；
+ *  · **没绑分组 / policy=free ⇒ 完全不注入**（老板要求"不强行每轮注入增加消耗"，零配置就是零成本）；
+ *  · 300 秒缓存：知识列表很少变；桥不可用就跳过（不阻塞发消息），并打日志。 */
+let _kbCatalogCache = new Map<string, { at: number; block: string; count: number; citations: Array<{ id: string; short: string; title: string }> }>()
+async function buildProjectKnowledgeBlock(session: any): Promise<{ block: string; count: number; citations: Array<{ id: string; short: string; title: string }> }> {
+  const empty = { block: '', count: 0, citations: [] as Array<{ id: string; short: string; title: string }> }
+  const projId = String(session?.projectId || '').trim()
+  if (!projId) return empty
+  const proj: any = listProjects().find((x: any) => String(x.id) === projId)
+  const policy = String(proj?.answerPolicy || 'prefer')
+  if (policy === 'free') return empty
+  const kb = proj?.knowledgeBindings
+  const cats: string[] = Array.isArray(kb?.cats) ? kb.cats : []
+  const entryIds: string[] = Array.isArray(kb?.entryIds) ? kb.entryIds : []
+  if (!cats.length && !entryIds.length) return empty
+
+  const cached = _kbCatalogCache.get(projId)
+  if (cached && Date.now() - cached.at < 300_000) return { block: cached.block, count: cached.count, citations: cached.citations }
+
+  try {
+    const r: any = await Promise.race([
+      memoryBridge.call('knowledge_list', { project_id: '' }),
+      new Promise((res) => setTimeout(() => res(null), 1500)),
+    ])
+    const entries: any[] = Array.isArray(r?.entries) ? r.entries : []
+    const picked = entries.filter((e: any) =>
+      cats.includes(String(e.parent_id || '')) || entryIds.includes(String(e.id || '')))
+    if (!picked.length) {
+      logMemoryInjection(session, '[项目知识] 绑了 ' + (cats.length + entryIds.length) + ' 项但没取到条目（id 可能已失效）')
+      return empty
+    }
+    /* ★1126：给每条一个**短 id 标记**（后 6 位）。第一版用序号 [[1]]，实测 AI 会数错
+       （问「暗号A1」它标了 [[3]]，而它实际是第 8 条）—— 改成「直接复制条目后面的标记」，不依赖数数。 */
+    const citations = picked.slice(0, 20).map((e: any) => {
+      const id = String(e.id || '')
+      return { id, short: id.slice(-6), title: String(e.title || '').slice(0, 60) }
+    })
+    const head = policy === 'strict'
+      ? '[项目知识] 已绑定 ' + picked.length + ' 条 —— 涉及这些主题**必须基于它们作答**；查不到就说"帮你转人工"，不许编'
+      : '[项目知识] 已绑定 ' + picked.length + ' 条 —— 有资料就引用，没有就正常回答（别乱承诺）'
+    const lines = citations.map(c => '- ' + c.title + ' [[' + c.short + ']]')
+    const block = [
+      head,
+      ...lines,
+      '引用规则：用到哪条就把**那条后面方括号里的标记原样复制**到句末（别自己编、别改数字）。例：「…[[0e2a7a]]」',
+      '要原文用 knowledge(action="query")；可搜范围：' + (kb?.allowExternal ? '全库' : '仅上述 ' + picked.length + ' 条'),
+    ].join('\n')
+    _kbCatalogCache.set(projId, { at: Date.now(), block, count: picked.length, citations })
+    return { block, count: picked.length, citations }
+  } catch (e: any) {
+    logMemoryInjection(session, '[项目知识] 取目录失败（本轮不注入）：' + String(e?.message || e).slice(0, 80))
+    return empty
+  }
+}
+
 async function buildResidentMemory(session?: any): Promise<{ block: string; ids: string[]; kIds: string[]; hit: MemHitPayload }> {
   const empty = { block: '', ids: [] as string[], kIds: [] as string[] }
   /* ★A：强化块**先算且独立于记忆桥** —— 快照在本机 JSON，桥挂了/超时照样注入。
@@ -23464,46 +23610,32 @@ async function buildResidentMemory(session?: any): Promise<{ block: string; ids:
     pinKnow = buildPinnedBlock('knowledge')
   } catch (e) { memWarn(session, '[memHit] 读钉选登记表 buildPinnedBlock（本轮当没钉，强化块为空）', e) }
   const pinIds = new Set<string>(pinMem.ids)
-  /* ★c1 分档：项目档 3 天/≤600 字（现状）；聊天档 24 小时/≤300 字 */
+  /* ★1126：原「近 3 天常驻（L0）」整段已删除 —— 老板实测它捞出来的多是与当前对话无关的技术教训，
+     却长期占着常驻位。常驻位现由 memoryProfile（USER.md / MEMORY.md）承担；技术型记忆只走召回。
+     tier 仍保留：命中摘要/日志要用它标记档位。 */
   const tier = l0TierOf(session)
-  const prof = L0_TIERS[tier]
-  let res = { block: '', ids: [] as string[], candN: 0, items: [] as Array<{ id: string; type: string; summary: string }> }
-  /* ★x1：常驻为空时的原因（只用于日志，不改变行为） */
-  let resSkip = ''
-  try {
-    if ((globalSettings as any).memoryAutoRecall === false) resSkip = '设置里关了自动召回(memoryAutoRecall=false)'
-    if ((globalSettings as any).memoryAutoRecall !== false) {   // 逃生舱：关的是常驻+自动召回（强化块不受影响）
-      const cached = _l0Cache[tier]
-      if (cached && Date.now() - cached.at < 60_000) {
-          res = { block: cached.block, ids: cached.ids.slice(), candN: cached.candN, items: (cached.items || []).slice() }
-          if (!res.ids.length) resSkip = '60s 缓存命中且为空（上次算出来就是空）'
-      } else {
-        const g: any = await Promise.race([
-          memoryBridge.call('memory_graph', { scope: 'all' }),
-          new Promise((r) => setTimeout(() => r(null), 1500)),
-        ])
-        /* ★A：已钉住的记忆**不再进常驻候选**（同一条两处都出现 = 纯浪费 token；口径与 L2 去重一致） */
-        const cand = residentPick(g?.nodes || [], Date.now(), prof.days).filter((n: any) => !pinIds.has(String(n.id)))
-        const r = cand.length ? buildResidentBlock(cand, prof.maxChars, prof.days) : { block: '', ids: [] as string[], items: [] as Array<{ id: string; type: string; summary: string }> }
-        res = { block: r.block, ids: r.ids.slice(), candN: cand.length, items: r.items.slice() }
-        _l0Cache[tier] = { at: Date.now(), block: r.block, ids: r.ids.slice(), candN: cand.length, items: r.items.slice() }
-        /* ★x1：为什么空（四个口径按链路顺序判，第一个命中就是真因） */
-        if (!g) resSkip = '记忆图超时/无响应(1.5s 或桥不可用)'
-        else if (!Array.isArray(g?.nodes) || !g.nodes.length) resSkip = '记忆图为空(0 节点)'
-        else if (!cand.length) resSkip = '候选被过滤空(时间窗 ' + prof.days + 'd / mem_ 前缀 / 已确认 / 已钉住)'
-        else if (!r.block) resSkip = '候选 ' + cand.length + ' 条但字数预算(' + prof.maxChars + ' 字)放不下'
-      }
-    }
-  } catch (e) { resSkip = '桥异常:' + String((e as any)?.message || e).slice(0, 60) }   // ★x1：不再静默（只注入强化块，绝不阻塞发消息）
-  /* 块序（老板定）：[强化记忆] → [强化知识] → [常驻记忆] */
-  const block = [pinMem.block, pinKnow.block, res.block].filter(Boolean).join('\n')
-  const memChars = pinMem.chars + res.block.length
-  const memLine = '[记忆注入] 强化 ' + pinMem.count + ' 条（' + pinMem.chars + ' 字）· 常驻 ' + res.ids.length + ' 条（' + res.block.length + ' 字）· 合计 ' + memChars + ' 字'
+  /* ★1126：**常驻位改放「用户画像 + 项目记忆」**（两个 md 文件，1400 / 2200 字上限），
+     不再放"近 3 天的技术教训"——老板实测那些多半与当前对话无关，却长期占着常驻位；技术型记忆改走召回。
+     画像内容少而稳 ⇒ 是完美的缓存前缀（写完一直命中，几乎不花钱），所以敢每轮注入。 */
+  const profileUser = buildProfileBlock('user')
+  const profileAgent = buildProfileBlock('agent')
+  /* ★1126：关联（→ mem_xxx）**在写入时就展开成摘要存在 md 里**（见 memoryBridge 的 profile 动作），
+     注入直接读文件、不查库 —— 注入每轮都跑，绝不能依赖 Python 桥可用。 */
+  const profileBlock = [profileUser.block, profileAgent.block].filter(Boolean).join('\n')
+  /* ★1126：项目知识目录（按项目绑定 + policy 决定注不注；没绑就是空串、零消耗） */
+  const kbCat = await buildProjectKnowledgeBlock(session)
+  /* 块序：[强化记忆] → [强化知识] → [用户画像] → [项目记忆] → [项目知识] → [记忆召回] → 用户原文 */
+  const block = [pinMem.block, pinKnow.block, profileBlock, kbCat.block].filter(Boolean).join('\n')
+  const memChars = pinMem.chars + profileBlock.length + kbCat.block.length
+  const memLine = '[记忆注入] 强化 ' + pinMem.count + ' 条（' + pinMem.chars + ' 字）· 画像 ' + profileUser.entries + ' 条 · 项目记忆 ' + profileAgent.entries + ' 条（' + profileBlock.length + ' 字）'
+    + (kbCat.count ? ' · 项目知识 ' + kbCat.count + ' 条（' + kbCat.block.length + ' 字）' : '')
+    + ' · 合计 ' + memChars + ' 字'
   /* ★x1（需求）：**无条件**打一行 —— 原来只在 pinMem/res/pinKnow 有值时打，于是"常驻为空"整轮零日志，
      只能靠猜。现在一次说清"候选几条 / 注入几条 / 为什么跳过"：
      跳过原因 = 设置关了自动召回 / 记忆图超时 / 记忆图为空 / 候选被过滤空(时间窗·mem_ 前缀·已确认·已钉住) /
                 字数预算放不下 / 60s 缓存命中且为空 / 桥异常:xxx。 */
-  logMemoryInjection(session, memLine + '｜常驻候选 ' + res.candN + ' 条' + (res.ids.length ? '' : '｜跳过原因=' + (resSkip || '空')))
+  logMemoryInjection(session, memLine + '｜画像 ' + profileUser.entries + ' 条 / 项目记忆 ' + profileAgent.entries + ' 条'
+    + (profileBlock ? '' : '｜两者皆空：让 AI 用 memory(target="user"/"agent") 写，或去记忆面板编辑'))
   if (pinKnow.count) logMemoryInjection(session, '[知识注入] 强化 ' + pinKnow.count + ' 条（' + pinKnow.chars + ' 字）')
   /* ★C：结构化命中摘要（**只作投影数据**，不进 finalMessage —— 缓存前缀一字不动）。
      recall 由调用方（runPromptCore）在 L2 召回算完后补上。 */
@@ -23514,30 +23646,35 @@ async function buildResidentMemory(session?: any): Promise<{ block: string; ids:
     pinned: [] as MemHitItem[],
     resident: [] as MemHitItem[],
     recall: [] as MemHitItem[],
-    counts: { pinnedMem: pinMem.count, pinnedKnow: pinKnow.count, resident: res.ids.length, recallMem: 0, recallKnow: 0 },
-    chars: { pinned: pinMem.chars + pinKnow.chars, resident: res.block.length, recall: 0 },
+    counts: { pinnedMem: pinMem.count, pinnedKnow: pinKnow.count, resident: profileUser.entries + profileAgent.entries, recallMem: 0, recallKnow: 0 },
+    chars: { pinned: pinMem.chars + pinKnow.chars, resident: profileBlock.length, recall: 0 },
   }
   try {
     /* 每个 .items 都按数组兜底：空分支/旧缓存结构漏了 items 也不许把整块注入带下水 */
     const _pinItems: any[] = Array.isArray(pinMem.items) ? pinMem.items : []
     const _knowItems: any[] = Array.isArray(pinKnow.items) ? pinKnow.items : []
-    const _resItems: any[] = Array.isArray(res.items) ? res.items : []
     hit.pinned = [
       ..._pinItems.map((x) => memHitItem(x, 'memory')),
       ..._knowItems.map((x) => memHitItem(x, 'knowledge')),
     ].filter(Boolean) as MemHitItem[]
-    hit.resident = _resItems.map((x) => memHitItem(x, 'memory')).filter(Boolean) as MemHitItem[]
-    /* ★x2 交叉核对（N→有效=M）：一眼看出「输入有条目、输出为零」是 memHitItem 全滤掉了，还是压根没传过来。
-       有效 = memHitItem 没返回 null（有 id 且有摘要文本）的条数。 */
+    /* ★1126：resident 槽位现在装「画像 + 项目记忆」的条目（不再来自记忆图 L0）——
+       对话流「记忆命中」里显示为「画像 N」，点开能看原文。 */
+    const _profItems: any[] = [
+      ...profileEntries('user').map(x => ({ id: x.id, type: '画像', summary: x.summary })),
+      ...profileEntries('agent').map(x => ({ id: x.id, type: '画像', summary: x.summary })),
+    ]
+    hit.resident = _profItems.map((x) => memHitItem(x, 'memory')).filter(Boolean) as MemHitItem[]
+    /* ★1126：知识引用序号映射（[[1]] → 条目 id/标题）——前端据此把 AI 回复里的 [[n]] 渲染成可点角标 */
+    ;(hit as any).citations = kbCat.citations
     logMemoryInjection(session, '[memHit] 构造完成：pinned(pinMem.items=' + _pinItems.length
       + '→有效=' + hit.pinned.filter((x) => x.kind === 'memory').length
       + ' / pinKnow.items=' + _knowItems.length
       + '→有效=' + hit.pinned.filter((x) => x.kind === 'knowledge').length
-      + ') resident(res.items=' + _resItems.length + '→有效=' + hit.resident.length + ') tier=' + tier)
+      + ') 画像 ' + profileUser.entries + ' 条 / 项目记忆 ' + profileAgent.entries + ' 条 tier=' + tier)
   } catch (e) {
     logMemoryInjection(session, '[memHit] ⚠ 结构化摘要构造失败（已降级为空，注入文本不受影响）：' + String((e as any)?.message || e).slice(0, 140))
   }
-  return { block, ids: [...pinMem.ids, ...res.ids], kIds: pinKnow.ids.slice(), hit }
+  return { block, ids: [...pinMem.ids], kIds: pinKnow.ids.slice(), hit }
 }
 
 /** ★c6x（问题 B：首轮变慢）：把召回的**检索**单独抽出来 —— 可与 L0（强化/常驻）**并行**起跑。
@@ -23550,15 +23687,20 @@ function recallSearchPromise(message: string, projectId = ''): Promise<any> | nu
   const q = String(message || '').replace(/\s+/g, ' ').trim()
   if (q.length < 4 || q.startsWith('【')) return null
   if ((globalSettings as any).memoryAutoRecall === false) return null
+  /* ★1126（老板拍板）：**只做关键词召回**。
+     原来的主力是「把整句原文扔进语义检索」——按向量相似度捞，字面毫无关系也能捞进来
+     （实测：当前消息 ↔ 10 月的「拍板事项与派活要分开表达」）。这就是"随机召回无用信息"的根。
+     现在只抽实体词（文件名/路径/错误码/标识符/术语）按词面检索；**没抽到词 ⇒ 本轮不召回**（宁缺勿滥）。 */
+  /* ★1126（老板拍板）：**知识不再每轮自动召回** —— 项目绑定目录已经告诉 AI「有哪些知识」，
+     需要正文它会自己 knowledge_query。原来每轮替它猜（语义 top_k=2）正是"胡乱召回"的来源。
+     现在这里只留**记忆**的关键词召回。 */
+  const _kw = extractEntityKeywords(q)
+  if (!_kw.length) return null
+  const _kwQ = _kw.slice(0, 4).join(' ')
   const withTimeout = <T,>(p: Promise<T>): Promise<T | null> =>
     Promise.race([p, new Promise<T | null>(r => setTimeout(() => r(null), 1500))])
-  const _kw = extractEntityKeywords(q)
-  const _q2 = _kw.length ? q + ' ' + _kw.join(' ') : q
-  const _kwQ = _kw.slice(0, 3).join(' ')
   return Promise.all([
-    withTimeout(memoryBridge.call('memory_search', { query: _q2, top_k: 3, detail: false })),
-    withTimeout(memoryBridge.call('knowledge_query', { query: _q2, top_k: 2, project_id: projectId || '' })),
-    _kwQ ? withTimeout(memoryBridge.call('memory_search', { query: _kwQ, top_k: 3, detail: false })) : Promise.resolve(null),
+    withTimeout(memoryBridge.call('memory_search', { query: _kwQ, top_k: 4, detail: false })),
   ])
 }
 
@@ -23568,21 +23710,22 @@ async function buildMemoryRecall(message: string, projectId = '', excludeIds?: S
   if ((globalSettings as any).memoryAutoRecall === false) return ''   // 逃生舱开关（设置里可关）
   /* ★c6x：withTimeout 与检索已搬进 recallSearchPromise（可被 runPromptCore 提前起跑）。 */
   try {
-    /* ★b2（L1 关键词叠加）：实体词（文件名/路径/错误码/标识符）**拼进语义 query** 一起搜，
-       再加一次"以实体词本身为 query"的检索 —— 文件名这种精确串在语义检索里常排不到前面。
-       三次调用并行，总延迟仍封顶 1.5s；**不替代**原语义召回，只是叠加。 */
+    /* ★1126：关键词召回的唯一入口（实体词 = 文件名/路径/错误码/标识符/术语）。
+       没有实体词 ⇒ recallSearchPromise 直接返回 null（本轮不召回），到这里 _kw 必定非空。 */
     const _kw = extractEntityKeywords(q)
-    const _q2 = _kw.length ? q + ' ' + _kw.join(' ') : q
-    const _kwQ = _kw.slice(0, 3).join(' ')
-    /* ★c6x：优先用 runPromptCore 已经提前起跑的检索（与 L0 并行）；没有就现场起。 */
+    /* ★c6x：优先用 runPromptCore 已经提前起跑的检索（与画像并行）；没有就现场起。 */
     const _sp = preSearch || recallSearchPromise(message, projectId)
-    const [mem, know, mem2]: any[] = _sp ? await _sp : [null, null, null]
-    /* ★b2 去重（两条口径一起过）：
-       ① 两次 memory_search 之间按完整 id 去重；
-       ② **L0 已在消息头出现过的记忆一律排掉** —— L0 印的是 id 后 6 位，所以完整 id 与"后 6 位"
-          双重比对（宁可少一条，也不让同一条记忆在消息头和召回行里各出现一次）。 */
+    const [mem]: any[] = _sp ? await _sp : [null]
+    const know = null   // ★1126：知识不再自动召回（项目绑定目录 + AI 主动 knowledge_query 取代）
+    /* ★1126 词面过滤：召回的记忆**必须真的含关键词**（老板拍板"关键词召回"）。
+       语义检索即使 query 是关键词，也可能按向量拉进字面无关的条目 —— 这一层把它挡掉。 */
+    const _kwL = _kw.map((k: string) => k.toLowerCase())
+    const _hitKw = (m: any): boolean => {
+      const t = (String(m?.title || '') + ' ' + String(m?.summary || '') + ' ' + String(m?.content || '')).toLowerCase()
+      return _kwL.some((k: string) => t.includes(k))
+    }
     const _l0Ids = excludeIds || new Set<string>()
-    const _memList = filterRecallMemories([...((mem && mem.memories) || []), ...((mem2 && mem2.memories) || [])], _l0Ids)
+    const _memList = filterRecallMemories([...((mem && mem.memories) || [])], _l0Ids).filter(_hitKw)
     const _memBitsArr = _memList.slice(0, 3).map((m: any) => recallBit(m, 60)).filter(Boolean)
     const memBits = _memBitsArr.join(' ')
     /* ★A：已钉住（[强化知识] 已注入）的知识条目不再进自动召回 —— 同一条两处出现 = 纯浪费 token */
@@ -23608,9 +23751,12 @@ async function buildMemoryRecall(message: string, projectId = '', excludeIds?: S
       knowBits ? '相关知识条目：' + knowBits : '',
     ].filter(Boolean)
     /* ★b1x 可观测（老板要看「到底抽了什么、命中没命中」）：抽到词才打，没抽到不打（避免每轮刷屏）。
-       两个数都是**本次命中**口径（≠ 全库统计）：记忆=去重后进召回行的条数，知识=去掉已强化后的条数。 */
+       两个数都是**本次命中**口径（≠ 全库统计）：记忆=去重后进召回行的条数，知识=去掉已强化后的条数。
+       ★1126：加**召回史**（hit_count）——一眼看出这条是"真有用"还是"语义时代的召回常客"（实测最高 1107 次）。 */
     if (_kw.length) {
+      const _hist = _memList.slice(0, _memBitsArr.length).map((m: any) => Number(m?.hit_count || 0)).join('/')
       const _line = '[记忆检索] 关键词=' + _kw.join(',') + '（命中：记忆 ' + _memBitsArr.length + ' / 知识 ' + _knowBitsArr.length + '）'
+        + (_hist ? '｜召回史 ' + _hist : '')
       if (session) logMemoryInjection(session, _line)
       else { try { console.log(_line) } catch { /* ignore */ } }
     }
@@ -25373,6 +25519,21 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
                ⚠️ 这里**只读不写**：补种只在启动加载时做一次（见 hydrateSessionsFromDisk）。
                以前在映射里补种 + schedulePersist，导致"你不在时到的回复"一拉列表就被顶成已读。 */
             unread: (s as any)._summary.unread,
+            /* ★1122（老板要求"不在窗口时也要正确显示未读"）：**最后一次 AI 回复的时间**。
+               前端拿它跟"本窗口最后已读时间"比：
+                 lastReplyAt > 我的已读时间 ⇒ 真有新回复 ⇒ 显示未读
+                 lastReplyAt <= 我的已读时间 ⇒ 服务端那条未读是旧的（markRead 还没落库）⇒ 不显示
+               只对**热会话**现算（_body 在内存里才有）；冷会话给 0 ⇒ 前端退回"信任服务端"，
+               不为了补这个字段去读正文（列表 KB 级的红线不能破）。 */
+            lastReplyAt: (() => {
+              const msgs = ((s as any)._body?.messages || (s as any).messages || []) as any[]
+              for (let i = msgs.length - 1; i >= 0; i--) {
+                const m = msgs[i]
+                if (!m) continue
+                if (m.role === 'assistant') return Number(m.time || m.timestamp || 0) || 0
+              }
+              return 0
+            })(),
             msgCount: (s as any)._summary.msgCount,
             // ★0926 链路修复②：把"在等用户应答"（权限卡/询问卡）暴露给列表 → 侧栏显示"等待你"
             awaitingUser: awaitingUserKind(s.id),
@@ -25414,8 +25575,18 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
     case 'session.teamV2Trial':
       return { enabled: false }
 
-    case 'session.create': {
-      /* ★老板裁定（V1 完全拆除）：**有团队就必然是 V2**。
+    /* ★1126：画像 / 项目记忆的读写 —— 记忆星系左栏点「画像」时用（两份 md，不走 SQLite） */
+    case 'memory.profile.get': {
+      return { user: readProfile('user'), agent: readProfile('agent') }
+    }
+    case 'memory.profile.set': {
+      const kind = String(p?.kind || 'user') === 'agent' ? 'agent' : 'user'
+      const r = writeProfile(kind, String(p?.content ?? ''))
+      if (!r.ok) throw new Error(r.error || '写入失败')
+      return { ok: true, chars: r.chars, limit: r.limit, doc: readProfile(kind) }
+    }
+
+    case 'session.create': {   /* ★老板裁定（V1 完全拆除）：**有团队就必然是 V2**。
          不再接受 `teamRuntime` 参数、不再有试用门、也没有 legacy 返回值 ——
          团队会话只有一条运行链，不存在"失败回退 V1"。
          普通会话（无 teamId）不受影响：它们本来就没有团队运行时。 */
@@ -25899,6 +26070,11 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
             cur.to = i + 1
             if (m.role === 'assistant') {
               if (!cur.model && m.model) cur.model = String(m.model)
+              /* ★1122（老板："轮底时间改成回复完成时间，要系统实际时间"）：
+                 取**本轮最后一条 assistant 消息的落盘时间戳** —— 那就是这轮真正写完的时刻，
+                 不是"提问时间 + 估算耗时"。assistant 消息落盘时就带 `timestamp`（见本文件 push 处）。 */
+              const _at = Number((m as any).timestamp) || 0
+              if (_at) (cur as any).endedAt = _at
               /* ★1021：本轮统计元数据（日期/用时/首token/tok/s/缓存）—— 旧渲染从节点 `_turnMeta` 读，
                  新渲染没有节点，所以随投影带出来（取该轮最后一条带 meta 的 assistant）。 */
               /* ★1028a：把「这一轮怎么结束的」也带进投影。原来 meta 只有 timing/usage ⇒
@@ -26128,6 +26304,19 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
          与乐观气泡的 `user:<cmid>:0` 对不上 ⇒ 回显时找不到 existing ⇒ **多建一条** = 两条。
          两个字段都认（通道/定时任务用 rpcId，前端用 clientMessageId，语义相同）。 */
       const _userRid = String((p as any)?.rpcId || (p as any)?.clientMessageId || '')
+      /* ★1127（**幂等**：同一个 rpcId 只处理一次）——
+         实测（老板 11-26 远程手机）：同一条消息被投递两次（16:58:06 / 16:59:44，**同一个 rpcId**），
+         后端把它当两条独立消息 ⇒ 落两条 user 消息、开两轮，还造出两个 turnId 相同的轮
+         （前端 turnId 唯一性被打破 ⇒ Vue key 撞车）。判据见 `promptDupReason`（三处真实数据，无新账本）。
+         命中就如实回 `{ ok:true, value:{ deduped:true } }`：前端不会当失败，也不再开新一轮。
+         **这是幂等，不是兜底** —— 拒绝的是"同一件事做第二遍"，不掩盖任何错误。 */
+      if (_userRid) {
+        const _dup = promptDupReason(sessionId, _userRid)
+        if (_dup) {
+          sessionLog(sessionId, 'warn', 'lifecycle', `[幂等] 同一 rpcId 重复投递已拒绝：${_userRid.slice(0, 12)}（${_dup}）—— 不再开新一轮`, { rpcId: _userRid, where: _dup })
+          return { ok: true, value: { deduped: true, where: _dup } }
+        }
+      }
       if (_userRid) pushPendingUserRpcId(sessionId, _userRid)
       // 0909⑦：队列自动续发统一挂在 agent_end 的 waitForIdle 回调（唯一触发点，防双 flush 竞态）；
       // 手动发送路径不再重复 flush——flush 那条自己结束时同样会经 agent_end→waitForIdle 链式续发。
@@ -28635,7 +28824,6 @@ const allowed = [
         String(p?.projectRoot || ''),
         !!p?.dryRun,
         _ov,
-        !!p?.auto,
       )
     }
 
@@ -29968,30 +30156,77 @@ const allowed = [
     case 'workspace.list':
       return buildWorkspaceView()
 
-    // 工作区文件树（右侧「工作区」面板数据源）：实时读会话 workDir，浅层深度限制防大目录卡顿
+    // 工作区文件树（右侧「工作区」面板数据源）
+    /* ★1127d（老板实测"文件显示不全"）—— 旧实现一次**递归 4 层 + 每层 slice(0,100)**：
+       目录名排在文件前面，根目录里备份目录一多，100 个名额全被目录占满 ⇒ 文件一个都看不到。
+       现在改成**单层**：只读 `dir` 这一层（默认根），由前端展开时按需再取下一层。
+       ⇒ 任何一层都完整（上限 500，多出来的如实报 truncated），也不会因为大目录一次递归卡死。 */
     case 'workspace.tree': {
       const session = sessions.get(sessionId || String(p?.sessionId || ''))
       if (!session) throw new Error('session not found')
-      const root = session.workDir?.trim() || process.cwd()
-      const walk = (dir: string, depth: number): Array<{ name: string; type: 'file' | 'folder'; children?: any[] }> => {
-        let entries: fs.Dirent[] = []
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return [] }
-        entries.sort((a, b) => {
-          if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
-          return a.name.localeCompare(b.name)
-        })
-        const out: Array<{ name: string; type: 'file' | 'folder'; children?: any[] }> = []
-        for (const e of entries.slice(0, 100)) {
-          if (e.name.startsWith('.')) continue
-          if (e.isDirectory()) {
-            out.push({ name: e.name, type: 'folder', children: depth < 4 ? walk(path.join(dir, e.name), depth + 1) : [] })
-          } else {
-            out.push({ name: e.name, type: 'file' })
-          }
-        }
-        return out
+      const root = path.resolve(session.workDir?.trim() || process.cwd())
+      const relDir = String((p as any)?.dir || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+      const abs = relDir ? path.resolve(root, relDir) : root
+      /* 目录穿越防护：只允许读工作区之内 */
+      if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error('目录越界（只允许工作区内）')
+      let entries: fs.Dirent[] = []
+      try { entries = fs.readdirSync(abs, { withFileTypes: true }) }
+      catch (e: any) { throw new Error('目录读取失败：' + String(e?.message || e)) }
+      entries.sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
+        return a.name.localeCompare(b.name)
+      })
+      const MAX_ENTRIES = 500
+      const out: Array<{ name: string; type: 'file' | 'folder'; size?: number }> = []
+      let truncated = 0
+      for (const e of entries) {
+        if (e.name.startsWith('.')) continue
+        if (out.length >= MAX_ENTRIES) { truncated++; continue }
+        if (e.isDirectory()) { out.push({ name: e.name, type: 'folder' }); continue }
+        let size = 0
+        try { size = fs.statSync(path.join(abs, e.name)).size } catch { /* 取不到大小不影响列出 */ }
+        out.push({ name: e.name, type: 'file', size })
       }
-      return { root, tree: walk(root, 0) }
+      return { root, dir: relDir, entries: out, truncated }
+    }
+
+    /* ★1127g（老板问："没加载的那些，搜索能搜到吗？"）—— 不能，所以搜索改成后端查。
+       前端树是"按层懒加载 + 分批渲染"，任何一层没展开、或超出单层 500 上限的条目都不在内存里，
+       拿它做过滤 = 搜不到。这里按名字**递归扫工作区**（跳过 node_modules/.git/dist 等），
+       返回相对路径；结果上限默认 200，超了如实回 truncated。 */
+    case 'workspace.search': {
+      const session = sessions.get(sessionId || String(p?.sessionId || ''))
+      if (!session) throw new Error('session not found')
+      const root = path.resolve(session.workDir?.trim() || process.cwd())
+      const q = String((p as any)?.q || '').trim().toLowerCase()
+      if (!q) return { root, hits: [], scanned: 0, truncated: false }
+      const maxHits = Math.min(500, Math.max(20, Number((p as any)?.limit) || 200))
+      const SKIP = new Set(['node_modules', '.git', '.nis', '.nis-history', 'dist', 'build', '__pycache__'])
+      const hits: Array<{ path: string; name: string; type: 'file' | 'folder' }> = []
+      let scanned = 0
+      let truncated = false
+      /* 扫描上限：实测这个工作区 6.3 万条目、全扫要 8.5 秒（小文件多、磁盘 IO 打满）。
+         3 万条 ≈ 4 秒左右，够用；超了如实回 scanned/truncated，前端提示"结果可能不全"。 */
+      const MAX_SCAN = 30_000
+      const walk = (dir: string, rel: string, depth: number): void => {
+        if (truncated || depth > 12) return
+        let entries: fs.Dirent[] = []
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue
+          if (e.isDirectory() && SKIP.has(e.name)) continue
+          scanned++
+          if (scanned > MAX_SCAN) { truncated = true; return }
+          const childRel = rel ? `${rel}/${e.name}` : e.name
+          if (e.name.toLowerCase().includes(q)) {
+            hits.push({ path: childRel, name: e.name, type: e.isDirectory() ? 'folder' : 'file' })
+            if (hits.length >= maxHits) { truncated = true; return }
+          }
+          if (e.isDirectory()) walk(path.join(dir, e.name), childRel, depth + 1)
+        }
+      }
+      walk(root, '', 0)
+      return { root, hits, scanned, truncated }
     }
 
     // 用户主动删除工作区文件（工作区面板右键；与 AI 的 fs_delete 工具不同：这是用户操作，不走审批门禁）
@@ -30221,6 +30456,78 @@ const allowed = [
       return st ? { diffAdded: st.diffAdded, diffRemoved: st.diffRemoved } : { diffAdded: 0, diffRemoved: 0 }
     }
 
+    /* ★1127e（老板拍板："按文件聚合 + 点开能看 diff"）—— 取某一条改动的 **unified diff 文本**。
+       之前只有 `diffStat`（+N-M 两个数字），点不开也看不到内容，这是"文件变更看着鸡肋"的根因。
+       快照口径与 diffStat 完全一致：
+         before = `beforeHash` 指向的快照（写入前）；after = `afterHash` 快照，没有就用**当前磁盘内容**。
+       行数超限（`unifiedDiff` 返回 null）⇒ 如实回 `tooLarge:true`，前端显示"只看行数"，绝不半份 diff 糊人。 */
+    case 'fs.history.diff': {
+      const session = sessions.get(sessionId || String(p?.sessionId || ''))
+      if (!session?.workDir) throw new Error('session not found')
+      const workDir = session.workDir.trim()
+      const changeId = String(p?.changeId || '')
+      const wantPath = String(p?.path || '')
+      let change: HistoryChange | undefined
+      let beforeBuf: Buffer | null = null
+      let afterBuf: Buffer | null = null
+      let turns: number[] = []
+      if (changeId) {
+        /* 单条改动（按轮次视图点开）：before/after 都取这条自己的快照 */
+        change = listChanges(workDir).find(c => c.id === changeId)
+        if (!change) throw new Error('记录不存在')
+        beforeBuf = change.beforeHash ? readObject(change.beforeHash) : null
+        if (change.afterHash) afterBuf = readObject(change.afterHash)
+        else if (change.relPath) { try { afterBuf = fs.readFileSync(resolveChangePath(workDir, change.relPath)) } catch { afterBuf = null } }
+        if (typeof change.turnIndex === 'number') turns = [change.turnIndex]
+      } else if (wantPath) {
+        /* ★1127e-3（老板实测："按文件显示 +75 -20，点开却只有 +"）—— 按文件视图看**跨轮汇总**。
+           实现注意：不要拿"最早 before → 最新 after"整段去对齐 —— 改动分散在 3.3 万行里时，
+           公共前后缀剥不掉多少，中间段直接超面积（实测 9 处改动跨 4 轮 ⇒ null）。
+           改为**逐条算、按时间顺序串起来**：每条都只有几十行，内存恒定，还能看出"哪一轮改的什么"。 */
+        const all = listChanges(workDir)
+          .filter(c => String(c.relPath || '') === wantPath && c.beforeHash && c.actor !== '用户撤销' && c.actor !== '用户撤销(整轮)')
+          .sort((a, b) => Number(b.t) - Number(a.t))          // 新的在前
+        if (!all.length) throw new Error('该文件没有改动记录')
+        const newest = all[0]
+        const parts: string[] = []
+        let skipped = 0
+        for (const c of all.slice(0, 20).reverse()) {          // 反转成"旧 → 新"
+          /* ⚠️ 必须**两端都有快照**才配对算：缺 afterHash 的老记录如果回落到"读当前磁盘"，
+             等于拿几十轮前的快照去比现在的文件 —— 实测直接把 37 轮差异全算进来（47 万行 diff）。 */
+          if (!c.beforeHash || !c.afterHash) { skipped++; continue }
+          const bf = readObject(c.beforeHash)
+          const af = readObject(c.afterHash)
+          const d = unifiedDiff(bf?.toString('utf8') ?? '', af?.toString('utf8') ?? '')
+          if (!d) { skipped++; continue }
+          if (d.split('\n').length > 3000) { skipped++; continue }   // 单段过大（多为整文件重写）→ 不展示
+          parts.push(`# 第 ${typeof c.turnIndex === 'number' ? c.turnIndex : '?'} 轮\n${d}`)
+        }
+        return {
+          path: wantPath,
+          tool: String(newest.tool || ''),
+          turnIndex: null,
+          turns: [...new Set(all.map(c => Number(c.turnIndex)).filter(n => Number.isFinite(n) && n > 0))].sort((a, b) => a - b),
+          aggregate: true,
+          at: Number(newest.t) || 0,
+          diff: parts.join('\n'),
+          tooLarge: false,
+          parts: parts.length,
+          skipped,
+        }
+      } else throw new Error('changeId 或 path 必填')
+      const diff = unifiedDiff(beforeBuf?.toString('utf8') ?? '', afterBuf?.toString('utf8') ?? '')
+      return {
+        path: String(change.relPath || wantPath || ''),
+        tool: String(change.tool || ''),
+        turnIndex: typeof change.turnIndex === 'number' ? change.turnIndex : null,
+        turns,
+        aggregate: !changeId,
+        at: Number(change.t) || 0,
+        diff: diff ?? '',
+        tooLarge: diff === null,
+      }
+    }
+
     case 'fs.history.saveRestoredCopy': {
       // 冲突分支：把快照版本另存为 .restored 副本（不覆盖当前文件）
       const session = sessions.get(sessionId || String(p?.sessionId || ''))
@@ -30322,6 +30629,9 @@ const allowed = [
         status: patch.status,
         members: patch.members,
         pinned: patch.pinned,
+        /* ★1126：知识库绑定 + 回答强度（前端「知识库绑定」弹窗提交） */
+        knowledgeBindings: patch.knowledgeBindings,
+        answerPolicy: patch.answerPolicy,
       })
       if (!r.ok) throw new Error(r.error)
       broadcastHost({ type: 'host/projects-changed' })
