@@ -74,6 +74,8 @@ import { omitNotice } from './spillStore.ts'
 import { LAZY_FAMILIES, familyIndexLine, splitToolsForRequest, shouldMountLoader } from './lazyTools.ts'
 /* ★1126：用户画像（USER.md）+ 项目记忆（MEMORY.md）——两个 md 文件，取代原「近3天常驻记忆」 */
 import { buildProfileBlock, parseProfileLinks, profileEntries, readProfile, writeProfile } from './memoryProfile.ts'
+/* ★1122：软件环境的安装源**远程可配**（改源不用重新打包）—— 域名白名单钉在代码里防篡改 */
+import { loadEnvSources, DEFAULT_SOURCES, fillTemplate } from './envSources.ts'
 import { listChanges, readObject, checkConflict, restoreChange, putObject, saveChanges, listOrphanWorkdirs, setWorkdirsRootProvider, removeWorkdir, diffStatByHash, resolveChangePath, changeStatus, turnSummaries, enforceBudget, setHistoryQuota, historyStats, autoCleanHistory, unifiedDiff, type HistoryChange } from './fileHistory.ts'
 import { memoryBridge, buildMemoryTools, setProfileWriteConfirm, setKnowledgeScope, resetMemoryPython, BRIDGE_SCRIPT, USING_BUNDLED_KERNEL, currentMemoryDir, defaultMemoryDir, setDistillLlm, coreDigestLine, memoryPythonCommand } from './memoryBridge.ts'
 import { listPinned, pinPinned, unpinPinned, type PinnedKind } from './pinnedStore.ts'
@@ -16439,10 +16441,11 @@ async function runNpmInstall(job: EnvJobState): Promise<void> {
        （GitHub 实测只有 7KB/s），带上系统代理；国内镜像（npmmirror）保持直连 —— 塞代理反而可能绕远。
        curl / node 都不读系统代理，所以这件事必须我们自己做（见 systemProxyUrl()）。 */
     const npmProxy = systemProxyUrl()
-    for (const [url, label] of [
-      ['https://registry.npmjs.org/npm/-/npm-' + NPM_VER + '.tgz', '官方源'],
-      ['https://registry.npmmirror.com/npm/-/npm-' + NPM_VER + '.tgz', 'npmmirror 镜像'],
-    ] as const) {
+    /* ★1122：源列表**远程可配**（官网 env-sources.json；拉不到/不合法就用内置兜底） */
+    const envSrc = await loadEnvSources()
+    const npmList = (envSrc.npm.length ? envSrc.npm : DEFAULT_SOURCES.npm)
+      .map(s => [fillTemplate(s.url, { NPM: NPM_VER }), s.label] as const)
+    for (const [url, label] of npmList) {
       job.phase = '下载 npm ' + NPM_VER + '（' + label + '）'
       const foreign = !/npmmirror|taobao|cnpm|tencent/i.test(url)
       const curlArgs = ['-L', '--fail', '--retry', '2', '-o', tmp]
@@ -16488,13 +16491,13 @@ async function runGitBashInstall(job: EnvJobState): Promise<void> {
     /* ★1010-D 实测坑：首次安装时 <envDir> 可能还不存在 → curl -o 写不进目录、两源「均不可达」假象。
        下载前先建目录（不是兜底，是安装器的本职）。 */
     fs.mkdirSync(envInstallDir(), { recursive: true })
-    // ① 下载（GitHub 官方 → npmmirror 镜像）
+    // ① 下载（源列表**远程可配**；默认 GitHub 官方 → npmmirror 镜像）
     job.stage = 'download'; job.percent = -1; job.bytes = 0; job.totalBytes = 0
     let downloaded = false
-    for (const [url, label] of [
-      ['https://github.com/git-for-windows/git/releases/download/v' + GITBASH_VER + '.windows.1/' + file, 'GitHub 官方'],
-      ['https://registry.npmmirror.com/-/binary/git-for-windows/v' + GITBASH_VER + '.windows.1/' + file, 'npmmirror 镜像'],
-    ] as const) {
+    const gbSrc = (await loadEnvSources()).gitbash
+    const gbList = (gbSrc.length ? gbSrc : DEFAULT_SOURCES.gitbash)
+      .map(s => [fillTemplate(s.url, { VER: GITBASH_VER, FILE: file }), s.label] as const)
+    for (const [url, label] of gbList) {
       job.phase = '下载 Git Bash ' + GITBASH_VER + '（' + label + '）'
       const r = await runEnvStep(job, pathPresent(curl) ? curl : 'curl', ['-L', '--fail', '--retry', '2', '-o', tmp, url], { timeoutMs: 10 * 60 * 1000 })
       if (r.code === 0 && pathPresent(tmp)) { downloaded = true; break }
@@ -16579,9 +16582,11 @@ async function runEmbedInstall(job: EnvJobState): Promise<void> {
     if (!pipOk) throw new Error('依赖安装失败（已试清华源与官方源，见日志末尾）')
 
     job.percent = -1
-    const code = "import os;os.environ.setdefault('HF_ENDPOINT','https://hf-mirror.com');from sentence_transformers import SentenceTransformer;SentenceTransformer('BAAI/bge-small-zh-v1.5');print('NiusDream-EMBED-OK')"
+    /* ★1122：模型下载端点也**远程可配**（默认 hf-mirror 国内镜像） */
+    const hfEndpoint = (await loadEnvSources()).embedHfEndpoint || DEFAULT_SOURCES.embedHfEndpoint
+    const code = "import os;os.environ.setdefault('HF_ENDPOINT','" + hfEndpoint + "');from sentence_transformers import SentenceTransformer;SentenceTransformer('BAAI/bge-small-zh-v1.5');print('NiusDream-EMBED-OK')"
     const r4 = await runEnvStep(job, vpy, ['-c', code], { phase: '下载语义模型 bge-small-zh-v1.5', timeoutMs: 45 * 60 * 1000 })
-    if (r4.code !== 0) throw new Error('语义模型下载失败（已试 hf-mirror 镜像，见日志末尾）')
+    if (r4.code !== 0) throw new Error('语义模型下载失败（端点 ' + hfEndpoint + '，见日志末尾）')
 
     fs.writeFileSync(memoryVenvMarker(), new Date().toISOString(), 'utf8')
     markEnvInstalled('embed', 'venv')   // ★ 0921d：来源标记（env.status 据此标 source=nis）
