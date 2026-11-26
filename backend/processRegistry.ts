@@ -22,6 +22,12 @@ interface ProcOrigin {
   projectId?: string
   /** 显示用短标签（后台任务标题 / 命令摘要） */
   label?: string
+  /** 团队 V2 执行身份：**由工具启动层从执行作用域原样带下来**（`teamV2AttemptScope`）。
+   *  这里只当搬运工，绝不推断 —— 落库（`noteAttemptPid`）用它，不再按成员 ID 去 running 里挑一个。 */
+  team?: { hostSessionId: string; requestId: number; attemptId: number }
+  /** ★1124：启动意图 token —— `spawn()` **之前**就已经落进团队账本的那条事实。
+   *  进程起来后用它把 pid 补回同一行（`bindProcIntent`），进程结束用它删行。 */
+  intentToken?: string
 }
 
 export interface TrackedProc {
@@ -42,11 +48,39 @@ let seq = 0
 const procs = new Map<string, TrackedProc>()
 let emitter: ((p: TrackedProc) => void) | null = null
 let remover: ((p: TrackedProc) => void) | null = null
+let registrar: ((p: TrackedProc, phase: 'spawned' | 'identified') => void) | null = null
+/* ★1124：启动意图钩子 —— 在 `spawn()` **之前**把"这单要起一个工具进程"落进账本。
+   与 registrar 的分工：registor 是"进程已经起来之后的事实"，这个是"即将起来之前的事实"。 */
+let intentHook: { begin: (origin: ProcOrigin) => string | null; end: (token: string) => void } | null = null
+export function setProcIntentHook(hook: { begin: (origin: ProcOrigin) => string | null; end: (token: string) => void } | null): void { intentHook = hook }
+/** 工具启动层在 `spawn()` 之前调：团队执行 ⇒ 返回 token（账本已有 intent 行）；非团队 ⇒ null。 */
+export function procIntentBegin(origin: ProcOrigin): string | null {
+  if (!intentHook) return null
+  return intentHook.begin(origin)
+}
+/** 进程结束 / 启动失败 ⇒ 删掉那条 intent。删不掉只记日志：残留行会让这一单被当成"未知副作用"挡住（保守方向）。 */
+export function procIntentEnd(token: string | null | undefined): void {
+  if (!intentHook || !token) return
+  try { intentHook.end(String(token)) } catch (err) {
+    try { console.warn('[proc] 启动意图收尾失败（该单将按"未确认副作用"处理）:', String((err as Error)?.message || err)) } catch { /* ignore */ }
+  }
+}
 
 /** 新增/变化 → server 广播（前端列表实时出现/更新） */
 export function setProcEmitter(fn: ((p: TrackedProc) => void) | null): void { emitter = fn }
 /** 结束 → server 广播移除（设计口径：结束就消失，不留在列表里） */
 export function setProcRemover(fn: ((p: TrackedProc) => void) | null): void { remover = fn }
+/** ★第十三轮：**持久登记**钩子（与广播彻底分开 —— 广播失败不影响事实，登记失败才影响围栏）。
+ *
+ *  两个阶段，**先落 pid、后补指纹**：
+ *   · `'spawned'`    进程刚起来，pid 已知、指纹还没查 ⇒ 调用方先用 pid 落一行（startStamp=null）。
+ *   · `'identified'` 指纹查询完了（非空串=指纹 / ''=确实查无此进程 / null=查询失败）⇒ 补写同一行。
+ *  为什么分两步：指纹查询是一次 PowerShell 往返（几十~几百毫秒）。原来"查完指纹才落库"，
+ *  后端在这一段里被 SIGKILL，这个 pid 就谁也不知道 —— 那正是"进程启动到持久登记的崩溃窗口"。
+ *
+ *  约定：本函数**不吞异常**。registrar 的实现必须自己把失败处置成账本/阻断事实；
+ *  真的抛出来 = 该记的没记上，必须让启动层看见（不许静默变成一个跑着的野进程）。 */
+export function setProcRegistrar(fn: ((p: TrackedProc, phase: 'spawned' | 'identified') => void) | null): void { registrar = fn }
 
 const emit = (p: TrackedProc): void => { try { emitter?.(p) } catch { /* ignore */ } }
 const remove = (p: TrackedProc): void => { try { remover?.(p) } catch { /* ignore */ } }
@@ -74,8 +108,12 @@ export function procRegister(pid: number, meta: { exe?: string; cmdline?: string
     origin: { ...meta.origin },
   }
   procs.set(id, p)
+  /* ★第十三轮：**先登记持久事实，再查指纹**（关闭"启动→落库"的崩溃窗口）。
+     阶段 1 只带 pid（指纹未知，如实写 null）；阶段 2 指纹出来后再补同一行。 */
+  if (registrar) registrar(p, 'spawned')
   /* 指纹同步补一次（~150ms）：拿不到就不记 —— procKill 里"没有指纹"走宽松分支，见那里的守卫 */
   p.pidStart = procStartStamp(n) || undefined
+  if (registrar) registrar(p, 'identified')
   emit(p)
   return id
 }

@@ -22,12 +22,24 @@ import { mapToWsFrame, type MuxFrameLike } from './wsMap.ts'
 import { noteFrame, readProbe, resetProbe, probeEnabled, setProbeEnabled, noteEmitCost } from './wsProbe.ts'
 import { createMemberActivity, MEMBER_ROSTER_ID, type MemberTurn } from './memberActivity.ts'
 import { createMemberActivityBridge, type MemberInput } from './memberActivityBridge.ts'
+import { openTeamV2Ledger } from './teamV2Ledger.ts'
+import { checkTeamFile } from './teamV2FileCheck.ts'
+import { projectCoordinationUsage, projectTeamV2Usage } from './teamV2Usage.ts'
+import { createTeamV2Scheduler } from './teamV2Scheduler.ts'
+import { normalizeTeamV2Verify, resolveTeamV2Intake } from './teamV2Intake.ts'
+import { describeVerifyOutcome, runTeamV2Verify } from './teamV2Verifier.ts'
+import { prepareTeamV2Review, type ReviewReceipt } from './teamV2ReviewInput.ts'
+import { createTeamV2Reviewer, REVIEW_OUTPUT_TOKENS, REVIEW_SYSTEM, type ReviewUsage } from './teamV2Reviewer.ts'
+import { memberReportArtifact, MEMBER_REPORT_FORMAT } from './teamV2Report.ts'
+import { buildStageBrief } from './teamV2Delivery.ts'
 import { slimAgentEvent } from './agentEventSlim.ts'
 import http from 'node:http'
 import os from 'node:os'
 import fs from 'node:fs'
 import path from 'node:path'
-import { createHash, randomBytes } from 'node:crypto'
+import { once } from 'node:events'
+import { shellDescriptorPaths } from './browserShellCtl.ts'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
@@ -44,11 +56,15 @@ import type { AgentMessage, AgentEvent, BeforeToolCallContext, AgentTool, ImageC
 import { buildResponsesRequest, parseResponsesReply } from './responsesProtocol.ts'
 /* ★member-lifetime：成员用量**唯一口径**的纯聚合（全历史=当前+归档段、命中率=Σ读/(Σ读+Σ未命中)）。
    读取层只负责把会话对象映射成 SegmentRow，怎么加怎么算只有这一份（见模块头注释）。 */
-import { collectMemberUsageViews, detailTotalsFromView, mergeViewsIntoMemberTotals, pickCurrentRow, sessionToSegmentRow, type MemberUsageSegmentRow, type MemberUsageTotalsView } from './memberUsageAggregate.ts'
+import { applyUsageViewToRecord, collectMemberUsageViews, detailTotalsFromView, mergeViewsIntoMemberTotals, pickCurrentRow, sessionToSegmentRow, type MemberUsageSegmentRow, type MemberUsageTotalsView } from './memberUsageAggregate.ts'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { rebuildTranscriptFromMessages } from './transcriptRebuild.ts'
 import { buildCheckRunTool } from './tools.ts'
-import { buildSessionTools, setSnapshotTurn, buildProjectNoteTool, buildLoadToolsTool, buildListDirTool, buildScheduleTools, buildRepoTools, resetBashPath, wasWrittenBySession } from './tools.ts'
+import { buildSessionTools, setSnapshotTurn, buildProjectNoteTool, buildLoadToolsTool, buildListDirTool, buildScheduleTools, buildRepoTools, buildImageTool, buildVideoTool, resetBashPath, wasWrittenBySession } from './tools.ts'
+/* ★1126：生成模型的配置读写（生图工具与审批门禁共用同一份真相） */
+import { getMediaTools, setMediaTarget, listMediaCandidates, type MediaKind } from './mediaTools.ts'
+/* ★1126：生成图片的画廊索引（prompt 只在落盘那一刻有，必须那时记） */
+import { addGalleryEntry, listGallery, galleryCount, removeGalleryEntry, markDeleted, restoreEntry } from './mediaGallery.ts'
 /* ★1128：工具执行分级 + 按会话的并行闸门（见文件头注释） */
 import { applyExecutionModes, createToolGate, DEFAULT_TOOL_GATE_LIMIT } from './toolExecMode.ts'
 /* ★1010：项目档案「档案卡」（体量 + 各节行范围 + 最近进度/决策）——新窗口开箱即知，别再整份读档案 */
@@ -67,7 +83,13 @@ import { buildWebTools, getWebSearchConfig, setWebSearchConfig, sealPortableSear
 import { getSkills, getSkillsSync, formatSkillList, invalidateSkillCache, skillsSnapshotSync } from './skillTools.ts'
 import { buildInstallTools, readInstallLog, appendInstallLog, SKILLS_DIR, MCP_DIR } from './installTools.ts'
 import { initAgentPresets, listAgentPresets, readAgentPreset, writeAgentPreset, deleteAgentPreset, INSTALL_SYSTEM_PROMPT, PRESETS_DIR } from './agentPresetsStore.ts'
+/* ★1124c：LLM 失败分类与文案的**唯一源**（纯模块，可单测）——见 llmFailure.ts 文件头说明。 */
+import {
+  RETRY_LADDER_MS, classifyFailure, hintWithCode, fatalReasonPhrase,
+  type ErrMode, type ErrHint, type FailVerdict,
+} from './llmFailure.ts'
 import { buildPresetAdminTools } from './presetAdminTools.ts'
+import { createPresetPlanCheck, type PresetPlanCheck } from './presetPlanCheck.ts'
 import { runCodexTurn } from './externalAgents/codexAdapter.ts'   // ★1001 外部预设：codex 引擎子进程
 import { runAcpTurn, type PartEvent } from './externalAgents/acpRuntime.ts'   // ★1010 P0：外部流 ACP 运行时（ext-stream/PartEvent 契约）
 import { listExternalAgents, startInstall, uninstallExternalAgent, startLogin, setExternalKey, getExternalKey, listModels, fetchQuota } from './externalAgents/installer.ts'   // ★1001 外部 agent 可拆装安装器
@@ -442,10 +464,50 @@ function consumeTurnShots(sessionId: string): string[] {
   return list
 }
 
+/** ★1126：从会话里找**最后一条带图的用户消息**（图生图的默认参考图）。
+ *  只认 user 角色 —— AI 自己生成的图不算"用户给的参考"。 */
+function findLastUserImages(sessionId: string): Array<{ data: string; mimeType: string }> {
+  const s: any = sessions.get(sessionId)
+  const msgs = s?.messages
+  if (!Array.isArray(msgs)) return []
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m?.role !== 'user') continue
+    const content = m?.content
+    if (!Array.isArray(content)) continue
+    const imgs = content.filter((c: any) => c?.type === 'image' && typeof c.data === 'string' && c.data)
+    if (imgs.length) {
+      return imgs.slice(0, 3).map((c: any) => ({
+        data: String(c.data).replace(/^data:[^;]+;base64,/, ''),
+        mimeType: String(c.mimeType || 'image/png'),
+      }))
+    }
+  }
+  return []
+}
+
+/** ★1126：按相对路径从会话工作区读一张图（图生图的 refShotRef 用），越界/不存在 → null */
+function readWorkspaceImageAsBase64(sessionId: string, ref: string): { data: string; mimeType: string } | null {
+  const wd = sessions.get(sessionId)?.workDir?.trim()
+  if (!wd) return null
+  const root = path.resolve(wd)
+  const abs = path.resolve(root, ref)
+  if (!abs.startsWith(root + path.sep) || !fs.existsSync(abs)) return null
+  try {
+    const buf = fs.readFileSync(abs)
+    if (!buf.length) return null
+    const ext = path.extname(abs).toLowerCase()
+    const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : 'image/png'
+    return { data: buf.toString('base64'), mimeType }
+  } catch {
+    return null
+  }
+}
+
 /** 0908 三批：截图落盘——把 base64 写入【工作区 screenshots/】目录，details 只存相对路径 shotRef
  *  （前端经 /api/workspace-file 渲染 live+刷新都能出图）。transcript/sessions.json 不再塞 base64。
  *  无工作区或写盘失败 → 回退内联 dataUrl，绝不让图丢失。 */
-function persistShot(sessionId: string | undefined, base64: string, mime: string): Record<string, any> {
+function persistShot(sessionId: string | undefined, base64: string, mime: string, meta?: { prompt?: string; model?: string; size?: string }): Record<string, any> {
   const ext = mime.includes('png') ? 'png' : mime.includes('gif') ? 'gif' : mime.includes('webp') ? 'webp' : 'jpg'
   const wd = sessionId ? sessions.get(sessionId)?.workDir?.trim() : ''
   if (!wd) return { dataUrl: `data:${mime};base64,${base64}` }
@@ -457,6 +519,17 @@ function persistShot(sessionId: string | undefined, base64: string, mime: string
     fs.writeFileSync(full, Buffer.from(base64, 'base64'))
     // 二十一批：通道会话 → 记进本轮清单，agent_end 自动补发到 IM（"图一定要到手机上"）
     noteTurnShot(sessionId, full)
+    /* ★1126：**所有落盘图都进索引**（不再只记带 prompt 的）——
+       带 prompt 的算 AI 生成，其余（截图/转发的图）算截图；画廊按 kind 分两栏。 */
+    addGalleryEntry({
+      shotRef: `screenshots/${fname}`,
+      sessionId: sessionId || '',
+      prompt: meta?.prompt || '',
+      model: meta?.model || '',
+      size: meta?.size || '',
+      ts: Date.now(),
+      kind: meta?.prompt ? 'image' : 'screenshot',
+    })
     return { shotRef: `screenshots/${fname}`, mime }
   } catch {
     return { dataUrl: `data:${mime};base64,${base64}` }
@@ -1015,13 +1088,16 @@ async function syncGroupName(channel: string, botId: string, peerId: string): Pr
   setPeerLabel(channel, botId, peerId, info.name, 'group', { auto: true })
   console.log(`[channel] 群名已同步：${peerId.slice(0, 8)} →「${info.name}」${info.memberNum ? `（${info.memberNum} 人）` : ''}`)
 }
-import { buildTeamTools, clearBlackboard, abortSubAgents, abortSubAgentByMember, loadBlackboard, memberName, memberViaSessionEnabled, setMemberRunLimitProvider, setMemberInspectorProvider, setInspectorReviewer, isRunActive, installMemberStreamOpHook, type TeamCtx, type ModelOverride } from './teamRuntime.ts'
+import { clearBlackboard, abortSubAgents, abortSubAgentByMember, loadBlackboard, memberName, memberViaSessionEnabled, setMemberRunLimitProvider, setMemberInspectorProvider, setInspectorReviewer, isRunActive, installMemberStreamOpHook, type TeamCtx, type ModelOverride } from './teamRuntime.ts'
 /* ★m6-member-model：成员会话模型决策（判定本体独立成模块 ⇒ 可隔离单测；这里只注入真依赖） */
 import { applyResolvedMemberTurnModel, resolveMemberTurnModel, type MemberTurnLlm, type MemberTurnLlmDeps } from './memberTurnModel.ts'
 import { runningSubAgentCount, setSubAgentsIdleHook } from './teamRuntime.ts'
+import { procStartStamp, sameStamp } from './procIdentity.ts'
+import { judgeFenceProbe, isFenceCleared } from './teamV2FenceProbe.ts'
+import { bindTeamAttempt, unbindTeamAttempt, type TeamAttemptIdentity } from './teamV2AttemptScope.ts'
 import { buildCloneTools, cancelClones, isCloneRunActive } from './cloneRuntime.ts'
 import { Type as TbType } from 'typebox'
-import { currentLlmConfig, endpointBase, getState, isBuiltinProvider, setProviderKey, setProviderLogo, setActiveModel, setActiveEffort, activeEffort, setProviderBase, setProviderProxy, setProviderProtocol, toggleProviderEnabled, addProvider, removeProvider, setModels, fetchModelsRemote, testConnectionRemote, revealKey, plainKeyById, plainKey, sealPortableKeys, unsealPortableKeys, autoSyncZenFreeModels, ensureProviderKeysWarmed, resolveModelCaps, resolveModelEfforts, clampEffort, resolveMaxOutput, resolveContextWindow, resolveMaxInput, reloadProviders, keepImportedProviderModels, backgroundLlmConfig, setBackgroundModel, type ProviderModel, opencodeGatewayHeaders } from './providers.ts'
+import { currentLlmConfig, endpointBase, getState, isBuiltinProvider, setProviderKey, setProviderLogo, setActiveModel, setActiveEffort, activeEffort, setProviderBase, setProviderProxy, setProviderProtocol, toggleProviderEnabled, addProvider, removeProvider, setModels, fetchModelsRemote, testConnectionRemote, revealKey, plainKeyById, plainKey, sealPortableKeys, unsealPortableKeys, autoSyncZenFreeModels, ensureProviderKeysWarmed, resolveModelCaps, resolveModelKind, resolveModelEfforts, clampEffort, resolveMaxOutput, resolveContextWindow, resolveMaxInput, reloadProviders, keepImportedProviderModels, backgroundLlmConfig, setBackgroundModel, type ProviderModel, opencodeGatewayHeaders } from './providers.ts'
 /* ★ 1001：密钥加密（enc:v1:dpapi/…）的判定 —— 发送前用它拦"把密文当明文发出去"这一类代码缺陷 */
 import { isEncrypted } from './secretbox.ts'
 import { sanitizeRequestMessages, repairToolPairing } from './messageSanitize.ts'
@@ -1030,9 +1106,9 @@ import { isUpstreamLeakText, stripUpstreamLeak, leakedToolNames, leakGateSplit, 
 /* 0920：语音（语音输入 ASR / 朗读 TTS）—— 模型增量包，装到 <envDir>/voice，不进安装包 */
 import { voiceState, voiceInstallStart, voiceJobGet, voiceRemove, voiceSpeak, voiceTranscribe, voiceRelease, loadCfg as loadVoiceCfg, saveCfg as saveVoiceCfg, modelCfg as voiceModelCfg, findModel as findVoiceModel } from './voice.ts'
 /* 0920：后台任务（挂后台跑长命令/下载，完事通知会话与 AI） */
-import { bgList, bgGet, bgStop, bgPause, bgResume, bgClear, bgReadOutput, setBgEmitter, setBgNotifier, setBgWatcher, bgSuggestWatchSec } from './backgroundTasks.ts'
+import { bgList, bgGet, bgStop, bgPause, bgResume, bgClear, bgReadOutput, setBgEmitter, setBgNotifier, setBgWatcher, bgSuggestWatchSec, resumeVideoPolls } from './backgroundTasks.ts'
 /* ★ 0922e：进程监控（AI 工具拉起的进程） */
-import { procList, procKill, setProcEmitter, setProcRemover } from './processRegistry.ts'
+import { procList, procKill, setProcEmitter, setProcRemover, setProcRegistrar, setProcIntentHook } from './processRegistry.ts'
 import { setFileLockRunLiveness } from './fileLocks.ts'
 import { recordUsage, stats, resetStats, type BillingPeriod } from './billing.ts'
 import { loadJsonOrBackup, degradedFiles, persistJson } from './jsonStore.ts'
@@ -1047,7 +1123,7 @@ import * as sessionStore from './sessionStore.ts'
 import { configureSessionIndex, closeSessionIndex, sessionIndexSearch, sessionIndexSearchEvents, sessionIndexStatus, sessionIndexOnWritten, sessionIndexDelete } from './sessionIndex.ts'
 /* ★1130：注入消息的唯一判据（`server.ts` 与 `sessionIndexCore.mjs` 共用同一份）——
    见 injectMarkers.mjs 头注释：两边判据不同 ⇒ 搜索结果的"第 N 轮"与界面对不上 ⇒ 跳错轮。 */
-import { INJECT_MARKERS, INJECTED_USER_PREFIXES, stripInjectedLines, isInjectedUserMsg } from './injectMarkers.mjs'
+import { INJECT_MARKERS, INJECTED_USER_PREFIXES, stripInjectedLines, isInjectedUserMsg, unregisteredInjectPrefix } from './injectMarkers.mjs'
 /* ★L4：孤儿 tool_use 修复（纯 JS 纯函数，便于单测；只读不写）
    ★L4-c：`ORPHAN_TEXT` 是"结果未知"的唯一文案 —— 检查点恢复补的 result 也用它，
    两边必须是同一句话，否则前端/模型会看到两套口径（`ORPHAN_MARK` 是幂等判据，含在文案里）。 */
@@ -1071,7 +1147,15 @@ function logMM(msg: string) {
 // ============================================================================
 
 // 0911 #16：支持 NIS_PORT 覆盖（冒烟副本验证用，默认仍是 8766）
-const PORT = Number(process.env.NIS_PORT || 8766)
+let PORT = Number(process.env.NIS_PORT || 8766)
+
+/** In-process consumers can wait for the real bind instead of guessing a port. */
+export async function backendListeningAddress() {
+  if (!server.listening) await once(server, 'listening')
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('Backend did not bind a TCP port')
+  return { port: address.port, logEpoch: LOG_EPOCH }
+}
 
 // ============================================================================
 // Types (minimal DSH protocol)
@@ -1313,6 +1397,11 @@ interface QueuedMsg {
    *  丢了它 ⇒ `beginTurnMark(session, undefined)` ⇒ `turnSource` 退化成 'user'
    *  ⇒ 自动续跑/通知轮被当成"用户在等" ⇒ 界面挂处理中 + 输入框变停止键（状态对不上的另一半）。 */
   source?: string
+  /** ★1124y：**只给模型看的本轮情境**（IM 场景块 / 定时任务标题…）。
+   *  与 `text` 分开存：`text` 是用户原话（落盘、气泡、排队条都读它），
+   *  这个只在出队真发时交给 `runPromptCore.modelContext`。
+   *  合一的话（原来把前缀拼进 text）⇒ 落盘就是拼后文本 ⇒ 气泡里露系统提示词。 */
+  modelContext?: string
   noticeReason?: NoticeMeta['reason']
 }
 
@@ -1487,7 +1576,7 @@ interface SessionView {
   /** turn 计时（TTFT/耗时统计） */
   turnStartTime?: number
   firstTokenTime?: number
-  lastTurnTiming?: { llmMs: number; ttftMs: number; toolMs?: number }
+  lastTurnTiming?: { llmMs: number; ttftMs: number; toolMs?: number; decodeMs?: number }
   /** 工具计时（tool_execution_start → end 累加） */
   toolStartTime?: number
   toolMsTotal?: number
@@ -1575,7 +1664,7 @@ function buildSettingsUpdateTool(_sessionId: string): AgentTool<any> {
       bumpSettingsVersion()
       persistSettings()
       const changed = Object.keys(patch).join('、')
-      broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(globalSettings)) })
+      broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() })
       return {
         content: [{ type: 'text', text: `已更新设置：${changed}` }],
         details: { updated: Object.keys(patch) },
@@ -1691,7 +1780,7 @@ const LLM_MAX_RETRIES = Number.isFinite(_retryEnvNum) && _retryEnvNum >= 0
   ? Math.min(10, Math.floor(_retryEnvNum))
   : 5            // 0908十（需求）：正常 1 次 + 最多重试 5 次，5 次全失败即终止
 // 0908十：阶梯退避（用户指定）=第 n 次重试前等待 LADDER[n-1]：5s/10s/30s/60s/120s
-const LLM_RETRY_LADDER_MS = [5000, 10000, 30000, 60000, 120000]
+const LLM_RETRY_LADDER_MS = RETRY_LADDER_MS
 type RetryPhase = 'retry' | 'recovered' | 'failed'
 /**
  * ★1035 结构修复：**轮级重试态有自己的一条事件**，不再借 `message_updated`。
@@ -2311,299 +2400,26 @@ function computeSendBudget(providerId: string, modelId: string, sysText: string,
   const sendOutput = Math.max(CTX_SEND_MIN_OUTPUT, Math.min(wantOutput, Math.max(room, CTX_SEND_MIN_OUTPUT), outCap))
   return { win, estimate, ratio, estCalibrated, wantOutput, sendOutput, outCap }
 }
-/** ── 0921 错误分类：哪些值得重试、哪些重试一万次也一样 ──
- *  重试值：429 限流 / 5xx 网关抖动 / 网络中断 —— 阶梯退避（5/10/30/60/120 秒）本来就是为它们设计的。
- *  重试无用（立刻失败，别白等 3.7 分钟）：上下文超限、参数非法、鉴权失败、模型不存在等确定性错误
- *  （安装版实测：400「maximum context length」被重试 5 轮，参数一字未变，注定全灭）。 */
-/** 从错误文本里取 HTTP 状态码 —— 只认明确形态，避免把 token 数（1048576 之类）当码。 */
-function httpCodeOf(msg: string): number {
-  const raw = String(msg || '')
-  const head = /^\s*(\d{3})\s*:/.exec(raw)              // '429: {...}'
-  if (head) return Number(head[1])
-  const j = /"(?:code|status|status_code)"\s*:\s*"?(\d{3})"?/i.exec(raw)   // {"code":429}
-  if (j) return Number(j[1])
-  const sc = /\b(?:status(?:\s*code)?|http)\s*[:=]?\s*(\d{3})\b/i.exec(raw) // status 429
-  if (sc) return Number(sc[1])
-  return 0
-}
-
-/* ★1028e：**没有状态码**时，只有下面这些形态算"瞬时、可退避重试"；其余一律立即失败。 */
-const RETRYABLE_TEXT = [
-  'rate_limit', 'rate limit', 'too many requests', 'tpm exhausted', 'tpm/rpm limit', 'rpm limit',
-  'terminated', 'econnreset', 'econnrefused', 'etimedout', 'socket hang up', 'fetch failed',
-  'connection reset', 'connection closed', 'network error', 'stream ended', 'premature close',
-  /* ★cx1（实测 12:42:35 两个成员同时断在 Connection error.，一行都没落盘）：上面列的是**具体形态**，
-     可网络层错误是开放集合、各网关/SDK 报法不一 —— 最通用的 connection error 竟然不在名单里 ⇒ 落到默认分支。
-     这里补「同一族、写法不同」的常见变体（只补形态，不把整类硬塞进来）。 */
-  'connection error', 'connection refused', 'connection timeout', 'connection aborted', 'econnaborted',
-  'other side closed', 'undici', 'upstream connect error', 'network is unreachable',
-]
-
-/*
- * 失败分类（1028e 收紧）。
- *   可重试：429 限流、408/425/499、5xx 网关抖动、网络层瞬断。
- *   立即失败：其余 4xx、鉴权/额度/模型不存在/参数非法/上下文与输出上限。
- *   ⚠️ 400 归"立即失败"这一支，但**纠偏重试在 fatal 分支里**（缩上下文/钳 max_tokens/裁输入）——
- *      那是"改参数再试一次"，与"原样退避 5 轮"不是一回事。
- *   ⚠️ 原来认不出来的一律判 retry ⇒ 什么错都进重试循环、白等 4 分钟（1028e 修）。
- */
-/* ★cx1（实测 12:42:35 两个成员同时断在 Connection error.，两件任务连开工都没开就死了）：
-   **判据结构修正** —— 原来拿「枚举黑名单 + 默认 fatal」当唯一判据，名单覆盖不到的网络错**一次都不试**。
-   网络层错误是开放集合、枚举不尽，所以默认分支也得有依据；但要和「确认可重试」分档，不能一刀切：
-     · retry         已知可重试（429/408/425/499、5xx、命中 RETRYABLE_TEXT）→ 满额 LLM_MAX_RETRIES（5 轮，5/10/30/60/120s≈4min）
-     · retry-unknown 两个名单都没命中 → 限 LLM_UNKNOWN_RETRY_MAX（4 次；退避 5/10/30/60s≈105s，够等一次抖动恢复）
-     · fatal         4xx / 命中确定性名单 → 立即停（fatal 名单一条没删，仍是第一判据）
-   ⚠️ 这**不是**回到 1028e 之前「所有错都重试 5 轮」：未知档封顶 4 次，不会无脑白等 4 分钟。
-   ⚠️ 返回三档；全仓 9 处调用点都只判 === fatal，故加一档不影响既有分支（另：判据仍以 fatal 名单优先，
-      401 unauthorized 这类文案即便被写进 RETRYABLE_TEXT 也照样 fatal）。 */
-const LLM_UNKNOWN_RETRY_MAX = 4
-type LlmVerdict = 'retry' | 'retry-unknown' | 'fatal'
-function classifyLlmFailure(msg: string): LlmVerdict {
-  const raw = String(msg || '')
-  const s = raw.toLowerCase()
-  const code = httpCodeOf(raw)
-  if (code) {
-    if (code === 429 || code === 408 || code === 425 || code === 499) return 'retry'
-    if (code >= 500) return 'retry'      // 网关抖动：退避后大概率好
-    return 'fatal'                        // 其余 4xx：401/402/403/404/400
-  }
-  const fatal = [
-    'maximum context length', 'context_length_exceeded', 'context length exceeded', 'reduce the length of the messages',
-    'too many tokens', 'prompt is too long', 'max_tokens is too large', 'string too long',
-    'invalid max_tokens', 'range of max_tokens', 'max_tokens must',
-    'invalid_request_error', 'invalid request', 'invalid parameter', 'unsupported', 'not supported',
-    'does not exist', 'no such model', 'model not found', 'unknown model',
-    'unauthorized', 'invalid api key', 'incorrect api key', 'permission denied', 'insufficient',
-    'permission_denied', 'token plan', 'not available in the current',
-  ]
-  if (fatal.some((k) => s.includes(k))) return 'fatal'
-  if (RETRYABLE_TEXT.some((k) => s.includes(k))) return 'retry'
-  /* ★cx1：两个名单都没命中 —— 不再默认 fatal（那会让「没枚举到的网络错」永远无法自愈）。
-     按「未知档」处理：可重试但封顶 4 次；日志会如实写「未识别的错误（两个名单都未命中）」。 */
-  return 'retry-unknown'
-}
-/** 本轮最多允许重试几次：retry=满额 LLM_MAX_RETRIES；retry-unknown=4（需求）；fatal=0。 */
+/* ★1124c：原实现（httpCodeOf / RETRYABLE_TEXT / LLM_UNKNOWN_RETRY_MAX / classifyLlmFailure /
+   llmRetryCap / llmVerdictWhy / ErrHint / extractHttpCode / ErrMode / retryLadderMinutes / errStopPhrase /
+   terminalErrorHint / terminalErrorHintBase 共 311 行）已整体搬到纯模块 `llmFailure.ts`：
+   那边一次分类同时决定"用户看到什么话"和"要不要重试"，不会再出现文案与行为各说一套。
+   这里只留同名薄包装，调用点一处不改。 */
+function classifyLlmFailure(msg: string): FailVerdict { return classifyFailure(msg).verdict }
 function llmRetryCap(msg: string): number {
-  const v = classifyLlmFailure(msg)
-  if (v === 'fatal') return 0
-  return v === 'retry-unknown' ? Math.min(LLM_MAX_RETRIES, LLM_UNKNOWN_RETRY_MAX) : LLM_MAX_RETRIES
+  const c = classifyFailure(msg)
+  return c.verdict === 'fatal' ? 0 : Math.min(LLM_MAX_RETRIES, c.retryCap)
 }
-/** 日志/文案用的判定依据 —— 不再写「命中确定性错误」这种认不出也硬说的谎。 */
 function llmVerdictWhy(msg: string): string {
-  const v = classifyLlmFailure(msg)
-  if (v === 'fatal') return '确定性错误（4xx / 命中确定性名单）'
-  if (v === 'retry-unknown') return '未识别的错误（两个名单都未命中）'
-  return '已知可重试（429/5xx/命中网络·限流名单）'
+  const c = classifyFailure(msg)
+  if (c.verdict === 'fatal') return c.kind === 'abort' ? '主动中止（不是网络故障）' : `确定性错误（${c.kind}）`
+  if (c.verdict === 'retry-unknown') return `未识别档（${c.kind}），按 ${c.retryCap} 轮试探`
+  return `已知可重试（${c.kind}）`
 }
-/** ★ 0930（实测反馈「不知道为啥不重试」）：把"**这一轮为什么不重试**"讲清楚。
- *  以前只丢一句"确定性错误，重试无用"，用户仍分不清是自己 key 的问题还是模型的问题；
- *  这里点名命中的是哪一类（鉴权/额度/上下文超限/输出上限/模型不存在/参数非法）。 */
-function fatalReasonPhrase(msg: string): string {
-  const raw = String(msg || '')
-  const s = raw.toLowerCase()
-  const head = /^\s*(\d{3})\s*:/.exec(raw)
-  const code = head ? Number(head[1]) : 0
-  const groups: [string, string[]][] = [
-    ['鉴权/权限', ['unauthorized', 'invalid api key', 'incorrect api key', 'invalid_api_key', 'authentication', 'permission denied', 'permission_denied']],
-    ['额度/套餐', ['insufficient', 'token plan', 'not available in the current', 'quota']],
-    ['上下文超限', ['maximum context length', 'context_length_exceeded', 'context length exceeded', 'too many tokens', 'prompt is too long', 'string too long', 'too long']],
-    ['输出上限越界', ['invalid max_tokens', 'range of max_tokens', 'max_tokens must', 'max_tokens is too large']],
-    ['模型不存在', ['does not exist', 'no such model', 'model not found', 'unknown model']],
-    ['参数/接口不支持', ['invalid_request_error', 'invalid request', 'invalid parameter', 'unsupported', 'not supported']],
-  ]
-  const hit = groups.find(([, kws]) => kws.some(k => s.includes(k)))
-  const why = hit ? `命中「${hit[0]}」类错误`
-    : (code >= 400 && code < 500 ? `供应商返回 ${code}（4xx 确定性拒绝）` : '未识别的错误（两个名单都未命中）')
-  /* ★cx1：以前兜底写「命中确定性错误」是**谎报**（它根本没认出是哪类，排查方向被带偏）。
-     认得出的才说「原样重发结果一样」；认不出的老实说判据不足，并提示可能只是网络抖动。 */
-  const known = !!hit || (code >= 400 && code < 500)
-  return known
-    ? `未重试：${why} —— 同一份请求原样重发结果一样，得先改配置 / 等额度恢复`
-    : `未重试：${why} —— 判据不足，保守按确定性错误停了（疑似网络抖动请手动重跑一次）`
+function terminalErrorHint(msg: string, mode: ErrMode = 'fatal', retries = 0): ErrHint {
+  return hintWithCode(msg, mode, retries)
 }
 
-/** ── 0928 错误人话化：把报错翻译成**按类型给建议**的人话（覆盖全部常见状态码/错误类型） ──
- *  起因（实测）：上下文才 2% 也弹 400，真因是供应商**额度/余额不足**
- *  （原文 `insufficient credits ... purchase more credits`），却被通用模板写成
- *  "如上下文超限…"，把排查方向直接带偏（以为上下文饱满了）。
- *  ★ 400 是个"万能筐"，至少 6 种触发方式（只能按正文细分，不能按状态码）：
- *  ①额度/余额 ②套餐不含该模型 ③鉴权 ④模型不存在 ⑤内容安全拦截 ⑥输入/上下文超限
- *  ⑦输出上限 max_tokens 越界 ⑧其他参数非法。其余：401/402/403/404/413/422 各归各，
- *  429 限流 / 5xx 网关抖动 / 网络中断（terminated、ECONNRESET…）走"重试后"口径。
- *  识别顺序：先专后通（额度 → 套餐 → 鉴权 → 模型 → 内容 → 输入 → 输出 → 参数 → 限流 → 网关 → 网络），
- *  前面命中就不看后面（如 403 token plan 不会先被"模型不存在"抢走）。
- *  mode='fatal'（确定性错误，重试无用直接停）/ 'exhausted'（已重试多轮仍未恢复）——
- *  只影响兜底与结尾口径。返回 { short, full }：short = 给用户看的一句话（≤60 字）；
- *  full = short + 具体怎么办（进日志 / 给模型看 / 详情里可展开）。 */
-type ErrHint = { short: string; full: string }
-/** ★ 0930（实测反馈「报错不显示 40 几、只有人话」）：从错误原文里抠**真实 HTTP 状态码**。
- *  绝不按裸数字判 —— 错误正文里全是 token 数（1048576 / 393216…），裸数字必然误伤
- *  （与 classifyLlmFailure 里那句老规矩同源，这里是它的加强版：老规矩只认开头的 `401:`）。
- *  这里认四种**带上下文**的写法，覆盖各网关/SDK 的实际格式：
- *    ① `401: {...}`（pi-ai 当前格式） ② `{"status":401}` / `status_code=401` 这类键值
- *    ③ `HTTP 401` / `HTTP/1.1 401`  ④ `401 Unauthorized`（码+英文状态名，天然带上下文） */
-function extractHttpCode(msg: string): number {
-  const raw = String(msg || '')
-  const pats = [
-    /^\s*(\d{3})\s*:/,                                                                // ① "401: {...}"（pi-ai 当前格式）
-    /"?(?:status|status_?code|error_?code|code)"?\s*[:=]\s*"?(4\d\d|5\d\d)"?/i,        // ② {"status":401} / error_code=429
-    /\b(?:status|status_?code|error_?code)\b\s*[:=]?\s*"?\b(4\d\d|5\d\d)\b/i,           // ③ "status 401"（**空格**分隔；SDK 变体，实测漏过）
-    /\bHTTP[\s/]?(4\d\d|5\d\d)\b/i,                                                     // ④ HTTP/1.1 401
-    /\b(4\d\d|5\d\d)\b\s*[:\-]?\s*(Unauthorized|Forbidden|Not Found|Bad Request|Payment Required|Too Many Requests|Request Timeout|Internal Server Error|Bad Gateway|Service Unavailable)\b/i, // ⑤ 401 Unauthorized / 401: Unauthorized
-  ]
-  for (const p of pats) {
-    const m = p.exec(raw)
-    if (m) { const c = Number(m[1]); if (c >= 400 && c < 600) return c }
-  }
-  return 0
-}
-/** ★ 0930：包装层 —— 给 12 类人话**统一**挂上「真实状态码 · 」前缀。
- *  为什么放包装而不是改 12 个分支：分类文案还在长（0928/0929 一直在补词），逐个改必漏；
- *  在出口加一次，新增分类自动带码。**解析不出码就原样返回，绝不编一个码出来。** */
-function terminalErrorHint(msg: string, mode: 'fatal' | 'exhausted' = 'fatal'): ErrHint {
-  const h = terminalErrorHintBase(msg, mode)
-  const code = extractHttpCode(msg)
-  if (!(code > 0)) return h
-  return { short: `${code} · ${h.short}`, full: `${code} · ${h.full}` }
-}
-function terminalErrorHintBase(msg: string, mode: 'fatal' | 'exhausted' = 'fatal'): ErrHint {
-  const raw = String(msg || '')
-  /* ★1004（实测反馈"审批超时停轮却报网络层中断+自动重试 5 轮"）：**主动中止不是网络故障** ——
-     审批连续超时停轮/用户点停止走 abort()，LLM 层报 "Request aborted"，旧归类命中网络分支的
-     `aborted` 词根 → 谎报"网络层中断（没连上）"还挂"自动重试 5 轮后未恢复"（其实一轮都没重试）。
-     主动中止如实说：本轮已被停止，不是网络问题。 */
-  /* ★1026x（**1004 那次修了个寂寞**）：正则原来写的是 `\brequest aborted\b`（要求两个词**相邻**），
-     但上游实际抛的文本是 **`Request was aborted`** —— 中间多了 `was `，所以永远匹配不上
-     ⇒ 用户点停止后仍被归类成网络故障，显示"网络层中断…自动重试 5 轮"（实测截图 err="Request was aborted"）。
-     现在允许 `was/is` 的插入，并覆盖 `abort` 的几种变体。 */
-  if (/\brequest\s+(?:was\s+|is\s+)?abort(?:ed)?\b|^\[aborted\]|aborted by user|err_canceled|cancell?ed by user/i.test(raw)) {
-    return {
-      short: '本轮已停止（你点了停止，或审批连续超时自动停轮）：不是网络问题。',
-      full: '本轮已停止：**请求被主动中止**（你点了停止、或同一操作审批连续 2 次等不到授权自动停轮）——不是网络故障，无需检查网络。要继续的话重新发送指令即可（若是审批超时：先在卡片上点「允许一次」再发）。',
-    }
-  }
-  const s = raw.toLowerCase()
-  const code = Number((/^\s*(\d{3}):/.exec(raw) || [])[1] || 0)
-  // ① 额度/余额不足（402 / insufficient credits）
-  /* ★1013（实测反馈："我用的不是 commandcode 的模型，为什么报错里还有 commandcode 和 mimo"）：
-     这里原来的**用户可见文案**里粘着 0928 排查 commandcode.ai 的实测记录（同 key 下 mimo 报错、
-     deepseek 还能跑、像按模型/上游分池）—— 那是**内部事故记录**，对别的供应商的 402 毫无解释力，
-     却因为写在模板里，任何 402 都会念一遍（实测：用 deepseek-flash 报 402 也照样冒出 commandcode/mimo）。
-     修法：**用户可见 = 通用结论 + 可操作动作**；内部实测留在注释里。
-     ── 历史实测（0928 · commandcode.ai，留档备查）──────────────────────────
-     同 key 下 `xiaomi/mimo-v2.6-pro` 连 3.6K token 的小请求都报 insufficient credits，
-     而同 key 的 `deepseek/deepseek-v4.1-flash` 当时还能跑（一度像按模型/上游分池）；
-     随后 deepseek 也报同一错，还交替冒出 403「套餐不含该模型」与 429 限流 ⇒ 更像账户/套餐层面整体出问题。
-     细节：NIS-notes 决策记录 + 记忆库 lesson[0928]。
-     ── 给用户的通用结论只有一句（分池这件事是普适的）───────────────────── */
-  if (code === 402 || /insufficient\s+(credits?|quota|balance)|quota\s+exceeded|exceeded your (current )?quota|payment required|欠费|余额不足|额度不足|积分不足/.test(s)) {
-    return {
-      short: '该模型/上游额度不足（与上下文长度无关）——换个模型、换 key 或充值。',
-      full: '这一步没跑起来：**该供应商的这条模型/上游额度不足**（insufficient credits / quota exceeded）——'
-        + '与上下文长度、输出上限都无关，重试也不会好。'
-        + '有的供应商是**按模型/上游线分池**算额度，同一个 key 换个模型可能就能跑。'
-        + '所以：① 先换**同供应商的另一个模型**试试（成本最低）；② 不行就去充值/续费、查套餐状态；③ 或换 API key / 换供应商。',
-    }
-  }
-  // ② 套餐不含该模型 / 没权限（403 permission_denied）
-  if (code === 403 || /token plan|permission_denied|permission denied|not available in the current|upgrade your (plan|subscription)|no access to (this )?model|does not have (access|permission)/.test(s)) {
-    return {
-      short: '这个模型不在你当前套餐里（或没权限）——换模型或升级套餐。',
-      full: '这一步没跑起来：**当前套餐/计划不包含这个模型**'
-        + '（`model is not available in the current token plan`，403 permission_denied）——确定性错误，重试无用。'
-        + '① 在「设置→供应商→模型 ✎」换一个套餐内的模型；② 或去供应商后台升级/续费套餐；③ 或换供应商。',
-    }
-  }
-  // ③ 鉴权失败（401）
-  if (code === 401 || /unauthorized|invalid api key|incorrect api key|invalid_api_key|authentication/.test(s)) {
-    return {
-      short: '供应商鉴权失败：去「设置→供应商」检查 API key。',
-      full: '这一步没跑起来：**供应商鉴权失败**（key 无效 / 过期 / 权限不足）。去「设置→供应商」检查该供应商的 API key，'
-        + '或确认这个 key 有没有开对应模型的权限。',
-    }
-  }
-  // ④ 模型不存在/已下架/不被支持（404/400 unsupported_model —— 0928 真机 B 场景实测补词）
-  if (code === 404 || /model.{0,40}(not found|does not exist|no such|unknown|invalid|is not supported)|model_not_found|no such model|unknown model|unsupported_model|invalid model/.test(s)) {
-    return {
-      short: '模型 ID 不存在或已下架：去「设置→供应商→模型」核对模型名。',
-      full: '这一步没跑起来：**模型不存在 / 已下架**（model not found）——重试无用。'
-        + '① 核对模型 ID 拼写（含 `供应商/模型` 前缀）；② 去该供应商模型列表看它是否已下架/改名；③ 换一个可用模型。',
-    }
-  }
-  // ⑤ 内容安全拦截（400 content_filter）
-  if (/content[_ -]?(filter|policy|management)|responsibleai|sensitive|violation|inappropriate|flagged|prohibited|违规|敏感|拦截/.test(s)) {
-    return {
-      short: '这条内容被供应商安全策略拦下：改一下措辞再发，或换模型。',
-      full: '这一步没跑起来：**触发了供应商的内容安全策略**（content_filter / policy violation）——'
-        + '与技术配置无关，原样重发也不会过。① 改写措辞（尤其去掉攻击/越权/敏感表述）再试；② 或换安全策略更宽松的模型/供应商。',
-    }
-  }
-  // ⑥ 输入/上下文超限（400 / 413）
-  if (code === 413 || /maximum context length|context[_ -]?length|context_length_exceeded|prompt is too long|too many tokens|reduce the length of the messages|input is too long|longer than maximum/.test(s)) {
-    return {
-      short: '输入/上下文超限：压缩或删减历史，或换更大窗口的模型。',
-      full: '这一步没跑起来：**输入超过了模型的上下文/输入上限**（确定性错误，重试无用；自动纠偏会先试一次）。'
-        + '① 压缩或删减本会话历史（或开新会话）；② 在「设置→供应商→模型 ✎」调小输出上限给输入腾空间；③ 换窗口更大的模型。',
-    }
-  }
-  // ⑦ 输出上限/max_tokens 越界（400）
-  if (/max[_ ]?tokens|valid range|completion.{0,30}(too long|exceed)|output.{0,30}(too long|exceed|limit)/.test(s)) {
-    return {
-      short: '输出上限参数越界：去「设置→供应商→模型 ✎」调小输出上限。',
-      full: '这一步没跑起来：**max_tokens/输出上限超出了该模型的合法范围**（确定性错误；自动纠偏会先钳一次再试）。'
-        + '① 在「设置→供应商→模型 ✎」把输出上限调进供应商报的合法范围；② 或换输出上限更高的模型/线路。',
-    }
-  }
-  // ⑧ 其他参数非法（400/422 —— 400 万能筐里认不出触发方式的都落这）
-  if (code === 422 || code === 400 || /invalid_request|invalid request|invalid parameter|bad request|malformed|missing.{0,20}(parameter|field)/.test(s)) {
-    return {
-      short: '请求参数被供应商拒了（重试无用）：看原始报错，多为模型配置或会话数据问题。',
-      full: '这一步没跑起来：**请求参数非法**（invalid_request / bad request）——参数没变，重试也不会好。'
-        + '常见触发：输出上限/上下文等模型配置、会话里有不被支持的内容格式、供应商改了接口口径。'
-        + '① 看下面的原始报错定位；② 换个模型试（最快分辨是不是配置问题）；③ 或把这条会话的可疑内容删掉重发。',
-    }
-  }
-  // ⑨ 限流（429 tpm/rpm）
-  if (code === 429 || /rate.?limit|too many requests|\btpm\b|\brpm\b|inference exceeds|try again (in|later)|concurrent/.test(s)) {
-    return {
-      short: '供应商限流了：等一会儿再发、降并发，或找供应商提额。',
-      full: `这一步没跑起来：**触发供应商限流**（429 / tpm / rpm limit）——${mode === 'exhausted' ? '自动重试 5 轮（约 4 分钟）后仍未恢复' : '已按确定性错误直接停止'}。`
-        + '① 等几十秒到几分钟再发；② 减少并发（别的会话/工人同时在跑也算）；③ 找供应商提额或换线路。',
-    }
-  }
-  // ⑩ 网关/服务端抖动（5xx）
-  if (code >= 500 || /bad gateway|service unavailable|internal server error|overloaded|upstream|gateway.{0,20}(error|timeout)/.test(s)) {
-    return {
-      short: '供应商网关抖动：稍后重发，或换供应商/线路。',
-      full: `这一步没跑起来：**供应商服务端/网关故障**（5xx）——${mode === 'exhausted' ? '自动重试 5 轮（约 4 分钟）后仍未恢复' : '已直接停止'}。`
-        + '① 稍后重发；② 看该供应商状态页是不是在宕机；③ 换供应商/线路再试。',
-    }
-  }
-  // ⑪ 网络中断
-  if (/terminated|etimedout|econnreset|econnrefused|socket hang up|network|fetch failed|dns|timed? ?out|connection (reset|closed|refused)|aborted/.test(s)) {
-    return {
-      /* ★ 1001（用户问"为什么别的错有 40几、这条没有"）：这类是**网络层中断**，请求压根没拿到
-         回包 —— 状态码是服务端才给的东西，这里**客观上不存在**，所以显示不出来。
-         旧文案只写"网络层中断"，看着像"漏显示了码"，让人以为是 bug。改成明说"没有状态码 + 为什么"，
-         一眼能分清【服务端报错】和【压根没连上】。 */
-      short: '无状态码 · 网络中断（连接未建立）：检查网络/代理后重新发送。',
-      full: `这一步没跑起来：**网络层中断，本次没有 HTTP 状态码**（连接被掐/超时/域名解析失败——请求没到达服务端，所以没有 40几/5xx 可显示）——${mode === 'exhausted' ? '自动重试 5 轮（约 4 分钟）后仍未恢复' : '已直接停止'}。`
-        + '① 检查本机网络/代理/VPN；② 确认供应商域名可达；③ 重发这条消息即可。',
-    }
-  }
-  // ⑫ 兜底（认不出类型）
-  return mode === 'exhausted'
-    ? {
-        short: '请求多轮重试后仍未成功：看原始报错详情，或换模型/稍后再试。',
-        full: '这一步没跑起来：**自动重试多轮后仍未成功**，且错误文本不属于已知类型。'
-          + '① 看下面的原始报错定位；② 换个模型试（最快分辨是配置问题还是线路问题）；③ 或稍后再发。',
-      }
-    : {
-        short: '本次请求是确定性错误（上下文超限 / 参数非法 / 鉴权失败），重试无用。',
-        full: '本次请求是确定性错误（如上下文超限 / 参数非法 / 鉴权失败）——重试无用，已直接停止。'
-          + '若是上下文超限：压缩或删减本会话历史，或在「设置→供应商→模型 ✎」调小输出上限。',
-      }
-}
 /** 0921：从 400 原文里抠出供应商**自己报**的三个数（这是最硬的真相，比任何估算都准）。
  *  样本（实测原文）：
  *  `This model's maximum context length is 1048576 tokens. However, you requested 1049171 tokens
@@ -2990,12 +2806,8 @@ function resolveLlmCfg(override?: { provider?: string; model_id?: string } | nul
   }
 }
 
-async function llmOnceDirect(
-  prompt: string,
-  systemPrompt: string,
-  opts: { maxTokens?: number; timeoutMs?: number; override?: { provider?: string; model_id?: string; effort?: string | null } | null } = {},
-): Promise<string> {
-  const llmCfg = resolveLlmCfg(opts.override)
+type DirectLlmOptions = { maxTokens?: number; timeoutMs?: number; contextWindow?: number; override?: { provider?: string; model_id?: string; effort?: string | null } | null }
+function directLlmRequest(llmCfg: ReturnType<typeof resolveLlmCfg>, prompt: string, systemPrompt: string, opts: DirectLlmOptions) {
   if (!llmCfg.base || !llmCfg.model) throw new Error('未配置模型')
   /* ★1013：让"后台模型的推理强度"对提炼这类**非对话**调用也生效（用户："后台模型也能自由选强度"）。
      只有该模型确实支持思考（clampEffort 返回非空）时才打开 reasoning，避免给非推理模型塞 thinking 参数。 */
@@ -3013,7 +2825,7 @@ async function llmOnceDirect(
   const piModel: NiusDreamModel<'openai-completions'> = {
     id: llmCfg.model, name: llmCfg.model, api: proto as any, provider: llmCfg.providerId as any,
     baseUrl: llmCfg.base, reasoning: !!_effort, input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: opts.contextWindow ?? 128000, maxTokens,
     compat: proto === 'openai-completions'
       ? (isLongCat ? { supportsStore: false, supportsDeveloperRole: false, maxTokensField: 'max_tokens' as const } : { supportsDeveloperRole: false })
       : proto === 'anthropic-messages' ? {} : undefined,
@@ -3029,29 +2841,40 @@ async function llmOnceDirect(
     // ★1013：后台模型的推理强度（仅当该模型支持思考时才有值；非推理模型不加此参数）
     ...(_effort ? { reasoningEffort: _effort } : {}),
   } as any
-  let out = ''
-  // 空输出容错：推理款模型偶发"只思考不出正文"（empty output，实测 glm-5.3-flash）→ 重试一次（0913）
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  return async () => {
     const st = proto === 'anthropic-messages'
       ? anthropicMessagesStream(piModel as any, ctx, callOpts)
       : proto === 'google-generative-ai'
         ? googleGeminiStream(piModel as any, ctx, callOpts)
         : (proto === 'openai-responses' ? openaiResponsesStream : openaiCompletionsStream)(piModel as any, ctx, callOpts)
-    out = ''
     for await (const ev of st) {
-      if (ev.type === 'done') {
-        const mm: any = (ev as any).message
-        out = (mm.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('').trim()
-      } else if (ev.type === 'error') {
-        // 透传上游错误细节（此前只报 'llm direct error'，把 402 欠费/4xx 这类关键信息藏掉了）
-        const detail = JSON.stringify((ev as any).error || (ev as any).reason || ev).slice(0, 300)
-        throw new Error('llm direct error: ' + detail)
-      }
+      if (ev.type === 'done' || ev.type === 'error') return ev
     }
-    if (out) return out
+    throw new Error('Model stream ended without a terminal event')
+  }
+}
+
+async function llmOnceDirect(prompt: string, systemPrompt: string, opts: DirectLlmOptions = {}): Promise<string> {
+  const run = directLlmRequest(resolveLlmCfg(opts.override), prompt, systemPrompt, opts)
+  // Existing extraction callers allow one retry for empty output. The reviewer does not use this wrapper.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const ev = await run()
+    if (ev.type === 'error') throw new Error('llm direct error: ' + JSON.stringify((ev as any).error || (ev as any).reason || ev).slice(0, 300))
+    const text = directAssistantText(ev.message)
+    if (text) return text
     if (attempt === 1) console.warn('[llmOnceDirect] 空输出，重试一次…')
   }
   throw new Error('empty llm output')
+}
+
+function directAssistantText(message: any): string {
+  return (message.content || []).filter((block: any) => block.type === 'text').map((block: any) => block.text).join('').trim()
+}
+
+function directReviewUsage(value: any): ReviewUsage | null {
+  const { input, output, cacheRead, cacheWrite } = value ?? {}
+  if (![input, output, cacheRead, cacheWrite].every(n => Number.isSafeInteger(n) && n >= 0) || input + output + cacheRead + cacheWrite === 0) return null
+  return { input, output, cacheRead, cacheWrite }
 }
 
 /** 从模型输出抠出 JSON 对象（容忍 markdown 围栏 / 前后废话） */
@@ -4126,7 +3949,7 @@ export function setMemberStreamOpHook(h: { begin: (sid: string, actor?: string) 
  *     **重启后第一次读到的是骨架也照样升级**（任务单点名的"重启骨架"场景）。
  *
  *  只读：不建会话、不改账本、不做任何迁移。 */
-function readMemberSegmentRows(sessionId: string, memberId?: string): MemberUsageSegmentRow[] {
+function readMemberSegmentRows(sessionId: string, memberId?: string, teamOnly = false): MemberUsageSegmentRow[] {
   const out: MemberUsageSegmentRow[] = []
   const only = String(memberId || '')
   if (!sessionId) return out
@@ -4135,7 +3958,7 @@ function readMemberSegmentRows(sessionId: string, memberId?: string): MemberUsag
       const anyS: any = s
       if (String(anyS?.parentSessionId || '') !== sessionId) continue
       const mid = String(anyS?.memberId || '')
-      if (!mid) continue
+      if (!mid || (teamOnly && /^clone\d+$/i.test(mid))) continue
       if (only && mid !== only) continue
       let dm: any = anyS
       if (dm._skeleton === true) {
@@ -4149,6 +3972,7 @@ function readMemberSegmentRows(sessionId: string, memberId?: string): MemberUsag
       if (row) out.push(row)
     }
   } catch (e) {
+    if (teamOnly) throw e
     try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员分段失败（${String((e as Error)?.message || e)}）`) } catch { /* ignore */ }
   }
   return out
@@ -5521,7 +5345,11 @@ ${_summary}${_quotesBlock}` }] }
           /* ★0929c：人话归类优先按错误轨迹里第一个确定性错误（429/400…），不再被最后一轮的
              terminated 误判成"网络层中断"；原始错误行附完整轨迹（多轮去重、限 4 条）。 */
           const _repErr = attemptErrs.find(s => classifyLlmFailure(s) === 'fatal') || terminalErr
-          const th3 = terminalErrorHint(_repErr, 'exhausted')
+          /* ★1124c（老板实测："根本没触发重试，直接弹自动重试 5 轮"）：按**实际发生了什么**说 ——
+             真重试过 N 轮才说"重试 N 轮"；已经输出过内容（forwarded）的从设计上就不重试，如实说，
+             不再借 exhausted 的文案谎报轮数。 */
+          const _retried3 = Math.max(0, attempt - 1)
+          const th3 = terminalErrorHint(_repErr, _retried3 > 0 ? 'exhausted' : forwarded ? 'interrupted' : 'fatal', _retried3)
           if (!forwarded && !signal?.aborted) {
             clearRetryState(sessionId)   /* ★1028c：终态只留红卡 */
             retryLog('failed', Math.max(1, _cap1), terminalErr || '连接中断')
@@ -5560,7 +5388,9 @@ ${_summary}${_quotesBlock}` }] }
           sessionLog(sessionId, 'error', 'llm', `流式响应异常中断: ${em}`)
           /* ★0929c：同 th3 —— 归类优先看轨迹里的确定性错误，原始错误行带完整轨迹 */
           const _repErr2 = attemptErrs.find(s => classifyLlmFailure(s) === 'fatal') || em
-          const th4 = terminalErrorHint(_repErr2, 'exhausted')
+          /* ★1124c：与 th3 同口径 —— 说真实轮数，别把"没重试"说成"重试 5 轮"。 */
+          const _retried4 = Math.max(0, attempt - 1)
+          const th4 = terminalErrorHint(_repErr2, _retried4 > 0 ? 'exhausted' : forwarded ? 'interrupted' : 'fatal', _retried4)
           if (!forwarded && !signal?.aborted) {
             clearRetryState(sessionId)   /* ★1028c：终态只留红卡 */
             retryLog('failed', Math.max(1, _cap2), em)
@@ -5977,6 +5807,12 @@ type TeamReturn = { batchId: string; text: string; memberIds: string[]; attempt?
 type TeamReturnAttempt = { batch: TeamReturn; message?: AgentMessage }
 const teamReturnInboxes = new WeakMap<SessionView, { pending: Map<string, TeamReturn>; accepted: Set<string>; stopped: boolean }>()
 const teamReturnPrompts = new WeakMap<Record<string, unknown>, TeamReturnAttempt>()
+/** ★第十三轮：`attempt` = 这一轮执行的确切身份（调度器接纳的那一单），由执行器在派工时写入。
+ *  开工边沿拿它绑定到成员会话（工具启动层据此把 pid 记到这条 attempt 名下），
+ *  不再"按成员 ID 去 running 里挑一个"。 */
+type TeamV2Turn = { id: string; attempt: TeamAttemptIdentity; started: () => void; result?: Extract<AgentEvent, { type: 'agent_end' }> }
+const teamV2Turns = new WeakMap<Record<string, unknown>, TeamV2Turn>()
+const teamV2Hosts = new WeakMap<SessionView, ReturnType<typeof openTeamV2SessionHost>>()
 /* Runtime only: admission is bound to the exact agent; delivered inputs to the exact message. */
 const nativeSidebarStarts = new WeakMap<Agent, { source: SidebarTurnSource }>()
 const sidebarInputs = new WeakMap<AgentMessage, 'user'>()
@@ -6069,156 +5905,26 @@ async function judgeBgWorthWaking(convId: string, contextText: string): Promise<
   }
 }
 
-/** ★0930：续跑到限后的「收尾汇报」——不再一句通知了事，补一轮让 LLM 把情况说清楚
- *  （这几轮做了什么 / 现在什么状态 / 要用户确认什么）。只发一次（cappedNotified 门闩）。 */
-function fireBgResumeWrapup(convId: string): void {
-  const c = bgResumeChainOf(convId)
-  const parked = c.pending.splice(0)
-  const text = '【自动续跑 · 收尾】后台自动续跑已达上限（' + bgResumeMax() + ' 轮），自动续跑到此停止。' +
-    (parked.length ? '\n另外还有没来得及处理的后台事件：\n' + parked.join('\n---\n') + '\n' : '') +
-    '\n现在给用户写一段**正文汇报**（这是正文消息，不是通知）：1）这几轮自动续跑各自做了什么、结果如何；' +
-    '2）任务当前状态（完成/失败/卡在哪一步）；3）需要用户确认或决定什么——**具体列出**（没有就明说"无需确认"）。'
-  /* ★1130 修（**实测"后台任务回归显示成用户消息"**）：这里原来**没登记注入身份**（`fireBgResume` 登记了，它漏了）。
-     后果一：这条落盘没有 `_inject` ⇒ 历史投影判成 `kind='user'` ⇒ 前端画成**用户气泡**（老大截图那条
-     「后台任务完成：「静默安装实测 v3」…」，磁盘 id=42a3156c，keys 里确实没有 _inject）。
-     后果二：会话忙时它走队列，`source` 也一起丢了 ⇒ `turnSource` 退化 'user' ⇒ 界面以为用户在等。
-     与 `fireBgResume` 补齐同一口径：**注入消息必须有结构化身份**，不许靠正文前缀让读侧猜。 */
-  pushInjectMeta(convId, { merge: false, at: Date.now(), kind: 'bg_wrapup' })
-  void runPromptCore(convId, { message: text, source: 'notice' }).catch((e: any) => {
-    const q = pendingBgNotices.get(convId) || []
-    q.push({ text })
-    pendingBgNotices.set(convId, q.slice(-10))
-    pushBgResumeNotice(convId, '收尾汇报启动失败（已转待办）：' + String(e?.message || e).slice(0, 120))
-  })
-}
+/* ══ 自动续跑链：**已拆除**（2026-11-24 老板拍板）══════════════════════════════════════
+ * 拆的是什么：原来「后台任务结束 ⇒ 系统自动替 AI 开一轮接着干」。它的可见形态就是老板报的那条：
+ *   **AI 正常回复完正文之后又接着回复一段，计时还清零重跑**（新一轮 = 新 turnId、新计时/新用量）。
+ *
+ * 为什么拆：这套"事后拉起"没有先例 ——
+ *   · Claude Code：后台任务完成只发 **task notification** 投递进 inbox，由模型在**下一次交互**里消化；
+ *     官方 issue #82151 明写 "turn completion and background-task completion are uncoupled"，
+ *     他们**没有**用"开新轮"来解决它。
+ *   · DSH（本机源码）：子任务 report / 可续话（tool-subagent-control），也不开新轮。
+ *   而我们这套是 10/22 为绕开 steer 分组 bug 定的临时形态（"播报 + 独立轮"），代价就是上述副作用。
+ *
+ * 现在走哪条：**与团队/成员回归同构**（`injectSessionNotice` 的第二分支）——
+ *   · AI 空闲（mainRunning=false）→ 开一轮把结果带走（老板认可的这半截保留）；
+ *   · AI 正忙 → 只入 `pendingBgNotices`（inbox），**本轮不排队、收轮后也不开新轮**；
+ *     下次任何轮次开始前由 `drainBgNotices` 一并带给模型；
+ *   · 用户可见通知照旧（`session-notice` 内联提示 / noticeLog）。
+ * ⚠️ 团队回归 / 成员回归走它们自己的 `injectSessionNotice` + `wakeTeamReturn`，本次拆除不碰它们。
+ * ⚠️ `【自动续跑` 前缀的**历史消息**仍按 injectMarkers 剥/渲染（存量数据），只是不再产生新的。
+ */
 
-/* ══ ★ 0923：后台事件「自动续跑」链（用户定案）══════════════════════════════════
- * 解决什么：任务挂后台跑完后，AI 若空闲**没人叫它**（原来只记待办，等用户下次发话才补送）
- *   ⇒ 现在：任务结束事件一到 → 自动替 AI 开一轮接着干（成功做下一步、失败查原因）。
- * 与 bg_watch 的分工：本机制管「有终点的任务」（事件驱动，不猜时间）；bg_watch 退化为看门狗
- *   （常驻任务的健康检查 / 超时卡死告警）。
- * 既定的四条：① 设置开关默认开（general.bgAutoResume）② 轮数上限默认 3、可调 1~10
- *   （general.bgAutoResumeMax）③ 到限留一句话 ④ 用户按停止 = 暂停。
- * 让路规则（需求）：用户正在对话时不打断 —— 事件先排队，用户那轮答完立刻续跑。 */
-interface BgResumeChainState { rounds: number; pending: string[]; stopped: boolean; cappedNotified: boolean }
-const bgResumeChains = new Map<string, BgResumeChainState>()
-function bgResumeChainOf(convId: string): BgResumeChainState {
-  let c = bgResumeChains.get(convId)
-  if (!c) { c = { rounds: 0, pending: [], stopped: false, cappedNotified: false }; bgResumeChains.set(convId, c) }
-  return c
-}
-/** 开关（缺省=开）：settings.general.bgAutoResume */
-function bgResumeEnabled(): boolean { return (globalSettings as any).bgAutoResume !== false }
-/** 轮数上限（缺省 3，夹在 1~10）：settings.general.bgAutoResumeMax */
-function bgResumeMax(): number {
-  const n = Number((globalSettings as any).bgAutoResumeMax)
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.max(Math.round(n), 1), 10) : 3
-}
-/** 用户亲自发话 → 额度重置、解除暂停（每次用户交互重新给一整份额度） */
-function resetBgResumeChain(convId: string): void {
-  const c = bgResumeChains.get(convId)
-  if (!c) return
-  c.rounds = 0
-  c.stopped = false
-  c.cappedNotified = false
-}
-/** 会话内联提示（用户可见；与后台任务通知同一通道） */
-function pushBgResumeNotice(convId: string, text: string): void {
-  try {
-    broadcastMux(convId, { type: 'session/projection', sessionId: convId, key: 'session-notice', seq: Date.now(), value: { text } } as any)
-  }catch (e) { /* ignore */ swallowedThrottled('broadcast', e, 'session/projection|' + String(convId)) }
-}
-/** 待续跑事件退回「等用户下次发话补送」通道（信息不丢） */
-function parkBgResumePending(convId: string): void {
-  const c = bgResumeChains.get(convId)
-  if (!c || !c.pending.length) return
-  const q = pendingBgNotices.get(convId) || []
-  q.push(...c.pending.splice(0).map((t: string) => ({ text: t })))
-  pendingBgNotices.set(convId, q.slice(-10))
-}
-/** 真正开一轮：文本走「【自动续跑」前缀 ⇒ 前端渲染成 notice，不伪装成用户消息
- *  ★1025：`mergeIntoPrev`（通知到达时上一轮还在写 / 分身还在跑）⇒ 显示上并入当前轮、不新起头像。
- *   该事实走 `pushInjectMeta` 结构化通道，不再往正文塞 `[[nis:merge]]` 机器标记。 */
-function fireBgResume(convId: string, notes: string[], mergeIntoPrev = false): void {
-  const c = bgResumeChainOf(convId)
-  const max = bgResumeMax()
-  c.rounds += 1
-  pushInjectMeta(convId, { merge: mergeIntoPrev, at: Date.now(), kind: 'bg_resume' })
-  const body = notes.join('\n---\n')
-  const text = '【自动续跑 · 后台任务完成】你之前挂到后台的任务已经结束了，结果如下：\n' + body +
-    '\n\n（这一轮由「后台任务完成」事件自动触发，不是用户在提问。要看完整输出用 bg_read，看全部任务用 bg_list。）' +
-    '\n请据此接着推进你原来在做的事：成功了就做下一步（例如构建成功后跑测试/做验证）；失败了就查输出定位原因再修。' +
-    '\n若还需要长时间等待，可以继续挂后台任务 —— 跑完会再自动触发一次。' +
-    '\n这是第 ' + c.rounds + '/' + max + ' 次自动续跑。' +
-    /* ★0930（需求）：最后一轮必须正文汇报情况，别干巴巴一句"等待确认" */
-    (c.rounds >= max ? '\n⚠️ 这是最后一次自动续跑——本轮收尾前必须给用户一段**正文汇报**：这几轮自动续跑各自做了什么、任务当前状态（完成/失败/卡在哪）、需要用户确认或决定什么（**具体列出**；没有就明说"无需确认"）。别只留一句通知。' : '')
-  const go = () => {
-    void runPromptCore(convId, { message: text, source: 'notice' }).catch((e: any) => {
-      console.warn('[bg-resume] 自动续跑失败:', e)
-      const q = pendingBgNotices.get(convId) || []
-      q.push({ text: body })
-      pendingBgNotices.set(convId, q.slice(-10))
-      pushBgResumeNotice(convId, '后台续跑启动失败（已转为待办提示）：' + String(e?.message || e).slice(0, 120))
-    })
-  }
-  const ag = agents.get(convId) as any
-  if (ag?.waitForIdle) void ag.waitForIdle().then(go).catch(go)
-  else go()
-  sessionLog(convId, 'info', 'lifecycle', '后台任务事件 → 自动续跑第 ' + c.rounds + '/' + max + ' 轮')
-}
-/** 任务结束时的入口。返回 true = 续跑链接管（已开跑 / 已排队等这轮结束） */
-function scheduleBgResume(convId: string, note: string, _status: string): boolean {
-  if (!bgResumeEnabled()) return false
-  const c = bgResumeChainOf(convId)
-  if (c.stopped) return false
-  if (c.rounds >= bgResumeMax()) {
-    if (!c.cappedNotified) {
-      c.cappedNotified = true
-      /* ★1109（老大定：那句「已达上限」告警去掉）—— 到限只补「收尾汇报」，
-         由 LLM 的正文说清这几轮做了什么、现在什么状态；再叠一句机读告警属于重复叙述。 */
-      c.pending.push(note)
-      fireBgResumeWrapup(convId)
-      return true
-    }
-    return false
-  }
-  const ag = agents.get(convId) as any
-  /* ★1020（活跃口径统一）：原来只认 `state.isStreaming` ⇒ 工具批次/待审批/子代理期间被判"空闲"，
-     后台续跑通知会**立刻注入**而不是等本轮结束（打断当前轮）。改用 sessionAgentBusy()。 */
-  /* ★1024bl（设计定案）：**并行要保留** —— 分身在跑时后台任务照样可以处理（这是优点），
-     所以这里**不把分身算作"忙"**（不排队、不阻塞）。分身/主 agent 还在跑的这段时间里，
-     续跑内容只是**显示上并入当前轮**（见下方 fireBgResume 的 merge 参数）：
-     一次提问始终是一个头像、运行行计时不重置。 */
-  const busy = sessionAgentBusy(convId)
-  if (busy || !ag) {
-    // 用户正在对话 / 会话还没开跑 → 不打断：排队，等这轮自然结束（drainBgResumeAfterIdle）再续
-    c.pending.push(note)
-    return true
-  }
-  /* ★1024bk/bl：**空闲时到达**：若还有分身在跑（这一轮其实还没真正结束）⇒ 显示上并入当前轮
-     （并行照旧、只是不新开头像）；分身也跑完了 ⇒ 这才是真的一段新回复（新头像）。 */
-  fireBgResume(convId, [note], hasRunningSubAgents(convId))
-  return true
-}
-/** 一轮自然结束（waitForIdle 之后、队列已空）→ 有排队事件就立刻续跑 */
-function drainBgResumeAfterIdle(convId: string): void {
-  const c = bgResumeChains.get(convId)
-  if (!c || !c.pending.length) return
-  if (!bgResumeEnabled() || c.stopped) { parkBgResumePending(convId); return }
-  if (c.rounds >= bgResumeMax()) {
-    if (!c.cappedNotified) {
-      c.cappedNotified = true
-      /* ★1109：同上 —— 到限只补「收尾汇报」（会把 c.pending 里的事件一并带上），不再弹一句话告警 */
-      fireBgResumeWrapup(convId)
-      return
-    }
-    parkBgResumePending(convId)
-    return
-  }
-  const notes = c.pending.splice(0)
-  /* ★1024bk：**排队来的** = 通知到达时上一轮还在写 ⇒ 显示上并入当前轮（不新起头像）。 */
-  fireBgResume(convId, notes, true)
-}
 
 /**
  * 0920：把"后台任务完成"的待办提示补进这个会话。
@@ -6227,8 +5933,8 @@ function drainBgResumeAfterIdle(convId: string): void {
  * ⚠️ 刻意不写进 transcript：那会凭空多一条用户消息（UI 上很怪），也容易跟 pi 的内部序列打架。
  */
 function drainBgNotices(sessionId: string, agent: unknown): void {
-  // ★ 0923：把「自动续跑队列里没来得及跑的事件」一并补送 —— 用户发话了，让他这轮看到全部待办
-  parkBgResumePending(sessionId)
+  /* ★1124：inbox（`pendingBgNotices`）现在是**唯一**的待办来源 —— 自动续跑链已拆除，
+     不再有"续跑队列"需要并进来（原来这里要先 parkBgResumePending 把续跑队列倒进 inbox）。 */
   const q = pendingBgNotices.get(sessionId)
   if (!q || !q.length) return
   pendingBgNotices.delete(sessionId)
@@ -6248,7 +5954,10 @@ function drainBgNotices(sessionId: string, agent: unknown): void {
       const _now = Date.now()
       const _inject: any = { merge: true, at: _now, kind: 'bg_notice' }
       if (_ids.length) _inject.memberIds = _ids
-      const message = { role: 'user' as const, content: [{ type: 'text' as const, text: `【后台任务通知】${_text}\n（要看完整输出用 bg_read，看全部任务用 bg_list）` }], timestamp: _now, _inject }
+      /* ★1124w：**前缀不再在这里硬加** —— 入队时各来源已自带自己的前缀
+         （后台任务「【后台任务通知】」/ 成员中断「【成员中断】」/ 团队回归「【团队回归】」…）。
+         原来这里硬编码 `【后台任务通知】` ⇒ 后台任务那条变成**双前缀**、并且把别人的通知也叫成"后台任务通知"（实测截图）。 */
+      const message = { role: 'user' as const, content: [{ type: 'text' as const, text: `${_text}\n（要看完整输出用 bg_read，看全部任务用 bg_list）` }], timestamp: _now, _inject }
       ;(agent as any)?.steer?.(message)
     }
     setMembersQueued(sessionId, q.flatMap((n: any) => (Array.isArray(n?.memberIds) ? n.memberIds : [])), false)
@@ -6673,6 +6382,10 @@ function buildSessionPayload(s: any, body?: SessionBody): Record<string, any> {
       planMeta: (s as any).planMeta,
       boardPlan: s.boardPlan,
       teamId: s.teamId,
+      /* ★团队 V2 第 2 阶段：自动阶段汇报开关（开启时刻 + 结算水位）。
+         本函数是显式字段白名单 —— 漏登记就是"重启后自动汇报静默失效"、
+         表现为该投的不投；所以和第 1 阶段的账本状态一样必须登记。 */
+      teamAutoReportState: (s as any).teamAutoReportState,
       /* ★1032-TM：**子会话归属**（成员会话 = 一个成员一个窗口）。
          这是显式字段白名单，漏登记过一次（同上面 origin 那条教训）——
          漏了就是"重启后成员会话全部重建"：`ensureMemberSession` 靠 parentSessionId+memberId
@@ -8006,6 +7719,12 @@ function hydrateSessionsFromDisk(opts: { onlyId?: string; onlyMissing?: boolean;
            **读侧一直没恢复**，与 `noticeLog` / `approvalLog` 完全同型（同一张白名单的两个方向没成对）。
            审计脚本 `_audit_1029c_persist.cjs`：按区间分别提取写/读侧 key 求差集，当前"只写不读"只剩它。 */
         boardPlan: (s as any).boardPlan,
+        /* ★团队 V2 第 2 阶段：自动阶段汇报开关（写侧见 buildSessionPayload 同名字段）。
+           白名单是**两个方向**：只在写侧登记，重启后按"关闭"处理 —— 该投的不投，
+           而且下一次落盘还会把盘上的值抹掉（1029c / 1026m / P23 同族坑）。 */
+        teamAutoReportState: (s as any).teamAutoReportState && typeof (s as any).teamAutoReportState === 'object'
+          ? (s as any).teamAutoReportState
+          : undefined,
         // 0917：项目归属恢复（与 persistSessions 对应）
         projectId: typeof s.projectId === 'string' && s.projectId ? s.projectId : undefined,
         presetId: s.presetId,
@@ -9129,290 +8848,6 @@ function resolveModelProviderId(modelId: string, explicit?: string): string {
 
 /** 团队运行时上下文工厂（0904 单聊抽取）：getOrCreateAgent 挂派发工具与 session.memberPrompt 单聊共用同一构造，
  *  避免两处 ctx 漂移。session 实时查（成员 workDir/permissionMode 等运行期可被 configure 改）。 */
-function buildTeamCtx(sessionId: string, teamDef: TeamDef): TeamCtx {
-  const activityRoster = readTeamMemberRoster(teamDef.id)
-  // use_skill（与主 agent 内联版同实现；成员工具池需要）
-  const skillParams = TbType.Object({
-    name: TbType.String({ description: '技能名称（见系统提示词中的可用技能清单）' }),
-  })
-  const skillTool: AgentTool<typeof skillParams, any> = {
-    name: 'use_skill',
-    label: '使用技能',
-    description: '加载指定技能的完整执行指令。当用户任务匹配可用技能清单中的某项、或用户消息带有 [skill:名称] 标记时调用；返回指令后严格按其流程完成任务。',
-    parameters: skillParams,
-    async execute(_callId, params) {
-      const skills = await getEnabledSkills()   // ★ 0921q：只认启用的技能
-      const s = skills.find(x => x.name === params.name)
-      if (!s) throw new Error(`未知技能：${params.name}。可用技能：${skills.map(x => x.name).join('、') || '(无)'}`)
-      if (!isSkillEnabled(s.name)) throw new Error(`技能「${s.name}」已被停用（技能仓库里可重新开启）`)
-      /* ★ 0921z-2（用户修正）：主开关 `skillAutoSelect` **只管"AI 自主性"** —— 决定技能清单注不注入；
-         它**不再拦 use_skill**：用户手动点技能按钮 / 消息里写 [skill:名称] 是用户意志，AI 照办。 */
-      return { content: [{ type: 'text', text: `# 技能已加载：${s.name}\n\n${s.content}` }], details: { skill: s.name } }
-    },
-  }
-  return {
-    sessionId,
-    team: teamDef,
-    broadcast: (frame) => broadcastMux(sessionId, frame as MuxFrame),
-    log: (level, category, message, data) => sessionLog(sessionId, level, category as any, message, data),
-    /* ★1032-C0-d（**补上团队 run 的唯一正规写入路径**）——
-       在此之前，`registerSubRuns` 全仓只赋给过 `lite`（分身用的那个 ctx，见 :7122），
-       `buildTeamCtx` 从来没接 ⇒ `teamCtx.registerSubRuns` 恒为 `undefined`
-       ⇒ `teamRuntime` 就算调也是 `?.()` 静默跳过
-       ⇒ **团队 run 从来没有正规写入路径**，只能靠 `injectSubRuns` 的"读时写回"充当写入器，
-          而它按 stepId 过滤（跨批复用 ⇒ 串批）⇒ 脏数据就是这么进 subRuns 的。
-       ⇒ 一个缺失的写路径 + 一个错误的读时写回 = 脏数据工厂（这是同一个结构性缺陷的两面）。
-
-       ⚠️ 与 `lite` 那版**刻意不同**（按需最小化，不把分身的逻辑糊到团队上）：
-          · 不播 `clone-anchor`（那是分身卡定位用的，团队卡不需要）
-          · 不调 `pushTurnSnapshot`（团队是同步 await，结果回来主 agent 才继续，
-            由 agent_end 统一推帧；多推一次只会制造中间态）
-          · 团队**只在收尾登记**，不在派活时登记 —— 派活即登记会让卡出现在"还没跑完"的状态，
-            与既有行为不符。 */
-    registerSubRuns: (toolCallId: string, runs: any[]) => {
-      if (!toolCallId || !Array.isArray(runs) || !runs.length) return
-      try {
-        /* ★1036-S30：走**唯一写入口**（与分身侧同一条规则）。团队是"收尾登记"语义
-           （传的是 bb.runs 里的活对象，已含终态）⇒ `update`。
-           原来是 `深拷贝 + 整体替换`：深拷贝会切断活对象身份 ⇒ `settleRunningRuns`（用户停止）
-           改的是副本、而 runRec 还是 running，下一次快照合并又把活对象写回 ⇒ 成员卡
-           "停止后又变执行中"（这条 bug 在团队模式比分身更容易复现，因为成员共享一个 bb）。 */
-        mergeSubRunsInto(sessionId, toolCallId, runs, 'update')
-        schedulePersist(sessionId)
-      } catch { /* 登记失败不拦成员执行 */ }
-    },
-    /* ★1032-fix：团队 run 的**过程流实时**（原来只给 `lite` 接了，
-       团队 ctx 恒 undefined ⇒ 团队卡在运行中 segments 永远是 0，跑完才一次性冒出来）。
-       与 `registerSubRuns` 的分工（**不是重复，是分工**）：
-         · `pushRunSnapshot` = 运行中**只更新内存 + 推一帧投影**（每 2s，不深拷贝全文、不落盘）
-         · `registerSubRuns` = 派活/收尾**持久化**（深拷贝 + schedulePersist）
-       实现照抄 `lite.pushRunSnapshot`（见 :7199 那处），**逐字对照过**：
-         不 JSON 深拷贝（runs 数组由调用方新造/浅拷贝），只做一次浅数组复制防回写穿透。 */
-    pushRunSnapshot: (toolCallId: string, runs: any[]) => {
-      /* ★1036-S31：走**唯一推送实现**（与分身同一条）。这份原来是独立副本：
-         `s.subRuns[callId] = runs.slice()` 整体替换，且**只有累加器存在时**才推帧 ——
-         而主 agent 派完活就收轮、累加器被删 ⇒ 团队成员的进展一帧都推不出去
-         （实测 3 个成员，运行中只出现 1 个，另外两个要等停止收尾才冒出来）。 */
-      pushRunSnapshotFrame(sessionId, toolCallId, runs)
-    },
-    /* 团队汇总携带批次身份；普通通知仍走原通路。 */
-    notifyDone: (text, meta) => injectSessionNotice(sessionId, text, meta),
-    /* ★1036-S37：`sub_read` 的全量数据源（会话内嵌的 subRuns，按 callId 展开）。
-       不再让它读黑板的 60 条窗口 —— 那是"存档滚动上限"，不是"能派多少"的上限。 */
-    listAllRuns: () => {
-      const s: any = sessions.get(sessionId)
-      const sr = s?.subRuns
-      const out: any[] = []
-      if (sr && typeof sr === 'object' && !Array.isArray(sr)) {
-        for (const k of Object.keys(sr)) if (Array.isArray((sr as any)[k])) out.push(...(sr as any)[k])
-      }
-      return out
-    },
-    /* ★1032-TM（P102）：`sub_read` 读成员单聊 —— 只读、只给人说的话（派活单/系统注入不算单聊）。
-       用 `findMemberSession`（只找不建）：看历史不该凭空造出一个空会话。 */
-    readMemberChat: (memberId: string, limit?: number) => {
-      try {
-        const dm: any = findMemberSession(sessionId, String(memberId || ''))
-        if (!dm) return []
-        const msgs: any[] = Array.isArray(dm.messages) ? dm.messages : []
-        const out: Array<{ role: 'user' | 'assistant'; text: string; ts: number }> = []
-        for (const m of msgs) {
-          if (m?.role !== 'user' && m?.role !== 'assistant') continue
-          const txt = Array.isArray(m.content)
-            ? m.content.filter((c: any) => c?.type === 'text').map((c: any) => String(c.text || '')).join('')
-            : String(m.content || '')
-          if (!txt.trim()) continue
-          /* 派活单（`_inject.kind='dispatch'`）/ 交接 / 系统注入 —— 那不是"人和成员的聊天" */
-          if (m.role === 'user' && (m as any)._inject) continue
-          out.push({ role: m.role === 'user' ? 'user' : 'assistant', text: txt, ts: Number(m.timestamp) || 0 })
-        }
-        const n = Math.max(1, Math.min(50, Number(limit) || 12))
-        return out.slice(-n)
-      } catch {
-        return []
-      }
-    },
-    /* ★1032-TM（P1）：派活的"任务单"与成员的"产出"都落进它的持久会话（tab 里 = 完整聊天记录）。 */
-    appendMemberMessage: (memberId: string, role: 'user' | 'assistant', text: string, meta?: any) => {
-      appendMemberMessage(sessionId, memberId, role, text, meta)
-    },
-    /* ══ ★L5：成员派活走**成员会话**（心脏手术）════════════════════════════════════
-       teamRuntime 从此只做调度（车道/步骤状态/黑板/回归通知），**不建 Agent、不碰 LLM**；
-       成员本身就是一个普通会话 ⇒ 历史/压缩/圆环/usage/落盘/检查点/索引全部自动获得。
-       四个能力分开注入（而不是包成一个"帮我跑一轮"）：团队侧要先拿会话记 beforeLen、
-       再拿 agent 登记中断表、再决定排队的等法 —— 包成一个大函数就只能黑盒。 */
-    ensureMemberSession: (memberId: string) => ensureMemberSession(sessionId, memberId),
-    /* 成员会话的 agent：`session.stopMember` / 看门狗 / 单次运行上限都要拿到它才停得下来。
-       拿不到就如实返回 null（团队侧会记一条 warn），绝不让"停止键"变成静默无效。 */
-    ensureMemberAgent: (sid: string) => {
-      try { return getOrCreateAgent(String(sid)) } catch (e) {
-        sessionLog(sessionId, 'error', 'session', `[团队] 取成员会话 agent 失败（${String(sid).slice(0, 8)}）：${String((e as Error)?.message || e)}`)
-        return null
-      }
-    },
-    laneActivity: (memberId, runId, queued) => {
-      if (!memberViaSessionEnabled() || /^clone\d+$/i.test(memberId)) return
-      const rosterId = activityRoster?.get(memberId)
-      if (queued) memberActivity.enqueueDispatch(sessionId, memberId, `l5run-${runId}`, rosterId)
-      else memberActivity.discardDispatch(sessionId, memberId, `l5run-${runId}`)
-    },
-    runPromptCore: async (sid: string, p: Record<string, unknown>, activityTurnId) => {
-      setMemberPromptInput(sid, p, { turnId: activityTurnId, kind: 'dispatch' })
-      /* ★L5：这条 user 消息的**持久 id** 用调用方给的 `clientMessageId`（= 派发的 runId）。
-         两个作用：① 提取产出的精确定位锚点（能区分"本轮新增"与"用户同时在私聊说过的话"）；
-         ② 不推的话落盘会回退随机 id，并打一条「[rpcid] 没有待认领的 rpcId」警告 ——
-            那条是给"前端直发却丢了 id"用的，派活不是那种情况（会造成排错误导）。 */
-      const rid = String((p as any)?.clientMessageId || '')
-      if (rid) { try { pushPendingUserRpcId(String(sid), rid) } catch { /* 推不上不影响发送 */ } }
-      return runPromptCore(String(sid), p)
-    },
-    waitSessionIdle: (sid: string, maxMs?: number) => waitSessionAgentIdle(String(sid), maxMs),
-    /* ★L4：成员检查点 —— 按 (父会话, memberId) 找到成员持久会话，副作用工具执行前先落盘。
-       白名单在这一处过滤（needsCheckpoint）；只读工具直接 return，不做任何落盘。 */
-    checkpoint: async (memberId: string, toolName: string, toolCall?: any) => {
-      if (!needsCheckpoint(toolName)) return
-      const ms: any = findMemberSession(sessionId, memberId)
-      if (!ms) return       // 成员会话还没建（压根没落过盘）⇒ 没有可检查点的正文
-      /* ★L4-c：先记"即将执行什么"（立即写草稿），再落正文 —— 工具意图必须早于副作用。
-         `toolCall` 由团队运行时传入（teamRuntime 的 beforeToolCall 手里就有它）；
-         没传就只落正文（`noteToolIntent` 拿不到 callId 会自己跳过，不编 id）。 */
-      noteToolIntent(String(ms.id), toolCall)
-      await checkpointSession(String(ms.id))
-    },
-    /* ★1032（P44）：整段运行（思考/工具/正文）落进成员会话 —— 窗口与主对话流同形。 */
-    feedMemberEvent: (memberId: string, event: any, agent: any) => feedMemberEvent(sessionId, memberId, agent, event),
-    endMemberRun: (memberId: string, agent: any) => endMemberRun(sessionId, memberId, agent),
-    setMemberState: (memberId: string, status: any, opts?: any) => {
-      setMemberState(sessionId, memberId, status, opts)
-    },
-    /* ★1032（P24）：主 agent 的 member_new_session 工具走这里（与 RPC 同一份实现）。 */
-    newMemberSession: (memberId: string, handoff: string) => newMemberSessionFor(sessionId, memberId, handoff),
-    buildMemberToolPool: (actor?: string, lock?: { owner: string; label: string }) => {
-      const session = sessions.get(sessionId)
-      const cwd = session?.workDir?.trim() || process.cwd()
-      // 0910 二批 F：actor 由成员实例传入，闭包捕获文件快照署名（并发多实例互不覆盖）
-      // 0910 三批④：快照带会话 id —— 撤销按对话隔离，成员改的文件也不会串到别的对话
-      // 0911 反馈③：lock 由成员 run 传入（owner=runId）——fs_write/fs_delete 写前查锁，并行互斥防静默覆盖
-      /* ★1032（P64 · 成员子 agent 化 Step 1）：**成员的工具集接回主线**。
-         原来这里是手写的一份清单（session/memory/notebook/web/skill/ask）——
-         主 agent 后来加的 MCP 工具、自定义 agent 工具，成员**一个都拿不到**（不是白名单拦的，是根本没进池子）。
-         现在与主 agent 同源：多两类工具进池，**是否真的启用仍由成员预设的白名单收窄**（`preset.tools` / `toolWhitelist`），
-         所以这是"能力对齐 + 权限不变"，不是放开权限。 */
-      const _preset = readAgentPreset(session?.presetId || '') || readAgentPreset('standard')
-      return [
-        ...buildSessionTools(cwd, actor, sessionId, lock),
-        /* ★f1（Bug2 修，d2 实测根因）：**成员/分身拿不到 list_dir / repo** ——
-           这两件只挂在主 agent 的 extraTools（getOrCreateAgent 里），成员池从来没拼过
-           ⇒ 成员会话 list_dir 0 成功 / 87 失败，全报 "Tool list_dir not found"（不是权限问题）。
-           补的判据是**职责**：成员要写代码、要搜代码，就必须能看目录结构与符号索引。
-           ⚠️ 只补读工具：schedule（定时任务）/ settings_update（改全局设置）/ plan_write（会话计划卡）
-           / spawn_clone（再派分身）/ project_note（改项目档案）一律**不补** —— 它们是
-           "改配置 / 管会话 / 派活 / 改档案"，属指挥官与用户职权，补给执行者成员就是越权。
-           是否真的启用仍由成员预设白名单（preset.tools，成员预设里本来就勾了这两件）收窄
-           ⇒ 补池 = 能力对齐，不是放开权限。 */
-        buildListDirTool(cwd),
-        ...buildRepoTools(cwd),
-        ...buildMemoryTools({ projectId: String(session?.projectId || '') }),
-        ...buildNotebookTools(),
-        ...buildWebTools(),
-        skillTool,
-        buildAskUserTool(sessionId),
-        ...mcpToolsForPreset(_preset, sessionId),
-        ...getCustomAgentTools(),
-      ]
-    },
-    // 成员子流（派发/单聊共用）：sub=true 抑制主时间线重试通知/压缩/上下文环明细（0904 修复串扰）
-    // ★f1：再补 opTrack=true —— 看门狗的在途打点判据已从 sub 独立出来（见 createStreamFn 的 opts 注释）
-    // 0910：成员独立模型可带自己的推理挡位（member.effort，缺省 deep=原行为）
-    createSubStreamFn: (sysSub, override, extraSignal, effort, actor?: string, onStreamNote?: (n: { kind: string; attempt: number; reason: string }) => void) => createStreamFn(sysSub, sessionId, { llmOverride: override ?? undefined, effort: effort || 'deep', signal: extraSignal, sub: true, opTrack: true, actor, onStreamNote }),
-    resolveMemberModel: (member) => resolveTeamMemberModel(member),
-    /* ★r3：**成员当前上下文占用 + 窗口** —— 给 `memberTotals` 补 ctxUsed/ctxWindow（前端画进度条）。
-       唯一实现在 `buildMemberCtxUsage`（★u1 抽出）—— 因为 `blackboard.read` 也要用同一份：
-       前端打开成员面板时先走 RPC 读盘（TeamMemberPanel.vue:239），那条路径**不经过广播**，
-       若只在这里算，面板首帧就是空进度条（实测）。
-       两处必须同源，否则会出现"刚打开没数、跑一轮才有"的不一致。 */
-    memberCtxUsage: buildMemberCtxUsage(sessionId, teamDef),
-    memberSkills: (memberId: string) => {
-      const s2 = sessions.get(sessionId)
-      const arr = s2?.memberSkills?.[memberId]
-      return Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()) : []
-    },
-    /* ★m1p：派活轮次计数（唯一写者是 teamRuntime 的 runMemberTurn）——
-       approvalGate 用 `dispatchDepthBySession > 0` 判"这一轮是不是派活"，据此免审成员工具。
-       取代原来的会话可变单值 `__l5Dispatch`（并发/排队会提前失效，见 approvalGate 里的注释）。 */
-    enterDispatchTurn: (memberSid: string) => enterDispatchTurn(String(memberSid)),
-    leaveDispatchTurn: (memberSid: string) => leaveDispatchTurn(String(memberSid)),
-    approval: async (toolName, args, actor) => {
-      const s = sessions.get(sessionId)
-      if (!s) return undefined
-      const who = String(actor || 'member')
-      const mode = s.permissionMode || 'confirm'
-      /* ★1034-commit6（需求）：**成员内部一律免审** —— 授权点统一收到「派活那一次」
-         （`approvalGate` 的 `team_dispatch` / `spawn_clone` 分支）。
-         为什么改成这样（推翻本批 commit2 的"成员内部也按三档弹卡"）：
-           · 派活卡已经明确告诉用户"将派出 N 个成员执行任务"，用户同意 = 授权这批人干活；
-           · 成员内部再逐工具弹卡，一次任务能弹十几张（读文件/写文件/跑命令各一张），
-             用户点到手软 —— 这是实测抱怨点；
-           · 与分身同构（`cloneRuntime.ts:147` 就是 `approval: async () => ({ block: false })`）。
-         ⚠️ 但**免审必须留痕**（需求：high_only / full_access 的免审都要能查到
-            "谁、什么时候、干了什么"）—— 所以这里的 sessionLog 不能省。
-         ⚠️ 不改 `s.permissionMode`：会话档位是用户的选择，成员免审是**团队机制**，
-            两件事不能混（否则派一次活就把会话权限改了）。 */
-      sessionLog(sessionId, 'info', 'approval', `[团队][${mode}] 成员 ${who} 免审执行 ${toolName}`)
-      return { block: false }
-    },
-    workDir: () => sessions.get(sessionId)?.workDir?.trim() || process.cwd(),
-    // 会话当前模型（跟随会话的成员/被中断的 run 记录也带模型标签）
-    sessionModel: () => {
-      /* ★1012t 收尾：走统一解析口（通道会话未单独配模型时=后台模型），标签才与实际发出去的模型一致 */
-      const mid = String(resolveSessionLlm(sessionId)?.model || '').trim()
-      if (mid) return mid
-      try { return currentLlmConfig().model || '' } catch { return '' }
-    },
-    /* ★tw1s（成员 token 漏算 97% 的根治）：把**成员持久会话的 token 账本**交给团队运行时读。
-       `runSubAgent` 在 run 开始/结束各读一次，差值 = 本 run 真实消耗（几十跳全算，不再只算最后一跳）。
-       · 只读不建（`findMemberSession`）：读不到就回退旧口径，**绝不为读数而新建会话**；
-       · 口径来源 = 成员 run 的过程事件由 `feedMemberEvent` 喂进成员会话的同一条内容管线
-         ⇒ `handleAgentEvent` → `creditHopSnapshot` 按 assistant 消息 id 幂等入账 ⇒ `usageTotals` 单调只增
-         （会话压缩/裁剪消息都不影响它，所以差值可信）。 */
-    memberUsageLedger: (memberId: string) => {
-      try {
-        const dm: any = findMemberSession(sessionId, String(memberId || ''))
-        const ut: any = dm && dm.usageTotals
-        if (!dm || !ut) return null
-        const n = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : 0 }
-        return {
-          sessionId: String(dm.id),
-          uncached: n(ut.uncached), cacheRead: n(ut.cacheRead), cacheWrite: n(ut.cacheWrite), output: n(ut.output),
-        }
-      } catch (e) {
-        try { sessionLog(sessionId, 'warn', 'session', `[团队·用量] 读成员账本失败（${String((e as Error)?.message || e)}）⇒ 本 run 回退最后一条口径`) } catch { /* ignore */ }
-        return null
-      }
-    },
-    /* ★member-lifetime（全历史口径）：**该父会话下每个成员的全历史累计**（当前段 + 归档段 + 其中私聊）。
-       与旧 `memberUsageLedgerTotal` 的区别只有一处、但正是病根：旧实现 `findMemberSession` 只取
-       **未归档**段 ⇒ 归档段全部丢失（实测 m4 漏 61.7%）。现在一次遍历全部段、按纯聚合相加。
-       键 = 真实存在成员会话的 memberId ⇒ 只有私聊、没有 bb.runs 记录的成员也会出现。
-       返回 Map 而不是单成员闭包：`mergeMemberUsageLedger` 一帧只要算一次，不再 N 次遍历会话。
-       拿不到（该父会话没有任何成员会话）⇒ 空 Map ⇒ 调用方保留 runs 残值并标 source='runs'。 */
-    memberUsageHistory: () => collectMemberUsage(sessionId),
-    /* ★f1（需求）：**当前段的用量**（卡片显示用，新开对话天然从 0 起）。
-       与上面全历史累计同源（同一份成员会话账本），只是取"未归档那一段"。
-       拿不到就返回 null ⇒ 调用方不写 segTokens/segSeq ⇒ 前端显示「—」。 */
-    memberSegTotal: (memberId: string) => readMemberCurrentSegmentTotal(sessionId, String(memberId || '')),
-    /* ★g1：**成员当前段运行体征**（team_info 用：压缩次数 / run 数 / 段号）。
-       数据源是成员会话对象本身（`contextSummaries` 与 `usageTotals.turns` 都是既有持久字段），不新造计数。
-       拿不到就返回 null ⇒ team_info 那行显示「—」，不写假 0。 */
-    memberSegSigns: buildMemberSegSigns(sessionId),
-    syncPlan: (items) => {
-      // 0910 三批①：黑板写自己的字段，不再覆盖主 agent 的 plan（二者曾共用一个字段=计划面板串台）
-      const s = sessions.get(sessionId)
-      if (s) { s.boardPlan = items; schedulePersist(sessionId) }
-      broadcastPlan(sessionId)
-    },
-  }
-}
 
 
 /** ── 工具唯一源接线（0904 捋顺）──────────────────────────────
@@ -9691,7 +9126,17 @@ function hasLiveSubRuns(map: any, isActive: (runId: string) => boolean): boolean
 function splitRunningSubAgents(sessionId: string): { clones: number; members: number } {
   /* ★1105-h3(F3)：判据统一到 countLiveSubRuns（唯一实现）—— 这里不再自己写一遍循环，
      否则"僵尸过滤"迟早只改到其中一处（本次就是 has 那份漏改）。 */
-  return countLiveSubRuns((sessions.get(sessionId) as any)?.subRuns, isRunActive)
+  const s = sessions.get(sessionId)
+  return splitRunningAgentsIn(s, s?.subRuns)
+}
+
+function splitRunningAgentsIn(s: SessionView | undefined, runs: SessionView['subRuns']) {
+  const split = countLiveSubRuns(runs, isRunActive)
+  if (s && teamV2Hosts.has(s)) {
+    const roster = s.teamId ? readTeamMemberRoster(s.teamId) : undefined
+    return { clones: split.clones, members: memberActivity.rosterSnapshot(s.id, roster).runningMembers }
+  }
+  return split
 }
 
 /** ★1126d（老板需求）：**成员异常告警数** —— 侧栏"红色状态"的第二种来源。
@@ -9801,6 +9246,10 @@ function statusFrame(sessionId: string, opts: { mainRunning: boolean } & Record<
     type: 'session/status',
     sessionId,
     mainRunning,
+    /* ★阶段4补正：`rest` 里的额外标记必须真的下发 —— 原来解构出来后只留在局部变量里，
+       于是 `publishMemberActivity(..., { teamWorkChanged: true })` 推的帧**根本不含该字段**，
+       前端 `subscribeTeamWork` 永远收不到，两页都不会自动刷新（双页实测反例）。 */
+    ...(rest.teamWorkChanged === true ? { teamWorkChanged: true } : {}),
     clones: split.clones,
     members: split.members,
     running: mainRunning || split.clones > 0 || split.members > 0,
@@ -9989,11 +9438,7 @@ function flushNextQueued(sessionId: string): void {
   const item = s.queuedMessages.shift()!
   schedulePersist()
   broadcastQueue(sessionId)
-  /* ★ 0923：排队的用户消息同样是「用户发话」→ 续跑额度重置、解除暂停（与 session.prompt 同口径）。
-     ★ 0930（T4 真机实测）：收尾/续跑的**注入消息**也会走队列续发——它们不是用户发话，
-     重置额度等于"3 轮上限形同虚设"（实测收尾后又开出 1/3、2/3 轮）。额度重置只认真实用户消息，
-     且挪到「真正发出」这一刻（此前在跳过闸门前就重置，被跳过的消息也会白吃一次额度）。 */
-  if (!/^\s*【自动续跑/.test(String(item.text || ''))) resetBgResumeChain(sessionId)
+  /* ★1124：**自动续跑额度已废除** —— 队列续发时不再有"重置续跑额度"这一步（链已拆）。 */
   sessionLog(sessionId, 'info', 'lifecycle', `队列自动续发：${item.text.slice(0, 40)}`)
   // 前端乐观气泡对账：投影帧带 clientMessageId，NiusDreamChat 把"排队中"占位转正
   try {
@@ -10014,6 +9459,8 @@ function flushNextQueued(sessionId: string): void {
   const prompt = {
     message: item.text, attachments: item.attachments, skills: item.skills,
     model: item.model, effort: item.effort, __fromQueue: true,
+    /* ★1124y：情境块随队列项一路带到真正发出的一跳（否则 IM 场景在忙时排队后就不见了） */
+    ...(item.modelContext ? { modelContext: item.modelContext } : {}),
     /* ★1130：把入队时摘下的**注入身份 / 轮来源**原样交还给真正发送的这一跳。
        缺了它们 ⇒ 注入消息落成普通 user 消息（画成用户气泡）+ turnSource 退化成 'user'
        （界面以为用户在等）。见 `QueuedMsg.inject` 的注释。 */
@@ -10807,7 +10254,10 @@ function getOrCreateAgent(sessionId: string): Agent {
     // 询问卡工具：AI 主动问用户（按会话挂起）
     const askTool = buildAskUserTool(sessionId)
     // 计划本工具：多步骤任务写计划（输入框上方计划卡）
-    const planTool = buildPlanTool(sessionId)
+    const requiredCmd = session?.teamId ? undefined : sessionPreset?.requiredPlanCheck
+    const presetCheck = requiredCmd ? createPresetPlanCheck(requiredCmd) : undefined
+    if (presetCheck) sys += '\n\n# 预设验收\n做有计划的改动时，在当前工作区用 check_run 执行指定命令后再完成计划：' + presetCheck.command
+    const planTool = buildPlanTool(sessionId, presetCheck)
     // 0910 三批⑤：项目档案工具（工作区根 NIS-notes.md，跨窗口共享的项目记忆）
     const projectNoteTool = buildProjectNoteTool(session?.workDir?.trim() || process.cwd())
     // 设置更新工具：用户明确要求改设置（名字/头像/提示词）时调用
@@ -10879,13 +10329,31 @@ function getOrCreateAgent(sessionId: string): Agent {
     buildListDirTool(session?.workDir?.trim() || process.cwd()),
     /* ★ g3：验收命令 —— **常驻**（不进懒包）：验收随时要跑，藏进懒包等于每次先 load_tools 再用。
        ⚠️ 它的审批与 run_command 同级（assessRisk 的 check_run 分支 + approvalGate 的杀伤命令硬拦截）。 */
-    withPlanAutoTick(buildCheckRunTool(session?.workDir?.trim() || process.cwd(), sessionId), sessionId),
+    withPlanAutoTick(buildCheckRunTool(session?.workDir?.trim() || process.cwd(), sessionId), sessionId, presetCheck),
     /* ★1118：传当前会话 id + 任务产出读取器 ——
        ① convId 让定时任务工具支持 target="this"（绑到本对话 / 开值守）；
        ② readTaskResult 让值守任务能读执行层任务今天的产出（schedule 的 result 动作）。
        原来无参 ⇒ 工具层既拿不到会话身份、也读不到别的任务产出 ⇒ AI 只能绕过工具去打 HTTP RPC。 */
     ...buildScheduleTools(sessionId, readTaskResult),
     ...buildRepoTools(session?.workDir?.trim() || process.cwd()),
+    /* ★1126：生成图片（**常驻**，不进懒包）。
+       为什么常驻：家族里现在只有 1 件工具，而 lazyTools 的 shouldMountLoader 要求"能藏 ≥2 件才值得"，
+       藏 1 件却多挂一个 load_tools = 净亏。等 video 工具加进来变 2 件，再一起进懒包。
+       落盘走 persistShot（同一个会话工作区 + details.shotRef），前端现有渲染直接出图。 */
+    buildImageTool({
+      saveImage: (b64: string, mime: string, meta: any) => persistShot(sessionId, b64, mime, meta),
+      /* ★1126：图生图的两个参考图来源 —— 用户本轮发的图 / 工作区里已生成的那张 */
+      getTurnImages: () => findLastUserImages(sessionId),
+      readWorkspaceImage: (ref: string) => readWorkspaceImageAsBase64(sessionId, ref),
+    }),
+    /* ★1126：生成视频（**提交即返回**，跑在后台任务里；进度/完成通知都走 bg 那套） */
+    buildVideoTool({
+      conversationId: sessionId,
+      workDir: session?.workDir?.trim() || process.cwd(),
+      /* ★1126：图生视频的两个首帧图来源（与 image 工具的图生图同一套回调） */
+      getTurnImages: () => findLastUserImages(sessionId),
+      readWorkspaceImage: (ref: string) => readWorkspaceImageAsBase64(sessionId, ref),
+    }),
   ]
   const allTools = [...tools, ...extraTools, ...memoryTools, ...notebookTools, ...buildWebTools(), skillTool, askTool, planTool, settingsTool, ...cloneTools, projectNoteTool]
     /* ★ 0929 工具瘦身·刀①：存量预设存的是合并前旧工具名 —— 过滤前归一到家族名（旧名=家族别名，逐一等价），
@@ -10990,46 +10458,187 @@ function getOrCreateAgent(sessionId: string): Agent {
           不自己另发明一套：两个字段是"这是子会话"的完整证据，缺一个都可能是老数据。
        （原来那行 `effectivePresetId` 已随判据一起删掉：留着就是没人读的死变量。） */
     const _isMemberSubSession = !!(session as any)?.parentSessionId && !!(session as any)?.memberId
-    if (teamDef && !_isMemberSubSession) {
-      // ctx 构造抽取为 buildTeamCtx（0904 单聊复用同一套），行为与旧内联块一致：
-      // session 实时查（workDir/权限运行期可变），use_skill 工具内联同款实现
-      const teamCtx = buildTeamCtx(sessionId, teamDef)
-      teamTools = buildTeamTools(teamCtx)
-      // 团队简报注入系统提示词（role 流程第 1 步"读成员清单"的兑现；详情仍可 team_info 查询）
-      if (teamTools.length > 0) {
-        const brief = teamDef.members.map(m => {
-          const mp = readAgentPreset(m.preset)
-          return `- ${m.id} ${mp?.name || m.preset}：${String(m.role || mp?.description || '').slice(0, 60)}`
-        }).join('\n')
-        sys = sys + `\n\n# 你的团队「${teamDef.name}」（成员详情用 team_info 查询）\n${brief}\n成员：${teamDef.members.length} 人（一人一件，能同时跑几个就派几个）｜编排流程：team_dispatch 派发 → 成员跑完「团队回归」→ bb_write 审核/汇总（计划可用 bb_goal 立/改）\n派发铁律：派活前先明确每个成员的职责边界（简报不够就用 team_info 查详情）；**新活直接派**——stepId 可省、计划里没有会自动补建一步（计划卡同步），只有"要依赖前置 / 要改派已存在步骤的 owner"时才先 bb_goal；owner 派错会被硬拒绝——拿不准就先 team_info\n并行铁律：相互独立的步骤放在同一次 team_dispatch 的 tasks 数组里一次性提交 —— **不同成员之间**才是并行；**同一个成员同一时刻只干一件事**，多派给它的会排队（前一件跑完自动接着做，随那批一起回归），不要为了"看起来更快"把两件事同时压给一个人；owner 必须职责匹配，不要为凑数派给不相关成员\n简单任务判据：任务不涉及工作区文件→直接回答；极小单点修改（改一个词/一处样式）→直接用 fs_write 完成，无需派发；多文件/多步骤→派发\n派完之后用户又说话（**先判性质，别条件反射重派**）：\n· 同一个问题、只是催/确认/重复/补截图 → **不重派、不开新步骤**：直接告诉用户"成员正在做（步骤 X），跑完随回归一起给你"，然后等回归通知。\n· 是对正在做的那一步的**补充/修正**（新约束、新证据、改口径）→ 用 member_tell 把增量插给那个成员（不要重发整份任务单），它带着这条继续做完；它若还没开工，补充会自动并入它的任务单。\n· 是**另一个问题** → 正常 team_dispatch 开新步骤（新活可直接派）；与在跑的不冲突就并行。\n· 判不准时按"补充"处理（member_tell）：重派会让成员白跑一遍，插话只是加一条约束。`
-        /* ★1104-I：计划快照**不能拼在这里** —— systemPrompt 是建 agent 时固化的（跨轮不变），
-           拼进来会被冻在建 agent 那一刻的旧计划上（比不注入更糟：给模型一份过期事实）。
-           真正的位置在 createStreamFn 里逐请求拼（只追加、不进 transcript）。 */
-      /* ★1036-S40（**"用户问进度，主 agent 又重新派了一批"**的根因）：
-         异步派发之后主 agent 收轮了；等它被用户消息叫醒时，**上下文里没有"我还有子任务在跑"这件事**
-         ⇒ 它会重新 bb_goal + team_dispatch 一遍（实测 10:33 那轮又派了 3 个成员，
-         界面上看起来就像"上面那三个成员又出现了一次"）。
-         ⇒ 把**当前仍在运行**的委派状态注入系统提示（结构事实，不是猜）：它知道就不该重派。
-         查进度走 sub_read，重派是纯浪费。 */
-      try {
-        const _sr: any = (sessions.get(sessionId) as any)?.subRuns || {}
-        const _live: any[] = []
-        for (const k of Object.keys(_sr)) {
-          for (const r of (Array.isArray(_sr[k]) ? _sr[k] : [])) {
-            if (String(r?.status || '') === 'running') _live.push(r)
+    /* ★V1 拆除：团队会话只有 V2 一条链 —— 旧团队会话在这里就地接管（`ensureTeamV2Host`），
+       不存在"没有 V2 就走 V1 工具集"的岔路。 */
+    const v2host = session && !_isMemberSubSession ? ensureTeamV2Host(session) : undefined
+    if (v2host && teamDef && !_isMemberSubSession) {
+      const schema = TbType.Object({ tasks: TbType.Array(TbType.Object({
+        quote: TbType.String({ minLength: 1, maxLength: 2000, description: '逐字引用用户**表达实质需求**的那段原话（含具体问题/现象/期望结果），可引用本会话更早的用户消息；同一段被多个工单复用是允许的。一轮里说了多个问题且分开派单时，每单摘对应那一段，不要整条照搬、也不要摘成泛泛一句。**授权/推进语不算需求原话**：「派人去查吧」「你可以再让他们深入去查」「去做吧」「你去安排」这类必须回溯到描述该问题的那条消息再摘。' }),
+        title: TbType.String({ minLength: 1, maxLength: 240 }),
+        acceptance: TbType.String({ minLength: 1, maxLength: 2000 }),
+        memberId: TbType.String({ minLength: 1, maxLength: 200 }),
+        /* 阶段3：用户在同一次派工里就说了"某项要等某项" ⇒ 依赖必须随派工一起提交，
+           不能先派出去再补边（那样后置会在补边之前就抢跑）。 */
+        after: TbType.Optional(TbType.Integer({ minimum: 1, maximum: 100, description: '本次 tasks 里的第几项（1 起）。该项按当前版本验收通过后，本项才开工。只在用户明确说了先后顺序时填。' })),
+        dependsOn: TbType.Optional(TbType.Integer({ minimum: 1, description: '已存在的需求单编号。它按当前版本验收通过后，本项才开工。只在用户明确说了要等某条已有需求时填。' })),
+        /* ★1124（老板拍板）：**可执行判据**。用户不写命令 —— 由你从用户原话里推；
+           推不出就省略（这张单会停在待验收等人定，绝不自动判过）。 */
+        verify: TbType.Optional(TbType.Object({
+          files: TbType.Optional(TbType.Array(TbType.Object({
+            path: TbType.String({ description: '相对该单工作区的文件路径（如 src/LoginPage.vue）' }),
+            contains: TbType.Optional(TbType.String({ description: '文件里必须出现的片段（如 border-radius），不确定就省略' })),
+          }), { minItems: 1, maxItems: 20 })),
+          command: TbType.Optional(TbType.String({ description: '交付后在该单工作区自动执行的检查命令，退出码 0 = 通过（如 npm run typecheck）' })),
+          timeoutMs: TbType.Optional(TbType.Integer({ minimum: 1000, maximum: 600000, description: '命令超时毫秒，默认 120000' })),
+        }, { additionalProperties: false })),
+        /* ★1124：这单跟该成员上一单**无关**时置 true —— 派单前给它开新段（旧段归档、只带账本事实做交接）。
+           拿不准就不填（默认沿用当前段）；判断依据用 team_v2_status 的 members 字段。 */
+        freshSession: TbType.Optional(TbType.Boolean({ description: 'true = 这单与该成员上一单无关，派单前给它开新对话（旧段归档）。' })),
+      /* ★1124 更正：**一次能派多少单 ≠ 有几个成员**。3 个人也能接 10 个活（排队干），
+         所以这里只留结构性上限 100（防滥用）。"同时几个在跑"由调度器槽位管（= 成员数）。 */
+      }), { minItems: 1, maxItems: 100 }) })
+      const tool: AgentTool<typeof schema> = {
+        name: 'team_v2_dispatch', label: '团队收单并派发', parameters: schema,
+        description: '仅在用户明确要求团队执行时提交。授权来自当前用户轮，quote 来自表达任务内容的用户消息；接受后异步执行，不用重派。用户同一句话里说了先后顺序时，用 after（本次第几项）或 dependsOn（已有需求单号）随派工一起声明依赖，不要先派再补。**verify 是可执行判据，你自己从用户原话里推**（用户不会写命令）：能指出产物文件就填 files；能跑构建/测试就把命令填 command；推不出就不填——那单会停在待验收等人，绝不自动判过。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以收单')
+          const messageId = sessionTurnBase.get(sessionId)
+          if (!messageId) throw new Error('当前轮没有可引用的用户消息')
+          const receipt = v2host.dispatch(messageId, args.tasks)
+          return { content: [{ type: 'text', text: JSON.stringify(receipt) }] }
+        },
+      }
+      const reviewSchema = TbType.Object({
+        requestId: TbType.Optional(TbType.Integer({ minimum: 1, description: '需求单编号。用户未指定且目标不明确时省略，不猜编号。' })),
+        mode: TbType.Union([TbType.Literal('file'), TbType.Literal('report')], { description: 'file 仅复核已登记的文件指纹；report 对报告证据给独立复验意见。' }),
+      }, { additionalProperties: false })
+      const reviewTool: AgentTool<typeof reviewSchema> = {
+        name: 'team_v2_review', label: '复验需求单', parameters: reviewSchema,
+        description: '仅在当前用户明确要求验收或复验时调用。不要用于催进度、成员交付通知或派工。核对已登记文件指纹用 file；需要判断报告证据时才用 report。结果不是通过或驳回。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以复验需求单')
+          const messageId = sessionTurnBase.get(sessionId)
+          if (!messageId) throw new Error('当前轮没有真实用户消息')
+          const result = await v2host.requestReview(messageId, args)
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      const statusSchema = TbType.Object({ afterId: TbType.Optional(TbType.Integer({ minimum: 0, description: '仅在用户要看更多明细时使用上次返回的 nextAfterId。首次省略。' })) }, { additionalProperties: false })
+      const statusTool: AgentTool<typeof statusSchema> = {
+        name: 'team_v2_status', label: '查看团队进度', parameters: statusSchema,
+        description: '读取本团队会话的工单阶段、最新证据状态，以及**每个成员最近一单**（title/phase/rounds）——判断「新任务跟这个成员上次做的有没有关联」就用 members 里的依据；上一单 rounds=3 且没过 ⇒ 下次派给它要开新段。只读，不派工、不复验。submitted 是待验收，accepted 是报告已通过，不代表功能验收通过。',
+        async execute(_callId, args) {
+          const result = v2host.stageReport(args.afterId)
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      const reviseSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '要追加/改验收的需求单编号' }),
+        acceptance: TbType.String({ description: '这一版的要求/验收文本（完整表述，不是补丁片段）' }),
+        quote: TbType.String({ description: '逐字引用用户表达本次补充的原话片段，必须出现在本用户消息里' }),
+      }, { additionalProperties: false })
+      const reviseTool: AgentTool<typeof reviseSchema> = {
+        name: 'team_v2_revise', label: '追加或修改需求要求', parameters: reviseSchema,
+        description: '仅在用户明确要求对某条需求追加要求或修改验收时调用；要求当前尝试已结算（排队/执行中/待验收时先结算）。原话与历史版本不会被覆盖，本次来源逐字保存。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以追加需求')
+          const messageId = sessionTurnBase.get(sessionId)
+          if (!messageId) throw new Error('当前轮没有可引用的用户消息')
+          const result = v2host.reviseRequest({ requestId: args.requestId, acceptance: args.acceptance, messageId, quote: args.quote })
+          return { content: [{ type: 'text', text: JSON.stringify({ id: result.id, revision: result.revision, acceptance: result.acceptance, replayed: result.replayed === true }) }] }
+        },
+      }
+      const reworkSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '要返工的需求单编号' }),
+        memberId: TbType.String({ description: '重派给团队里的哪位成员' }),
+      }, { additionalProperties: false })
+      const reworkTool: AgentTool<typeof reworkSchema> = {
+        name: 'team_v2_rework', label: '返工重派', parameters: reworkSchema,
+        description: '仅在用户明确要求对某条被驳回/失败的需求重派时调用。同一需求单开新的尝试，不新增顶层需求；排队/执行中的单不能重派。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以返工重派')
+          const result = v2host.reworkRequest({ requestId: args.requestId, memberId: args.memberId })
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      /* ★1123（老板）：用户说"继续/重来/重派"时，AI 要能直接把中断项放行 —— 不用人去点按钮。 */
+      const retrySchema = TbType.Object({
+        requestId: TbType.Optional(TbType.Integer({ minimum: 1, description: '只重试这一条需求的中断执行；省略则重试当前所有待核对的中断执行' })),
+      }, { additionalProperties: false })
+      const retryTool: AgentTool<typeof retrySchema> = {
+        name: 'team_v2_retry', label: '重试中断的执行', parameters: retrySchema,
+        description: '当用户要求「继续 / 重来 / 重派」而队列被中断的执行挡住时调用。先按 OS 事实确认旧进程已退出，再把中断项判失败并继续后面的队列。不会重跑这一单本身（要真重跑用 team_v2_rework）；旧进程还活着时会如实报错，不放行。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以重试中断执行')
+          const page: any = v2host.stageReport(0)
+          let ids: number[] = []
+          if (typeof args.requestId === 'number') {
+            const row = (page.items || []).find((r: any) => r.request?.id === args.requestId)
+            if (!row?.attempt?.id) throw new Error('需求 #' + args.requestId + ' 没有可重试的中断执行')
+            ids = [row.attempt.id]
+          } else {
+            ids = Array.isArray(page.recoveryAttemptIds) ? page.recoveryAttemptIds : []
           }
-        }
-        if (_live.length) {
-          const _lines = _live.slice(0, 12).map((r: any) =>
-            `- ${String(r.memberName || r.memberId || '成员')}｜步骤 ${String(r.stepId || '?')}｜已跑 ${Math.max(0, Math.round((Date.now() - Number(r.startedAt || Date.now())) / 1000))}s`)
-          sys += `\n\n# 当前委派状态（实时注入）\n你还有 ${_live.length} 个子任务**正在跑**：\n${_lines.join('\n')}\n` +
-            '它们结束时会自动以【团队回归】/【分身回归】通知叫醒你。**不要重复派发同一批任务**；' +
-            '用户问进度就用 sub_read 查（不要靠回忆，更不要为了"给个答复"重新 bb_goal + team_dispatch）。'
-        }
-      } catch (e) {
-        console.warn('[1036-S40] 注入委派状态失败:', String((e as Error)?.message || e))
+          if (!ids.length) throw new Error('当前没有待重试的中断执行')
+          const result = v2host.confirmRecovery(ids, '用户一键重试（AI 代执行）', '用户要求继续；按 OS 事实确认旧进程已退出')
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
       }
+      const cancelSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '要取消的需求单编号' }),
+        reason: TbType.Optional(TbType.String({ description: '用户给出的取消原因（可选）' })),
+      }, { additionalProperties: false })
+      const cancelTool: AgentTool<typeof cancelSchema> = {
+        name: 'team_v2_cancel', label: '取消需求', parameters: cancelSchema,
+        description: '仅在用户明确要求取消某条需求时调用。排队中的立即取消；运行中的先真的停执行器，确认停下后才标为已取消（期间显示停止中）。取消一单不影响其它需求。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以取消需求')
+          const result = await v2host.cancelRequest({ requestId: args.requestId, reason: args.reason ?? '用户取消' })
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
       }
+      const noteSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '要补充的需求单编号' }),
+        text: TbType.String({ description: '要补充给执行者的内容（不改验收、不改授权）' }),
+        quote: TbType.String({ description: '逐字引用用户这条补充消息里的片段' }),
+      }, { additionalProperties: false })
+      const noteTool: AgentTool<typeof noteSchema> = {
+        name: 'team_v2_note', label: '给运行中的需求补充信息', parameters: noteSchema,
+        description: '仅在用户给某条**正在执行**的需求补充信息（不改验收/范围/权限）时调用。补充会按顺序交给当前执行者；改验收或范围请用 team_v2_revise。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以补充信息')
+          const messageId = sessionTurnBase.get(sessionId)
+          if (!messageId) throw new Error('当前轮没有可引用的用户消息')
+          const result = v2host.noteRequest({ requestId: args.requestId, messageId, quote: args.quote, text: args.text })
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      const dependSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '后置需求单编号' }),
+        dependsOn: TbType.Integer({ minimum: 1, description: '前置需求单编号（它按当前版本验收通过后，后置才会开工）' }),
+      }, { additionalProperties: false })
+      const dependTool: AgentTool<typeof dependSchema> = {
+        name: 'team_v2_depend', label: '设置需求依赖', parameters: dependSchema,
+        description: '仅在用户明确说明"某需求要等另一需求做完"时调用。前置必须按当前版本验收通过，后置才会开工；自依赖和成环会被拒绝。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以设置依赖')
+          const result = v2host.dependRequests({ requestId: args.requestId, dependsOn: args.dependsOn })
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      /* ★1124（老板拍板）：用户口头表态 ⇒ 直接落状态，不用去界面点按钮。
+         授权规矩与派工同源（quote 必须逐字来自当前用户轮那条真实消息），evidence 留原话可回查。
+         ⚠️ 与 team_v2_review 的分工：review = 复核/出独立意见（永不改阶段）；accept = 把用户的结论落账。 */
+      const acceptSchema = TbType.Object({
+        requestId: TbType.Integer({ minimum: 1, description: '需求单编号（界面上是 #N）' }),
+        attemptId: TbType.Integer({ minimum: 1, description: '这一单当前的执行编号（team_v2_status 里有）' }),
+        passed: TbType.Boolean({ description: '用户说通过/可以/行 = true；用户说打回/不行/重做 = false' }),
+        quote: TbType.String({ minimum: 1, maxLength: 500, description: '用户那句表态的逐字引用（必须能在用户本条消息里原样找到）' }),
+      }, { additionalProperties: false })
+      const acceptTool: AgentTool<typeof acceptSchema> = {
+        name: 'team_v2_accept', label: '按用户原话验收', parameters: acceptSchema,
+        description: '【只在用户已经明确表态之后调用】把用户口头说的"通过/打回"落成需求单状态。quote 必须逐字引用用户那条消息里表达结论的话；用户没表态、只是在问进度或还没回答时**不要**调用。',
+        async execute(_callId, args) {
+          if (!session?.mainRunning || session.sidebarTurnSource !== 'user') throw new Error('只有前台用户轮可以按用户原话验收')
+          const messageId = sessionTurnBase.get(sessionId)
+          if (!messageId) throw new Error('当前轮没有真实用户消息')
+          const result = v2host.acceptByUser(messageId, args)
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        },
+      }
+      teamTools = [tool, reviewTool, statusTool, reviseTool, reworkTool, retryTool, cancelTool, noteTool, dependTool, acceptTool]
+      sys += '\n\n# 团队 V2\n只负责跟用户沟通和收单。用户明确要求派发时调用 team_v2_dispatch；每项 quote 要逐字引用实质需求，可以引用先前用户消息，也可以在不同工单复用同一段。不要把「让成员去」等授权指令拆作需求原话，不要代为宣布已开始或完成。普通聊天不要派发。队列停在中途（有「已中断」的单）且用户说继续/重来/重派时，调用 team_v2_retry（先确认旧进程已退出，再放行后面的队列）；用户问团队进度时使用 team_v2_status，只报告账本里的阶段，不派工、不复验；全局计数不是当前页条数。用户明确要求验收或复验时，调用 team_v2_review，不重派。明确是已有文件指纹用 file，需要独立判断报告证据才用 report；目标不明不猜编号。文件匹配或 C 的意见都不等于需求单通过；如实汇报。用户明确要求给某条需求追加要求或改验收时调用 team_v2_revise（逐字引用该用户消息、给出完整新版要求；排队/执行中/待验收的单先结算再改）；用户明确要求对被驳回或失败的需求重派时调用 team_v2_rework（同一需求单开新尝试，不新增顶层需求）。用户明确要求取消某条需求时调用 team_v2_cancel：排队中的立即取消，运行中的会先真停执行器、确认停下后才标为已取消（期间是"停止中"），不要替用户宣布"已经停了"。用户只是给正在跑的需求补信息（不改验收/范围）时用 team_v2_note，它会按顺序交给当前执行者；要改验收或范围才用 team_v2_revise。用户明确说"某需求要等另一需求做完"时用 team_v2_depend（前置必须按当前版本验收通过，后置才开工；自依赖/成环会被拒）；若这个先后顺序在**同一次派工**里就说清了，直接用 team_v2_dispatch 的 after（本次第几项）或 dependsOn（已有单号）随单声明，不要先派再补。**用户在对话里对某条需求明确表了态（通过 / 打回 / 重做）时，调用 team_v2_accept 并逐字引用用户那句话**——用户不必再去界面点按钮；用户没表态、或只是问进度时不要调，也不要在简报里替用户下结论。\n成员：'
+        + teamDef.members.map(m => m.id + ' ' + memberName(teamDef, m.id)).join('、')
     }
     // ★ 0929 刀②：低频能力包目录（说明书不常驻；先让模型知道"有什么能力、怎么喊"）
     if (loadToolsTool.length) {
@@ -11102,6 +10711,7 @@ function getOrCreateAgent(sessionId: string): Agent {
       /* ★L4：副作用工具执行前先落盘（在审批门禁**之前** —— 用户点"允许"的那一刻，正文已经安全了） */
       beforeToolCall: async (ctx: BeforeToolCallContext, signal?: AbortSignal) => {
         if (needsCheckpoint(ctx.toolCall.name)) {
+          presetCheck?.invalidate()
           /* ★L4-c：先记工具意图（立即写草稿，不等 1200ms 节流），再落正文 */
           noteToolIntent(sessionId, ctx.toolCall)
           await checkpointSession(sessionId)
@@ -11116,7 +10726,8 @@ function getOrCreateAgent(sessionId: string): Agent {
       // 旧 agent（被 session.cancel 停止/删除、或新 prompt 重建）的事件一律丢弃：
       // abort 后的 handleRunFailure/tool 结果不再广播，避免"停止后仍继续回复/内容串到下一轮"
       if (agents.get(sessionId) !== agent) return
-      handleAgentEvent(sessionId, event, agent)
+      if (event.type === 'agent_start') presetCheck?.invalidate()
+      handleAgentEvent(sessionId, event, agent, presetCheck)
     })
     // 恢复持久化的对话上下文（重启后 agent 重建，transcript 回填保证多轮连续）
     if (session?.transcript?.length) {
@@ -11422,6 +11033,29 @@ function assessRisk(session: SessionView, toolName: string, args: any): RiskAsse
      list_dir=只读低危；schedule 的 create/update/remove/run_now=改配置/起活=中高危。
      ★ a1（总方案 §2.1）：history（文件时光机）工具已下架，下面不再有它的分支。 */
   if (toolName === 'list_dir') return { ...low, toolDisplay: `list_dir ${args?.path || '.'}`, question: `列目录：${args?.path || '（工作区根）'}` }
+  /* ★1126：生成图片 —— **按张计费**，误调就是真花钱 ⇒ 永远需要审批（老板拍板：不要设置里的开关，
+     跟 fs_write 一样在工具行打黄点、执行弹卡）。
+     ⚠️ 不加这条会掉进函数末尾的"未知工具缺省放行"，等于免审批花钱（bg_start 0921 就是这个坑）。 */
+  if (toolName === 'image') {
+    const a = String(args?.action || 'generate')
+    const pv = String(args?.prompt || '')
+    const shown = `image ${a}｜${pv.slice(0, 80)}${pv.length > 80 ? '…' : ''}`
+    return { needApproval: true, risk: 'medium', question: `生成图片（按张计费）：${pv.slice(0, 80)}`, toolDisplay: shown }
+  }
+  /* ★1126：生成视频 —— **按次计费**，同样永远需要审批。
+     注意它提交后立刻返回（不阻塞对话），真正的生成在后台任务里跑。 */
+  if (toolName === 'video') {
+    const pv = String(args?.prompt || '')
+    const dur = Number(args?.duration)
+    const i2v = args?.refShotRef ? '（图生视频）' : ''
+    const shown = `video${i2v}｜${pv.slice(0, 80)}${pv.length > 80 ? '…' : ''}`
+    return {
+      needApproval: true,
+      risk: 'medium',
+      question: `生成视频${i2v}（按次计费，约 2~3 分钟）：${pv.slice(0, 80)}${Number.isFinite(dur) && dur > 0 ? `（${dur}s）` : ''}`,
+      toolDisplay: shown,
+    }
+  }
   if (toolName === 'schedule') {
     const a = String(args?.action || '')
     if (a === 'list') return { ...low, toolDisplay: 'schedule list', question: '查定时任务列表' }
@@ -12052,7 +11686,7 @@ function broadcastPlan(sessionId: string): void {
    两条同时成立 ⇒ 把那条置 done + broadcastPlan；零条 / 两条以上 ⇒ **不动**（只记一行 info，绝不猜）。
    ⚠️ 故意**不做** intent 关键字匹配（"验 A 语法" 去找含 A 的条目）：那又是靠文本猜，猜错比不勾更糟。
    ⚠️ 只勾**一步**：勾完 in_progress 归零 ⇒ 下一次 check_run 自然不再动（不会连锁勾穿整张计划）。 */
-function autoTickPlanAfterCheckRun(sessionId: string, details: any): void {
+function autoTickPlanAfterCheckRun(sessionId: string, details: any, presetCheck?: PresetPlanCheck): void {
   if (!details || details.ok !== true) return
   const s = sessions.get(sessionId) as any
   if (!s) return
@@ -12074,6 +11708,7 @@ function autoTickPlanAfterCheckRun(sessionId: string, details: any): void {
   const next: PlanItem[] = items.map((x, i) => i === hit.i
     ? { id: x.id, text: x.text, status: 'done' as PlanStatus, done: true }
     : x)
+  if (presetCheck?.blockCompletion(next)) return
   s.plan = next
   schedulePersist()
   try {
@@ -12086,13 +11721,16 @@ function autoTickPlanAfterCheckRun(sessionId: string, details: any): void {
 }
 
 /** 给 check_run 套一层：工具跑完（拿到 details）后按**事实**自动勾一步；包装出错绝不影响工具本身的返回值 */
-function withPlanAutoTick(tool: AgentTool<any>, sessionId: string): AgentTool<any> {
+function withPlanAutoTick(tool: AgentTool<any>, sessionId: string, presetCheck?: PresetPlanCheck): AgentTool<any> {
   const rawExecute = (tool as any).execute
   return {
     ...tool,
     async execute(...args: any[]) {
+      const params = args[1]
+      const record = presetCheck?.begin(String(params?.cmd || ''), params?.cwd, params?.readOnly)
       const res: any = await rawExecute.apply(tool, args)
-      try { autoTickPlanAfterCheckRun(sessionId, res?.details) } catch { /* ignore */ }
+      record?.(res?.details)
+      try { autoTickPlanAfterCheckRun(sessionId, res?.details, presetCheck) } catch { /* ignore */ }
       return res
     },
   } as AgentTool<any>
@@ -12200,7 +11838,7 @@ function planReceiptLine(x: PlanItem): string {
 }
 
 /** 计划本工具：AI 拆解多步骤任务时写计划，用户在输入框上方看到进度划勾 */
-function buildPlanTool(sessionId: string): AgentTool<any> {
+function buildPlanTool(sessionId: string, presetCheck?: PresetPlanCheck): AgentTool<any> {
   return {
     name: 'plan_write',
     label: '写计划',
@@ -12265,6 +11903,7 @@ function buildPlanTool(sessionId: string): AgentTool<any> {
         }
       }
       if (next.length === 0) throw new Error('计划为空：请用 items 先建一份')
+      if (presetCheck?.blockCompletion(next)) throw new Error(presetCheck.reason)
       const doneN = next.filter((x: PlanItem) => x.done).length
 
       /* ★g4（任务三根治）：`acceptance` / `verifyCmd` 原来**只在**「目标模式 + 闸门开」时才落地
@@ -12584,10 +12223,10 @@ const SESSION_LOG_CAP = 2000
    `stateRev` 只在**同 logEpoch 内**才可比，因此两者的可信度必须一致）。 */
 const LOG_EPOCH = crypto.randomUUID().slice(0, 8)
 const memberActivity = createMemberActivity({ logEpoch: LOG_EPOCH, currentStateRev, publish: publishMemberActivity })
-function publishMemberActivity(parentId: string) {
+function publishMemberActivity(parentId: string, extra?: { teamWorkChanged: true }) {
   try {
     const parent = sessions.get(parentId)
-    if (parent) broadcastMux(parentId, statusFrame(parentId, { mainRunning: parent.mainRunning === true }))
+    if (parent) broadcastMux(parentId, statusFrame(parentId, { mainRunning: parent.mainRunning === true, ...extra }))
   } catch (e) { console.warn('[member-activity] publish failed:', e) }
 }
 const memberActivityBridge = createMemberActivityBridge(memberActivity)
@@ -13228,8 +12867,15 @@ function injectSessionNotice(sessionId: string, text: string, meta?: NoticeMeta)
      正确判据只有一条：**主 agent 自己有没有在跑**（`mainRunning`）—— 成员在跑跟"能不能接收汇报"无关。 */
   const _mainBusy = (sessions.get(sessionId) as any)?.mainRunning === true
   if (_mainBusy) {
-    /* 主 agent 正在说话 ⇒ 这份汇报**排队等下一轮**：这是后端知道的事实，记在成员状态上（前端只读）。 */
+    /* 主 agent 正在说话 ⇒ 这份汇报先不打扰（前端蓝徽标）。
+       ★1124v（**老板要的效果**）：**忙时把通知就地喂进当前这一轮** ——
+         pi 的 `steer()` 只是往 `steeringQueue` 入队，会在本轮**下一次 LLM 调用前**被取走
+         ⇒ 模型做完手头的事，就在**同一条正文里**把这条通知处理掉、一次性汇报。
+       原来这里只"入队 + return"，送达要靠 P119 那条"收轮后 200ms 补送"——
+       而补送走的是"空闲 ⇒ 开一轮"分支，结果就是老板看到的"正文说完又冒一轮"（已删）。 */
     setMembersQueued(sessionId, ids, true)
+    const _ag = agents.get(sessionId)
+    if (_ag) drainBgNotices(sessionId, _ag)
     return
   }
   /* ★1032-TM（P92）：**空闲到达 = 新的一段**，这个事实由发起方写下来（不再交给读侧按时间反推）。
@@ -13273,6 +12919,1182 @@ function findMemberSession(parentId: string, memberId: string): any | null {
     if (anyS.parentSessionId === parentId && anyS.memberId === memberId && anyS.archived !== true) return s
   }
   return null
+}
+
+/** Adapter for a host that exclusively owns this parent ledger. Not registered as a public RPC. */
+export function openTeamV2SessionHost(parentId: string, ledgerFile: string, reopened = false) {
+  const parent = sessions.get(parentId)
+  if (!parent?.teamId || parent.parentSessionId || !isAppendOnlySession(parentId, parent)) {
+    throw new Error('V2 requires an append-only parent team session')
+  }
+  /** Settlement is driven by the transitions the ledger just committed, never by "a commit
+     happened": file checks, reviewer bookkeeping and queue starts report no stopped batch. */
+  function settleStoppedBatches(batchIds: number[]) {
+    if (!batchIds.length) return
+    try { ledger.settleStages(batchIds) } catch (e) { sessionLog(parentId, 'error', 'lifecycle', 'V2 阶段结算失败：' + String(e)) }
+    scheduleDeliver()
+  }
+  const ledger = openTeamV2Ledger(ledgerFile, (stoppedBatches) => {
+    publishMemberActivity(parentId, { teamWorkChanged: true })
+    settleStoppedBatches(stoppedBatches)
+  })
+  let recoveryPending = false
+  /* ★第十三轮补正（独立验收 R2）：「上一次调度尝试」的**后端事实**。
+     为什么需要它：只看见"B 没开工"，证明不了是统一放行判据挡的 —— 也可能是入口被 UI/鉴权/
+     上游预检挡掉，调度根本没被唤起。这里如实记下"哪个入口、什么时候、调度结果是过还是被什么挡住"，
+     界面（队列为什么停）与验收都用这同一份事实，谁都不许自己推断。 */
+  let lastDrain: { at: number; ok: boolean; reason: string; source: string } = { at: 0, ok: false, reason: '', source: '' }
+  /* ★第十三轮：**fail-closed 阻断列表** —— 只收"连账本都写不进"的失败。
+     能持久化的事实（围栏 / 待人工核对）一律进账本，不放这里：内存里的东西重启就没了，
+     拿它当安全边界等于假安全。这里存在的意义只有一个：**写不进库时也不许开工**，且要看得见。 */
+  const unpersistedFailures: string[] = []
+  function recordUnpersistedFailure(text: string): void {
+    const line = String(text).slice(0, 1_200)
+    if (unpersistedFailures.length < 20) unpersistedFailures.push(line)
+    try { sessionLog(parentId, 'error', 'lifecycle', '[团队V2] ' + line) } catch { /* 日志失败不影响阻断本身 */ }
+  }
+  /** 现在能不能有新单开工。返回 null = 可以；否则是**挡住它的那条事实**（原样给用户看）。 */
+  function startBlockedReason(): string | null {
+    if (unpersistedFailures.length) return unpersistedFailures[0]
+    const unreviewed = ledger.pendingRecoveryAttempts().length
+    if (unreviewed) return `有 ${unreviewed} 条旧执行停在待人工核对（interrupted 且尚未核对产物/副作用）`
+    const fences = ledger.fenceHolds()
+    if (fences.length) return `有 ${fences.length} 条副作用围栏未解除（进程/后台任务未确认停下）`
+    return null
+  }
+  /** ★工具进程持久登记：身份来自进程 origin（开工边沿带下来的确切 attempt），不从这里反推。
+   *  失败处置是**一个策略点**：
+   *    · 能挂围栏 ⇒ 挂持久围栏（"副作用状态未知"成为账本事实，后续任何入口都开不了工）；
+   *    · 挂不上（库整体写不进）⇒ 进阻断列表（fail-closed），原文留成可见证据。 */
+  function noteToolProcess(team: { requestId: number; attemptId: number }, proc: { pid: number; pidStart?: string }, phase: 'spawned' | 'identified') {
+    const pid = Number(proc.pid)
+    const stamp = phase === 'identified' ? (proc.pidStart ?? null) : null
+    try {
+      const recorded = ledger.noteAttemptPid(team.attemptId, pid, stamp)
+      if (!recorded && phase === 'identified') {
+        /* attempt 已是终态（这单早就结算了）：不编造归属，也不假装"没有残留" ——
+           结算时的 `drained` 会按成员会话的活进程表复核同一件事；这里只留可见证据。 */
+        try { sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] 工具进程 pid ${pid} 未能归到 attempt #${team.attemptId}（该单已不在 queued/running）`) } catch { /* ignore */ }
+      }
+    } catch (error) {
+      const evidence = `工具进程登记失败（attempt #${team.attemptId}，pid ${pid}）：${String((error as Error)?.message || error).slice(0, 400)}`
+      try {
+        ledger.holdFence(team.requestId, team.attemptId,
+          `${evidence}；副作用状态未知，必须先确认清理才放行`, [{ pid, startStamp: proc.pidStart ?? null }])
+        try { sessionLog(parentId, 'error', 'lifecycle', `[团队V2] ${evidence}（已挂持久围栏）`) } catch { /* ignore */ }
+      } catch (fenceError) {
+        recordUnpersistedFailure(`${evidence}；围栏也写不进：${String((fenceError as Error)?.message || fenceError).slice(0, 300)}；本进程内拒绝任何新开工`)
+      }
+    }
+  }
+  /** ★1124：**启动意图**（`spawn()` 之前落库）。
+   *  这是"进程已起、pid 还没进账本"那段崩溃窗口的结构性答案：先有一条账本事实（pid 未知），
+   *  崩溃重启后它还在 ⇒ 按"未知副作用"挡住，等人核对。
+   *  返回 token（工具层原样带进 origin，拿到 pid 后用它补）；这单已不在跑 ⇒ null（不伪造）。 */
+  function beginProcIntent(attemptId: number, token: string, tool: string): number | null {
+    return ledger.beginProcIntent(attemptId, token, tool)
+  }
+  /** 拿到 pid → 把意图补成"已知 pid"；补不上如实留痕（这单会因此按未确认副作用处理）。 */
+  function bindProcIntent(attemptId: number, token: string, pid: number): void {
+    let bound = false
+    try {
+      bound = ledger.bindProcIntent(attemptId, token, pid)
+    } catch (error) {
+      try { sessionLog(parentId, 'error', 'lifecycle', `[团队V2] 启动意图补 pid 失败（attempt #${attemptId}，pid ${pid}）：${String((error as Error)?.message || error).slice(0, 300)}`) } catch { /* ignore */ }
+      return
+    }
+    if (!bound) {
+      /* 补不上 = 账本里没这条意图或已补过：pid 归属仍由常规登记 + 结算围栏负责，这里只留痕。 */
+      try { sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] 启动意图未找到（attempt #${attemptId}，pid ${pid}）：该 pid 只按常规登记处理`) } catch { /* ignore */ }
+    }
+  }
+  function endProcIntent(token: string): boolean { return ledger.endProcIntent(token) }
+  /* ── 自动阶段汇报（第 2 阶段）：只投递，不唤醒、不复验、不重派 ─────────────────── */
+  let deliverQueued = false
+  let delivering = false
+  /** Moment auto reporting was switched on plus the settlement watermark at that moment.
+   * Absent ⇒ off: nothing is delivered, nothing wakes A. Eligibility is decided by settlement
+   * **order** (`settlementId > afterSettlementId`), never by comparing timestamps — so a batch
+   * settled in the same millisecond just before the switch still counts as backlog. */
+  type AutoReportState = { since: number; afterSettlementId: number }
+  function autoReportState(): AutoReportState | undefined {
+    const value = (parent as any)?.teamAutoReportState
+    if (!value || typeof value !== 'object') {
+      /* ★1124（老板拍板："自动汇报开关可以作废了，默认汇报就行，已经很静默了"）：
+         **默认开**。水位取"此刻最新的结算"，所以打开不会把历史结算一次性补发；
+         显式关掉（写入 `{enabled:false}` 之外的形状）仍走原来的"关"路径 —— 见 setTeamAutoReport。 */
+      if ((parent as any)?.teamAutoReportState === false || (parent as any)?.teamAutoReportDisabled === true) return undefined
+      const state = { since: Date.now(), afterSettlementId: ledger.latestSettlementId() } satisfies AutoReportState
+      ;(parent as any).teamAutoReportState = state
+      return state
+    }
+    const { since, afterSettlementId } = value as AutoReportState
+    if (!Number.isFinite(since) || !Number.isSafeInteger(afterSettlementId) || afterSettlementId < 0) return undefined
+    return { since, afterSettlementId }
+  }
+  /** Not a delay-based guess: it only lets the caller finish its own bookkeeping first. */
+  function scheduleDeliver() {
+    if (deliverQueued) return
+    deliverQueued = true
+    setImmediate(() => {
+      deliverQueued = false
+      try { deliverStageReports() } catch (e) { sessionLog(parentId, 'error', 'lifecycle', 'V2 阶段汇报未投递：' + String(e)) }
+    })
+  }
+  /** Foreground always wins: a replying agent or a queued user message means "wait for real". */
+  function foregroundBusy(): boolean {
+    return sessionAgentBusy(parentId) || parent!.mainRunning === true ||
+      queueSnapshot(parentId).length > 0 || pendingUserRpcId.has(parentId)
+  }
+  /** Delivery evidence = the message exists in what the session file replays, with this settlement
+   * stamped on it. A return value, a wake-up or a bare id is not evidence and is never used here. */
+  function persistedStageMessage(settlementId: number, messageId: string): boolean {
+    const payload = sessionStore.readSessionPayload(parentId)
+    const messages = Array.isArray(payload?.messages) ? payload!.messages as any[] : []
+    return messages.some(m => m?.id === messageId && m?.teamStageReport?.settlementId === settlementId)
+  }
+  /** Re-broadcast the authoritative turn projection after the brief landed in the transcript.
+   * Front-end rendering is driven by these frames (not by `nodes`), and the projection reads the
+   * transcript — so this call puts the brief on screen inside its own turn, with the same block
+   * identity a reload rebuilds. The carrier carries the brief's own message id and owning turn:
+   * `buildTurnProjection` takes `id` from the carrier, and a frame without an id is dropped by the
+   * front end ("权威消息缺 id") — that was why the frame arrived but nothing was drawn. */
+  function pushStageBriefSnapshot(messageId: string, ownerTurn: string) {
+    const existing = turnAccumulators.get(parentId) as unknown as TurnAccumulator | undefined
+    const carrier = existing ?? ({
+      id: messageId, baseTurnId: ownerTurn, text: '', reasoning: '', sequence: [], lastTextDelta: '', lastReasoningDelta: '', model: '',
+    } as unknown as TurnAccumulator)
+    /* `buildTurnProjection` 读的是 `turnAccumulators` 里那一份，不是函数参数；
+       空闲时那里是空的 ⇒ 投影拿不到 id ⇒ 帧被前端"缺 id"守卫丢掉。
+       临时挂一次最小载体，推完就摘（它不是真实轮，不许留在表里被后续逻辑当成"还在跑"）。 */
+    const installed = !existing
+    if (installed) turnAccumulators.set(parentId, carrier as any)
+    try { emitTurnSnapshot(parentId, carrier, true, false) } finally { if (installed) turnAccumulators.delete(parentId) }
+  }
+  function deliverStageReports(limit = 20): number {
+    if (delivering || foregroundBusy()) return 0
+    delivering = true
+    try {
+      let touched = 0
+      /* Reconciliation first, and it ignores the switch: if the conversation already carries a
+         message stamped with this settlement, the record must say delivered — no resend, no
+         duplicate, even if reporting was switched off or the watermark moved past it. */
+      const owned = new Map<number, string>()
+      for (const message of parent!.messages) {
+        const mark = (message as any)?.teamStageReport
+        if (mark && typeof mark.settlementId === 'number' && typeof message.id === 'string') owned.set(mark.settlementId, message.id)
+      }
+      for (const [settlementId, messageId] of owned) {
+        if (!ledger.stageReportPending(settlementId)) continue
+        if (!persistedStageMessage(settlementId, messageId)) {
+          throw new Error(`阶段 ${settlementId} 在主会话里有归属消息但落盘不可确认，挂起不重发`)
+        }
+        ledger.markStageReportDelivered(settlementId, messageId)
+        touched++
+      }
+      /* Delivery only, and only for stages ordered after the watermark. */
+      const state = autoReportState()
+      if (!state) return touched
+      const page = ledger.pendingStageReports(state.afterSettlementId, limit)
+      for (const view of page) {
+        if (owned.has(view.settlementId)) continue
+        const brief = buildStageBrief({
+          settlementId: view.settlementId,
+          authorizingMessageId: view.authorizingMessageId,
+          standing: view.standing,
+          items: view.items,
+        })
+        const id = crypto.randomUUID()
+        const message = {
+          id, role: 'assistant', content: [{ type: 'text', text: brief.text }], timestamp: Date.now(), expectFinal: false,
+          teamStageReport: { settlementId: view.settlementId, batchId: view.batchId, standing: view.standing },
+        }
+        parent!.messages.push(message as any)
+        /* The conversation has two copies of itself: `messages` (front-end contract) and
+           `transcript` (model context, and what `session.history` re-projects from). Both are
+           written with the SAME id, and stamped with the turn that owns them, so live projection,
+           history and the file agree on both identity and placement. */
+        const ownerTurn = String(currentTurnBaseId(parentId) || '')
+        ;((parent as any).transcript ||= []).push({
+          id, role: 'assistant', content: [{ type: 'text', text: brief.text }], timestamp: message.timestamp,
+          ...(ownerTurn ? { turnId: ownerTurn } : {}),
+        })
+        /* 同一个事实也要进 pi 的活体消息表：实时投影（`buildTurnProjection`）把 transcript 当基准、
+           再按"共同锚点"接上 live；若 live 停在上一条，基准里锚点之后的新条目会被切掉 ——
+           这是简报"帧发了但 blocks 里没有"的真因（实测 `message_updated|brief=false`）。
+           transcript 与 live 本来就是同一条对话的两份，写一处不写另一处就会分叉。 */
+        const liveMessages = (agents.get(parentId) as any)?.state?.messages
+        if (Array.isArray(liveMessages)) {
+          liveMessages.push({
+            id, role: 'assistant', content: [{ type: 'text', text: brief.text }], timestamp: message.timestamp,
+            ...(ownerTurn ? { turnId: ownerTurn } : {}),
+          })
+        }
+        sessionStore.commitSync(parentId)
+        /* Breakpoint 1 lives on the other side of this line: if the process dies before the next
+           statement, the record stays pending and the next start replays the file to decide. */
+        if (!persistedStageMessage(view.settlementId, id)) {
+          throw new Error(`阶段 ${view.settlementId} 的汇报写入后回读不到，未标记已送达`)
+        }
+        ledger.markStageReportDelivered(view.settlementId, id)
+        /* Live rendering is fed by the same authoritative turn projection as history
+           (`buildTurnProjection`), not by a private frame: the brief must appear in the turn that
+           already owns it, with the block identity the history path will rebuild later. */
+        pushStageBriefSnapshot(id, ownerTurn)
+        touched++
+        /* ★1124（老板拍板"降噪但要知道进度"）：**整批终结时唤醒主 agent 汇报总战果**。
+           投递这条简报只是把事实放进对话；用户还希望主 agent 主动开口说一句。
+           ★1124x（自动续跑拆除后）：改走**与团队回归同构**的投递口径 `injectSessionNotice` ——
+             主 agent 空闲 ⇒ 开一轮让它汇报（保留原能力）；
+             正忙 ⇒ 只入 inbox，等下一次任何轮次开始时一并带给它（**不再"本轮结束立刻开新轮"**）。
+           注意这些话**不带明细**：明细已经在简报里，避免同一份内容说两遍。 */
+        try {
+          injectSessionNotice(parentId,
+            `【团队回归】结算 #${view.settlementId}：这一批需求全部终结（有通过的、也可能有待你定的）。` +
+            `请先看上面那条阶段简报与需求单，然后**用正文向用户汇报这批结果**：几项通过、几项待定或失败、需要用户决定什么（没有就说无需确认）。` +
+            `不要重复派单，也不要替用户下结论。`)
+        } catch (error) {
+          /* 唤醒失败不影响"简报已送达"这个事实：用户仍能在对话里看到它。 */
+          sessionLog(parentId, 'warn', 'lifecycle', 'V2 回归唤醒失败（简报已送达）：' + String((error as Error)?.message || error).slice(0, 200))
+        }
+      }
+      /* Known remaining work continues on its own, but only after yielding: the next pass re-reads
+         the switch, the foreground state and the queue, so a busy parent or a switched-off feature
+         stops it there instead of a timer doing it later. */
+      if (page.length >= limit) scheduleDeliver()
+      return touched
+    } finally { delivering = false }
+  }
+  if (reopened) {
+    try {
+      ledger.recoverAfterOwnerExit()
+      recoveryPending = ledger.pendingRecoveryAttempts().length > 0
+      /* ★重启复核（**默认路径，不再是开关** —— 独立验收明确：安全边界不能靠配置打开）：
+         进程被 SIGKILL 后 running 一律变 interrupted，但如果**预登记的 pid 里还有活着/查询未知的**，
+         那就不只是"待人工对账"，而是"副作用可能确实还在" ⇒ 补登记持久围栏，任何后单不许开工。
+         探活三态严格区分：只有"确实查无此进程"才算退出；活着 / 查询失败 都不放行。 */
+      {
+        for (const attemptId of ledger.pendingRecoveryAttempts()) {
+          try {
+            const alive = ledger.attemptPids(attemptId)
+              .filter(p => !isFenceCleared(judgeFenceProbe(procStartStamp(p.pid), p.startStamp, sameStamp)))
+            if (!alive.length) continue
+            /* ★第十三轮：挂围栏的返回值也要看 —— `false` = 这条单已不是 interrupted（事实变了），
+               不能当"已经挡住"了事，必须留可见证据。 */
+            const fenced = ledger.holdFenceOnInterrupted(attemptId,
+              `重启复核：上次拉起过的 ${alive.length} 个进程状态未知或仍存活（pid ${alive.map(p => p.pid).join(',')}），需确认清理后才放行`, alive)
+            if (!fenced) recordUnpersistedFailure(`重启复核：attempt #${attemptId} 的围栏没挂上（该单已不在 interrupted），残留 pid ${alive.map(p => p.pid).join(',')} 状态未知`)
+          } catch (error) {
+            /* ★第十三轮：**不许静默吞掉**。复核失败 = 证明不了副作用状态 ⇒ 必须挡住后单，
+               并把失败原文留成证据（原来 `catch {}` 之后照样往下走，等于"查不了就当没有"）。 */
+            recordUnpersistedFailure(`重启复核失败（attempt #${attemptId}）：${String((error as Error)?.message || error).slice(0, 400)}；副作用状态未知，未放行`)
+          }
+        }
+        recoveryPending = ledger.pendingRecoveryAttempts().length > 0 || unpersistedFailures.length > 0
+        /* 复核结论留痕：待核几条、当前围栏几条（不写"仍活/已退"这类未证实的话）。 */
+        sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] 重启复核：待核 ${ledger.pendingRecoveryAttempts().length} 条，当前围栏 ${ledger.fenceHolds().length} 条`)
+      }
+      /* A restart may have turned running attempts into interrupted. Settle what already stopped
+         before any new drain, so a reopened ledger reports each finished stage exactly once. */
+      ledger.settleStages()
+      /* Restart is also where undelivered stages are reconciled: whatever the previous process
+         wrote to the conversation file first is treated as delivered, never sent twice. */
+      scheduleDeliver()
+    } catch (error) {
+      ledger.close()
+      throw error
+    }
+  }
+  function readUserMessage(id: string) {
+    const msg = parent!.messages.find(msg => msg.id === id && msg.role === 'user' && !isInjectedUserMsg(msg))
+    if (!msg) return undefined
+    const text = msg.content.filter(block => block.type === 'text').map(block => block.text).join('')
+    sessionStore.commitSync(parentId)
+    return text
+  }
+  /* ★双槽结论（本轮取证得出）：**调度器的 2 槽并发是真的**（`teamV2Scheduler` 有 2 槽单测：
+     两单同时跑、同成员排他、领取不重复），但**写隔离还没做到** ——
+     成员的工具实际在 `child.workDir`（= 父会话工作区）里执行，`started(workspace)` 只是被记账，
+     所以两个成员仍然会写同一个目录 ⇒ 那不是并发而是互踩。
+     真正的写隔离需要"成员会话按 attempt 分段、每段 workDir 指向独立 worktree"，
+     会改变"同一成员跨 attempt 续聊"的现有语义 —— 属下一阶段，本轮**不启用 2 槽**。
+     所以这里固定单槽，等成员会话分段方案落地再打开（不拿记账冒充隔离）。 */
+  /* 槽位数：默认 2（双槽并行）；NIS_TEAM_V2_SLOTS=1 可显式退回单槽 ——
+     用于验证"阻断期不许开工"这类语义（双槽下第二槽会立刻领走下一单，那类断言测的是单槽行为）。 */
+  const teamSlots = (() => {
+    /* ★1124（老板拍板）：**并行度 = 团队成员数（上限 20）**，不再人为卡 2。
+       串行/并行只该由「依赖关系」和「有几个成员」决定；写隔离已由每单独立工作区
+       （`.nis-attempts/<attemptId>`）保证，2 槽那套"再多需要更强隔离证据"的顾虑不再成立。
+       `NIS_TEAM_V2_SLOTS=n` 仍可显式覆盖（闸门 R3/R4/F-BS/F-CW 要单槽语义验"阻断期后单必须排队"）。 */
+    const team = parent.teamId ? readTeam(parent.teamId) : undefined
+    const members = Math.max(1, Math.min(20, team?.members.length || 1))
+    const raw = Number(process.env.NIS_TEAM_V2_SLOTS || '')
+    return Number.isSafeInteger(raw) && raw >= 1 ? Math.max(1, Math.min(20, raw)) : members
+  })()
+  /* ★1124：这行以前硬写「单槽执行」，不管实际槽位 —— 日志说的是假事实，排查时会被带偏。
+     现在按真实槽位输出，并把"同成员仍串行"这条语义一起写清（老板问过"并行能不能用"）。 */
+  sessionLog(parentId, 'info', 'lifecycle', `[团队V2] 执行槽位 ${teamSlots}（${teamSlots === 1 ? '单槽：同一时刻只有一单在跑' : '并行：互不依赖的需求单可同时开工，上限=成员数；同一成员天然一次只干一件'}）`)
+  /* ★1124（老板拍板）：一单交付后按需求单上的**可执行判据**自动验收 —— 无人值守的关键一环。
+     判定规则（与设计定稿第 2 节一致）：
+       · 没判据            ⇒ 什么都不做（停在待验收，等人）
+       · 硬判据全过        ⇒ 直接 accepted，evidence 写明依据
+       · 不过且还有次数    ⇒ 自动打回（同一成员重做，最多 3 次尝试）
+       · 不过且用满 3 次   ⇒ 判 rejected（进总汇报「待你定」）
+       · 判不了（缺工作区）⇒ 什么都不做并留痕，绝不瞎判通过
+     `ledger.assign` 拒绝"同一版本还有 open attempt"，所以打回必须先 verify(false) 关掉旧 attempt 再 assign。 */
+  async function autoVerifySubmission(input: { request: { id: number; revision: number; verify?: string | null }; attempt: { id: number; memberId: string }; artifact: string }) {
+    let verify = null
+    try { verify = input.request.verify ? normalizeTeamV2Verify(JSON.parse(input.request.verify)) : null } catch { verify = null }
+    if (!verify) return
+    let outcome
+    try {
+      outcome = await runTeamV2Verify({ workspace: ledger.workspaceOf(input.attempt.id), verify })
+    } catch (error) {
+      sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] #${input.request.id} 自动验收执行异常（不擅自判过）：${String((error as Error)?.message || error).slice(0, 200)}`)
+      return
+    }
+    const describe = describeVerifyOutcome(outcome)
+    if (outcome.verdict === 'pass') {
+      ledger.verify(input.request.id, input.attempt.id, input.artifact, true, '自动验收（硬判据）：' + describe)
+      sessionLog(parentId, 'info', 'lifecycle', `[团队V2] #${input.request.id} 自动验收通过：${describe}`)
+      scheduleDrain('auto-verify-passed')
+      return
+    }
+    if (outcome.verdict === 'needs-human') {
+      /* ★1124（老板选 A：C 只出意见，不改状态）：硬判据判不了时问一次独立复验，
+         把「支持 / 有疑虑 / 证据不足 + 一句理由」写进账本，随简报附给人看。
+         ⚠️ 无论 C 说什么都**不**改相位 —— runReview 只落意见，验收仍等人。 */
+      try {
+        const review = await runReview({ requestId: input.request.id, attemptId: input.attempt.id, artifact: input.artifact })
+        const opinion = (review as any)?.status === 'opinion' ? (review as any).opinion : null
+        sessionLog(parentId, 'info', 'lifecycle', opinion
+          ? `[团队V2] #${input.request.id} 无法自动验收（${outcome.reason}）；C 复验意见：${opinion.status} · ${String(opinion.summary || '').slice(0, 120)}`
+          : `[团队V2] #${input.request.id} 无法自动验收（${outcome.reason}）；C 复验未给出意见（${String((review as any)?.status || 'unknown')}）`)
+      } catch (error) {
+        sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] #${input.request.id} 的 C 复验调用失败（不影响"停在待验收"）：${String((error as Error)?.message || error).slice(0, 200)}`)
+      }
+      sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] #${input.request.id} 停在待验收等人：${outcome.reason}`)
+      scheduleDeliver()
+      return
+    }
+    const rounds = ledger.attempts(input.request.id).length
+    if (rounds < 3) {
+      ledger.verify(input.request.id, input.attempt.id, input.artifact, false, `自动打回（第 ${rounds} 次尝试未过）：` + outcome.reason)
+      ledger.assign(input.request.id, input.request.revision, input.attempt.memberId)
+      sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] #${input.request.id} 自动打回（第 ${rounds} 次）：${outcome.reason}`)
+      scheduleDrain('auto-verify-rework')
+    } else {
+      ledger.verify(input.request.id, input.attempt.id, input.artifact, false, `自动验收三次未过，判驳回：` + outcome.reason)
+      sessionLog(parentId, 'error', 'lifecycle', `[团队V2] #${input.request.id} 三次自动验收未过，判驳回：${outcome.reason}`)
+      scheduleDrain('auto-verify-rejected')
+    }
+  }
+  const scheduler = createTeamV2Scheduler(ledger, {
+    readUserMessage,
+    slots: teamSlots,
+    autoVerify: autoVerifySubmission,
+    /* ★第十三轮：**所有 drain 入口共用的一道门**（派工 / 重派 / 验收通过 / 围栏复核…）。
+       判据只有一类：现在有没有"证明不了副作用状态"的事没结清 ——
+         · 连账本都写不进的失败（内存阻断，本进程内 fail-closed）；
+         · 旧执行停在待人工核对（interrupted 且无核对记录）；
+         · 持久围栏未解除。
+       放在这里而不是各个调用方：加门的地方越少，越不会有"某条路还能开工"的漏。 */
+    startBlocked: () => startBlockedReason(),
+    /* 阶段4补正：结算/放槽前的**副作用围栏** —— 这一趟尝试持有的可写资源必须**真的交还**。
+       判据（都是后端自己的事实，不靠"Promise 已返回 / abort() 已调用"）：
+         ① 该成员会话登记在册的工具子进程（含 `bg_start` 拉起的）；
+         ② 该成员会话仍在跑的后台任务（`background` / `paused`）。
+       **不再无条件排除 bg_start**：后台任务写的是同一个工作区，排除它等于宣称"任务跑着、目录没人写"，那是假话。
+       10s 内没交还 ⇒ 不 ok ⇒ 调度器落 interrupted 并挂**持久围栏**（fence_hold），
+       之后每次 drain 都复核；只有这里确认无残留才解除。 */
+    async drained(target): Promise<{ ok: true } | { ok: false; reason: string; pids?: Array<{ pid: number; startStamp: string | null }> }> {
+      /* ★判据分两层，**OS 事实优先于内存登记表**：
+           ① 本 attempt 围栏里落过库的 pid（fence_pid）——后端重启后登记表是空的，但进程可能还活着，
+              所以对每个 pid 用 procStartStamp 探活（pid + 启动戳双校验，避免 pid 复用误判）；
+           ② 内存登记表里"这个成员会话"名下的进程/后台任务（首次判定时持久表还没有数据，靠它）。
+         两层任一有残留 ⇒ 不 ok。**成员会话不存在（!child）不再直接放行** ——
+         那只是"内存里查不到"，不等于"进程退出了"。 */
+      const attemptId = target.attempt.id
+      const child = ensureMemberSession(parentId, target.memberId)
+      const deadline = Date.now() + 10_000
+      for (;;) {
+      const liveProcs = child ? procList().filter(p => p.origin?.conversationId === child.id && p.origin?.tool !== 'bg_start') : []
+        const liveBg = child ? bgList(child.id).filter(t => t.status === 'background' || t.status === 'paused') : []
+        /* 预登记（工具启动时）+ 围栏登记，同一条来源：这个 attempt 名下记过的 pid。 */
+        const heldPids = ledger.attemptPids(attemptId)
+        /* ★三种结果分开判（独立验收点名）：'' = 确实查无此进程 ⇒ 退出；null = 查询失败 ⇒ **不放行**；
+           同 pid 但指纹不同 = 原进程已退、pid 被复用 ⇒ 也算退出。判定本体在 teamV2FenceProbe（唯一实现，可单测）。 */
+        const probed = heldPids.map(p => ({ ...p, verdict: judgeFenceProbe(procStartStamp(p.pid), p.startStamp, sameStamp) }))
+        const stillAlive = probed.filter(p => !isFenceCleared(p.verdict))
+        /* ★1124：pid 还没落库的**启动意图**（崩溃窗口里起过进程）= 副作用状态未知 ⇒ 不放行。
+           这一条正是堵住"没记上 pid 就等于没有残留"那个盲区的地方。 */
+        const unboundIntents = ledger.unboundProcIntents(attemptId)
+        /* 后台任务（liveBg）不进放行判据：成员挂长任务是合法状态；它仍在下面"不 ok 的说明"里如实列出。 */
+      if (!liveProcs.length && !stillAlive.length && !unboundIntents.length) return { ok: true }
+        if (Date.now() > deadline) {
+          const parts = [
+            ...liveProcs.map(p => `${p.name}(pid ${p.pid})`),
+            ...liveBg.map(t => `后台任务「${t.title || t.task_id}」(${t.status})`),
+            ...stillAlive.map(p => p.verdict === 'unknown' ? `进程状态未知(pid ${p.pid}，探活查询失败)` : `已登记进程(pid ${p.pid})`),
+            ...unboundIntents.map(i => `未确认的工具启动意图(${i.tool}，pid 未知)`),
+          ]
+          const pids = [
+            ...liveProcs.map(p => ({ pid: p.pid, startStamp: procStartStamp(p.pid) })),
+            ...stillAlive.map(p => ({ pid: p.pid, startStamp: p.startStamp })),
+          ]
+          return { ok: false, reason: parts.join('、') + ' 仍未交还工作区', pids }
+        }
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+    },
+    async execute(job, started) {
+      const { request, attempt } = job
+      /* 开工前核验全部走 `return failed`，不 throw：
+         throw 会被调度器记成 interrupted（"未知副作用，需人工对账"），可这里**一件事都还没做**，
+         用户重派即可 —— 语义必须分清，不然一次撤权就把整个队列锁进人工对账。 */
+      const team = parent.teamId && readTeam(parent.teamId)
+      if (!team || !team.members.some(member => member.id === attempt.memberId)) {
+        return { kind: 'failed', evidence: `授权已失效：成员 ${attempt.memberId} 已不在团队，拒绝开工` }
+      }
+      /* 授权边界（开工）：派工的授权必须**按当前事实**仍成立 —— 那条用户消息还在、且它的逐字引用仍在这条消息里。
+         派工时核过一次，但排队期间消息可能被删改；不能拿"当时成立"当现在成立。 */
+      const authorization = readUserMessage(request.messageId)
+      if (typeof authorization !== 'string' || !authorization.includes(request.quote)) {
+        return { kind: 'failed', evidence: '授权已失效：授权用户消息已不可核，拒绝开工' }
+      }
+      const dir = parent.workDir?.trim()
+      let dirUsable = false
+      try { dirUsable = !!dir && fs.statSync(dir).isDirectory() } catch { dirUsable = false }
+      if (!dirUsable) return { kind: 'failed', evidence: `工作区不可用（${dir || '空'}），拒绝开工` }
+      const child = ensureMemberSession(parentId, attempt.memberId)
+      /* 成员会话的 workDir 必须回到父工作区：执行期只是**临时**借用 attempt 目录，
+         正常路径由 finally 还原；这里再显式归位一次，保证"跨 attempt 复用会话"的不变量成立
+         （实测漏还原会让下一个 attempt 直接以"工作区不匹配"被拒开工）。 */
+      if (child && child.workDir !== dir) child.workDir = dir
+      if (!child || isExternalPreset(child.presetId)) {
+        return { kind: 'failed', evidence: '成员工作区或引擎不匹配当前授权，拒绝开工' }
+      }
+      /* 单槽：成员就在父工作区里干活（`started(workspace)` 记录的就是它）。
+         双槽要求成员会话按 attempt 分段换 workDir，尚未交付 —— 见 scheduler 创建处的说明。 */
+      /* ★双槽：每一单在自己的目录里干活。会话 workDir 只在**执行期临时**切过去（跑完立刻还原），
+         所以"成员 workDir 等于父工作区"的校验、以及跨 attempt 复用会话的语义都不变。
+         验收/文件指纹本来就按 attempt 记的 workspace 解析（checkFile → workspaceFor）。 */
+      const attemptWs = path.join(dir, '.nis-attempts', String(attempt.id))
+      fs.mkdirSync(attemptWs, { recursive: true })
+      const workspace = fs.realpathSync.native(attemptWs)
+      /* ★第十三轮：这一单的确切身份，从执行器一路带到工具启动层（经 `TeamV2Turn.attempt`）。
+         `hostSessionId` 是持有账本的父会话 —— 落库时直接用它找 host，不再从成员反推。 */
+      const identity: TeamAttemptIdentity = { hostSessionId: parentId, requestId: request.id, attemptId: attempt.id }
+      const turn: TeamV2Turn = { id: crypto.randomUUID(), attempt: identity, started: () => started(workspace) }
+      const p = { message: ['团队任务 #' + request.id, request.title, '用户原话：' + request.quote, '验收：' + request.acceptance].join('\n') }
+      setMemberPromptInput(child.id, p, { turnId: turn.id, kind: 'dispatch' })
+      teamV2Turns.set(p, turn)
+      /* 阶段4：执行前快照，执行后取差 = 这一轮成员执行的可归属用量（另计，不并入公共总量）。 */
+      const usageBefore = memberUsageSnapshot(child.id)
+      let reply: Awaited<ReturnType<typeof runPromptCore>>
+      {
+        const prevWd = child.workDir
+        child.workDir = workspace
+        try { reply = await runPromptCore(child.id, p) } finally { child.workDir = prevWd }
+      }
+      /* 阶段2·普通补充：主轮跑完后，把这一单收件箱里的补充按到达顺序继续交给**同一个 attempt**
+         （不改 acceptance/revision，只补上下文）。**投递成功才 consume**：失败就保留未消费并留日志。
+         补充轮有**自己的 turnId**，最终交付绑到"真正产出报告的那一轮"，不用首轮报告假提交。 */
+      let finalTurnId = turn.id
+      let finalReport = ''
+      let noteFailure = ''
+      /* ★已投递但**还没消费**的补充：投递成功只记 id，消费推迟到"报告提交成功之后"
+         （scheduler 的 `ledger.submit` 之后才 `consumeNotes`）。顺序反过来会制造
+         "收件被消费、报告没落盘"的静默丢失窗口。 */
+      const deliveredNoteIds: number[] = []
+      for (let round = 0; round < 5; round++) {
+        const notes = ledger.pendingNotes(request.id, attempt.id)
+        if (!notes.length) break
+        const followUpId = crypto.randomUUID()
+        const followUp = { message: ['团队任务 #' + request.id, '用户补充（不改验收，请据此继续）：', ...notes.map(note => '- ' + note.text)].join('\n') }
+        /* 补充轮也要被 agent_end 接住（否则最终产物永远停在首轮）。
+           started 用空实现：start 边沿在首轮已经发生过，补充轮不该再触发一次。 */
+        const followUpTurn: TeamV2Turn = { id: followUpId, attempt: identity, started: () => undefined }
+        teamV2Turns.set(followUp, followUpTurn)
+        setMemberPromptInput(child.id, followUp, { turnId: followUpId, kind: 'dispatch' })
+        try {
+          { const prevWd2 = child.workDir; child.workDir = workspace; try { await runPromptCore(child.id, followUp) } finally { child.workDir = prevWd2 } }
+        } catch (error) {
+          noteFailure = `第 ${round + 1} 批补充投递失败（${notes.length} 条未处理）：${String((error as Error)?.message || error)}`
+          break
+        }
+        /* 唯一凭据 = 这一轮**自己结算**的 agent_end 结果。不从会话 transcript / 历史里另找文本凑数。
+           只有「这一轮身份在、以 stop 收尾、有非空正文」才算真处理了补充；否则一条收件都不消费。 */
+        const settled = followUpTurn.result
+        const followUpAssistant = settled?.messages.findLast(m => m.role === 'assistant')
+        const followUpText = followUpAssistant
+          ? followUpAssistant.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+          : ''
+        if (!settled) noteFailure = `第 ${round + 1} 批补充轮没有结算`
+        else if (!settled.messages.some(m => m.role === 'user' && 'id' in m && m.id === followUpId)) noteFailure = `第 ${round + 1} 批补充轮的轮身份缺失`
+        else if (!followUpAssistant || followUpAssistant.stopReason === 'aborted') noteFailure = `第 ${round + 1} 批补充轮被中断`
+        else if (followUpAssistant.stopReason === 'error') noteFailure = `第 ${round + 1} 批补充轮模型返回错误：${followUpAssistant.errorMessage || '未给出原因'}`
+        else if (followUpAssistant.stopReason !== 'stop') noteFailure = `第 ${round + 1} 批补充轮未正常结束（${followUpAssistant.stopReason}）`
+        else if (!followUpText.trim()) noteFailure = `第 ${round + 1} 批补充轮没有正文`
+        if (noteFailure) break
+        deliveredNoteIds.push(...notes.map(note => note.id))
+        finalTurnId = followUpId
+        finalReport = followUpText
+      }
+      /* 只算"还没投递过"的补充（已投递的这几条由提交成功后统一消费）。 */
+      const leftNotes = ledger.pendingNotes(request.id, attempt.id).filter(note => !deliveredNoteIds.includes(note.id))
+      if (leftNotes.length) console.warn(`[团队V2] 需求 #${request.id} 仍有 ${leftNotes.length} 条补充未处理：${noteFailure || '超过单次投递批次上限'}`)
+      if (reply.queued || !turn.result) throw new Error('V2 member did not settle its exact turn')
+      const messages = turn.result.messages
+      /* 阶段4：成员执行这一轮的真实用量按 requestId/revision/attemptId 记一份**可归属**账
+         （另计，不并入团队公共总量；缺回执也落行并标不完整）。
+         取执行前后成员会话 usageTotals 的差值 —— 每个成员会话独立计数，不跨成员串。 */
+      try {
+        const usageAfter = memberUsageSnapshot(child.id)
+        const delta = {
+          input: Math.max(0, (usageAfter.uncached - usageBefore.uncached) + (usageAfter.cacheRead - usageBefore.cacheRead) + (usageAfter.cacheWrite - usageBefore.cacheWrite)),
+          output: Math.max(0, usageAfter.output - usageBefore.output),
+          cacheRead: Math.max(0, usageAfter.cacheRead - usageBefore.cacheRead),
+          cacheWrite: Math.max(0, usageAfter.cacheWrite - usageBefore.cacheWrite),
+        }
+        const known = delta.input + delta.output > 0
+        ledger.recordAttemptUsage({
+          attemptId: attempt.id, requestId: request.id, revision: attempt.revision, memberId: attempt.memberId,
+          usage: known ? delta : null,
+        })
+      } catch (error) {
+        console.warn('[团队V2] 记录可归属用量失败：', String((error as Error)?.message || error))
+      }
+      if (!messages.some(m => m.role === 'user' && 'id' in m && m.id === turn.id)) throw new Error('V2 turn identity missing from member receipt')
+      const assistant = messages.findLast(m => m.role === 'assistant')
+      if (!assistant || assistant.stopReason === 'aborted') throw new Error('V2 member turn was interrupted')
+      memberStore.commitMemberSync(child.id)
+      if (reply.turnFailed || assistant.stopReason === 'error') {
+        return { kind: 'failed', evidence: reply.error || assistant.errorMessage || '成员模型返回错误' }
+      }
+      if (assistant.stopReason !== 'stop' || !assistant.content.some(block => block.type === 'text' && block.text.trim())) {
+        throw new Error('V2 member did not submit a completed report')
+      }
+      const firstReport = assistant.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+      /* 阶段2补正：**补充没处理完就不能交付** —— 还有未消费补充时，不许拿首轮报告当最终结果假提交。 */
+      if (leftNotes.length) {
+        return { kind: 'failed', evidence: `用户补充未处理完（${leftNotes.length} 条仍在收件箱），不提交报告${noteFailure ? '：' + noteFailure : ''}` }
+      }
+      /* 有补充轮就用**补充轮的报告与 turnId**（真正产出交付的那一轮），没有补充才用首轮。
+         artifact 的 digest 与回跳都基于同一轮，避免"补充后仍交首轮报告"。 */
+      const report = finalReport || firstReport
+      const reportTurnId = finalReport ? finalTurnId : turn.id
+      /* 产物应用边界重核：「授权一次管一批」的第二个核验点 —— 产物真的要落地前，按当前事实再核一遍。
+         成员已不在团队 / 工作区已换 / 授权原话已不可核 ⇒ 一律 failed（不提交），
+         不把已失效的授权当有效；迟到回执（跑完了才撤的权）走的是同一条路。 */
+      const teamNow = parent.teamId && readTeam(parent.teamId)
+      if (!teamNow || !teamNow.members.some(member => member.id === attempt.memberId)) {
+        return { kind: 'failed', evidence: `授权已失效：成员 ${attempt.memberId} 已不在团队，产物不提交` }
+      }
+      const dirNow = parent.workDir?.trim()
+      if (!dirNow || child.workDir !== dirNow) {
+        return { kind: 'failed', evidence: '授权已失效：成员工作区已变更，产物不提交' }
+      }
+      const authNow = readUserMessage(request.messageId)
+      if (typeof authNow !== 'string' || !authNow.includes(request.quote)) {
+        return { kind: 'failed', evidence: '授权已失效：授权用户消息已不可核，产物不提交' }
+      }
+      /* 交付即合并：产物回到父工作区，成员与主 agent 共享同一份工作区。 */
+      if (workspace !== fs.realpathSync.native(dir)) {
+        const overwritten = mergeAttemptWorkspace(workspace, fs.realpathSync.native(dir))
+        if (overwritten.length) {
+          console.warn('[团队V2] 合并回父工作区时，这些同名文件被本次交付覆盖：' + overwritten.slice(0, 20).join(', ') + (overwritten.length > 20 ? ' …共 ' + overwritten.length + ' 个' : ''))
+        }
+      }
+      return { kind: 'submitted', artifact: memberReportArtifact(child.id, reportTurnId, report), report, consumeNoteIds: deliveredNoteIds }
+    },
+  })
+  /**
+   * ★1123（老板）：双槽下每单在 `<父工作区>/.nis-attempts/<attemptId>` 里干活，**交付时把产物合并回父工作区**
+   * —— 成员和主 agent 本来就该在同一个工作区里共享信息，隔离只是"干活期间别互相踩"，不是永久分家。
+   * 同名文件：新产物覆盖旧内容；若内容确有不同，**如实记下来**（不静默吞掉"谁赢了"）。
+   * 返回被覆盖的相对路径列表。
+   */
+  /**
+   * ★1124（老板拍板 + 大厂口径）：中断单**默认不合并任何东西** —— 崩溃现场不可信
+   * （GitHub Actions 托管 runner 每次全新、Temporal 只认重放历史，都不猜现场）。
+   * 沙箱保留供诊断，用户点名要哪个文件才带哪个；只认**相对路径白名单**，不做目录递归推断。
+   */
+  function copyPickedFiles(from: string, to: string, picks: string[]): { merged: string[]; overwritten: string[]; missing: string[] } {
+    const merged: string[] = [], overwritten: string[] = [], missing: string[] = []
+    for (const rel of picks.slice(0, 200)) {
+      const safe = String(rel || '').replace(/\\/g, '/')
+      if (!safe || safe.startsWith('/') || safe.includes('..') || safe.startsWith('.nis')) { missing.push(String(rel)); continue }
+      const src = path.join(from, safe), dst = path.join(to, safe)
+      try {
+        if (!fs.existsSync(src) || !fs.statSync(src).isFile()) { missing.push(safe); continue }
+        if (fs.existsSync(dst)) {
+          const a = fs.readFileSync(src), b = fs.readFileSync(dst)
+          if (!a.equals(b)) overwritten.push(safe)
+        }
+        fs.mkdirSync(path.dirname(dst), { recursive: true })
+        fs.copyFileSync(src, dst)
+        merged.push(safe)
+      } catch { missing.push(safe) }
+    }
+    return { merged, overwritten, missing }
+  }
+
+  function mergeAttemptWorkspace(from: string, to: string): string[] {
+    const overwritten: string[] = []
+    const walk = (rel: string) => {
+      let entries: fs.Dirent[]
+      try { entries = fs.readdirSync(path.join(from, rel), { withFileTypes: true }) } catch { return }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.nis')) continue      /* 内部状态目录不合并 */
+        const r = rel ? path.join(rel, entry.name) : entry.name
+        const src = path.join(from, r), dst = path.join(to, r)
+        if (entry.isDirectory()) { try { fs.mkdirSync(dst, { recursive: true }) } catch { /* ignore */ } walk(r); continue }
+        if (!entry.isFile()) continue
+        try {
+          if (fs.existsSync(dst)) {
+            const a = fs.readFileSync(src), b = fs.readFileSync(dst)
+            if (!a.equals(b)) overwritten.push(r)
+          }
+          fs.mkdirSync(path.dirname(dst), { recursive: true })
+          fs.copyFileSync(src, dst)
+        } catch { /* 单个文件合并失败不拖垮交付；下面的日志会记无可合并的项 */ }
+      }
+    }
+    walk('')
+    return overwritten
+  }
+
+  function scheduleDrain(source = 'internal') {
+    setImmediate(() => {
+      void scheduler.drain()
+        /* 一次 drain 会把队列推到底（可能包含取消落定），结束后统一推一次权威变更，让所有窗口刷新。 */
+        .then(() => {
+          lastDrain = { at: Date.now(), ok: true, reason: '', source }
+          /* ★drain 里会按 OS 事实复核并解除围栏（releaseVerifiedFences）——
+             解除后"待对账"这件事就变了，必须**按账本重算**这个缓存标志，
+             否则界面会一直停在"等待重启对账"、派工一直被拒（围栏已解也进不来）。 */
+          const next = ledger.pendingRecoveryAttempts().length > 0 || unpersistedFailures.length > 0
+          if (next !== recoveryPending) recoveryPending = next
+          publishMemberActivity(parentId, { teamWorkChanged: true })
+          /* ★1124（老板实测"成员干完不汇报"）：原来这里只刷界面，**从不安排阶段汇报** ——
+             于是"成员全部回归 → 自动汇报一次"这条链只剩三个触发点（前台轮次结束 / 打开开关 / 后端重启），
+             成员在自己会话里干完、主 agent 又是空闲的，就永远等不到那次汇报。
+             结算刚发生就是该投递的时刻；`deliverStageReports` 自己会判"前台忙就等下次 / 关着就不发"。 */
+          scheduleDeliver()
+        })
+        .catch(e => {
+          const msg = String(e)
+          lastDrain = { at: Date.now(), ok: false, reason: msg, source }
+          publishMemberActivity(parentId, { teamWorkChanged: true })
+          /* 围栏等待 / 开工门被挡不是"调度坏了"：它们是"副作用还没确认交还"的正常暂停 —— 用 warn 记。
+             ★第十三轮：开工门（startBlocked）走同一档：B 保持排队是**正确结果**，不是调度中断。 */
+          if (/unconfirmed side effect/.test(msg) || /Team V2 start blocked/.test(msg)) sessionLog(parentId, 'warn', 'lifecycle', 'V2 队列暂停：' + msg)
+          else sessionLog(parentId, 'error', 'lifecycle', 'V2 调度中断：' + msg)
+        })
+    })
+  }
+  function reportTurn(memberId: string, artifact: string) {
+    const [kind, childId, turnId, digest] = artifact.split(':')
+    if (kind !== 'member-turn' && kind !== MEMBER_REPORT_FORMAT) return undefined
+    const child = sessions.get(childId)
+    if (!child || child.parentSessionId !== parentId || child.memberId !== memberId || !Array.isArray(child.transcript)) return undefined
+    const history = child.transcript as AgentMessage[]
+    const first = history.findIndex(m => m.role === 'user' && 'id' in m && m.id === turnId)
+    if (first < 0) return undefined
+    let end = first + 1
+    while (end < history.length && (history[end].role !== 'user' || isInjectedUserMsg(history[end]))) end++
+    const reply = history.slice(first + 1, end).findLast(m => m.role === 'assistant')
+    if (!reply || reply.role !== 'assistant' || reply.stopReason !== 'stop') return undefined
+    return { child, turnId, reply, digest }
+  }
+  function resolveReport(requestId: number, attemptId: number, artifact: string) {
+    const attempt = ledger.attempts(requestId).find(row => row.id === attemptId)
+    if (!attempt || !['submitted', 'accepted', 'rejected'].includes(attempt.phase) || attempt.artifact !== artifact) throw new Error('V2 submitted report changed')
+    const turn = reportTurn(attempt.memberId, artifact)
+    if (!turn) throw new Error('V2 report turn unavailable')
+    return { turn, target: { sessionId: turn.child.id, turnId: turn.turnId, memberId: attempt.memberId } }
+  }
+  function reportText(attemptId: number, artifact: string, turn: ReturnType<typeof reportTurn>): string | null {
+    if (artifact.startsWith(MEMBER_REPORT_FORMAT + ':')) return ledger.readDurableReport(attemptId, artifact)
+    // Pre-version receipts keep their original fingerprint contract; navigation is independent of it.
+    if (!turn) return null
+    if (createHash('sha256').update(JSON.stringify(turn.reply.content)).digest('hex') !== turn.digest) return null
+    return turn.reply.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+  }
+  function readReport(requestId: number, attemptId: number, artifact: string) {
+    const { turn, target } = resolveReport(requestId, attemptId, artifact)
+    const report = reportText(attemptId, artifact, turn)
+    if (report === null) throw new Error('V2 report evidence unavailable or changed')
+    return { report, target }
+  }
+  function prepareReview(receipt: ReviewReceipt) {
+    return prepareTeamV2Review(ledger, receipt, (candidate, memberId) => {
+      const artifact = candidate.artifact
+      const turn = artifact.startsWith(MEMBER_REPORT_FORMAT + ':') ? undefined : reportTurn(memberId, artifact)
+      return reportText(candidate.attemptId, artifact, turn)
+    })
+  }
+  const runReview = createTeamV2Reviewer({
+    prepare: prepareReview,
+    selectModel() {
+      const cfg = currentLlmConfig()
+      const model = getState().providers.find(p => p.id === cfg.providerId)?.models?.find(m => m.id === cfg.model)
+      if (!cfg.base || !model || !Number.isSafeInteger(model.maxContext) || !(model.maxContext! > 0)) return null
+      const window = resolveContextWindow(cfg.providerId, cfg.model)
+      return {
+        providerId: cfg.providerId, model: cfg.model, window, maxOutput: resolveMaxOutput(cfg.providerId, cfg.model),
+        async run(prompt) {
+          const invoke = directLlmRequest(cfg, prompt, REVIEW_SYSTEM, { maxTokens: REVIEW_OUTPUT_TOKENS, contextWindow: window, timeoutMs: 30000 })
+          const ev = await invoke()
+          if (ev.type === 'error') return { text: '', usage: directReviewUsage((ev as any).error?.usage), failed: true }
+          return { text: directAssistantText(ev.message), usage: directReviewUsage(ev.message.usage) }
+        },
+      }
+    },
+    record: ledger.recordReview,
+  })
+  /* ★1124（老板定稿第 4 节）：换段判据 + 交接包。只在派单前调用，绝不中断正在跑的任务。 */
+  /** 返回换段原因（null = 不换）。三条触发都在这里，主 agent 只提供"无关"这一条。 */
+  function rotateReason(memberId: string, forced: boolean): string | null {
+    if (forced) return '主 agent 判定本单与该成员上一单无关'
+    /* ① 上一单跑满 3 次还没过：错误方向已经污染上下文，换段止损（账本事实，不靠 AI 判断） */
+    const recent = (ledger.recentByMember() as Array<{ memberId: string; requestId: number; phase: string; rounds: number }>)
+      .find(row => row.memberId === memberId)
+    if (recent && recent.rounds >= 3 && ['rejected', 'failed', 'interrupted'].includes(recent.phase)) {
+      return `上一单 #${recent.requestId} 跑满 ${recent.rounds} 次仍未过（${recent.phase}）`
+    }
+    /* ② 当前段已经压缩过：`contextSummaries` 是"压缩次数"的既有权威口径（换段后新段天然从 0 起） */
+    const child = findMemberSession(parentId, memberId)
+    const compactions = Array.isArray((child as any)?.contextSummaries) ? (child as any).contextSummaries.length : 0
+    if (compactions > 0) return `当前段已压缩 ${compactions} 次（选择在下次派单前换段，避免工作中换）`
+    return null
+  }
+  /** 交接包：**后端从账本拼装事实**（单/相位/依据），不需要主 agent 写、也不加一轮模型调用。
+   *  成员"当前状态一句话"由它自己在新段第一轮里补 —— 事实部分不可篡改，意图部分它最清楚。 */
+  function buildHandoffPacket(memberId: string, reason: string): string {
+    const lines: string[] = [`【交接】上一段为什么换：（${reason}）`]
+    const recent = (ledger.recentByMember() as Array<{ memberId: string; requestId: number; title: string; phase: string; rounds: number }>)
+      .filter(row => row.memberId === memberId)
+    for (const row of recent) {
+      lines.push(`· 最近的单 #${row.requestId}「${row.title}」：${row.phase}（${row.rounds} 次尝试）`)
+    }
+    /* 工作区按 **attemptId** 记（`workspaceOf` 的参数是 attempt，不是 request）—— 取每单最新那次。 */
+    const workspaces = recent.map(row => {
+      const attempts = ledger.attempts(row.requestId) as Array<{ id: number }>
+      const last = attempts[attempts.length - 1]
+      return last ? ledger.workspaceOf(last.id) : null
+    }).filter(Boolean)
+    if (workspaces.length) lines.push(`· 你这几单的工作区：${workspaces.slice(0, 3).join('、')}（产物都在各自工作区里）`)
+    lines.push('· 新的一段从零开始：上面事实来自账本，不要凭记忆编造上一段做了什么；接着干之前先读项目约定与你要改的文件，再动手。')
+    return lines.join('\n')
+  }
+  return {
+    ledger, scheduler, readReport, reportTurn, prepareReview, runReview,
+    /** ★第十三轮：工具进程持久登记（由 `setProcRegistrar` 钩子在进程启动时调用；身份来自 origin）。 */
+    noteToolProcess,
+    /** ★1124：工具启动意图（`spawn()` 之前落库 / 拿到 pid 补 / 进程结束删）。 */
+    beginProcIntent, bindProcIntent, endProcIntent,
+    /** ★第十三轮：当前挡住"新单开工"的那条事实（null = 没挡）。界面/夹具按这个口径看，不各自推断。 */
+    startBlocked: startBlockedReason,
+    /** ★第十三轮补正（R2）：上一次调度尝试的后端事实（哪个入口唤起、过了还是被什么挡住）。 */
+    lastDrain: () => lastDrain,
+    /** Auto reporting is per parent conversation and off by default. Turning it on records the
+     * current settlement watermark; turning it on again while already on is a no-op, so a repeated
+     * `enabled:true` can never push the boundary forward and orphan work that was already eligible. */
+    setAutoReport(enabled: boolean) {
+      if (typeof enabled !== 'boolean') throw new Error('V2 auto report needs an explicit boolean')
+      const current = autoReportState()
+      if (enabled && current) {
+        /* 已开启：边界一格不动，但既然用户在要这个能力，就把已知剩余工作推一下。 */
+        scheduleDeliver()
+        return { enabled: true, since: current.since, afterSettlementId: current.afterSettlementId }
+      }
+      if (enabled) (parent as any).teamAutoReportState = { since: Date.now(), afterSettlementId: ledger.latestSettlementId() } satisfies AutoReportState
+      /* ★1124：关掉要留一个**显式假值**，不能 delete —— delete 之后 `autoReportState()` 会按"默认开"重建，
+         那等于关不掉（默认开是老板这次拍板的）。 */
+      else (parent as any).teamAutoReportState = false
+      /* 开关是显式动作：同步落盘，失败就不返回成功（异步窗口会让"重启后静默失效"变得不可见）。 */
+      try { sessionStore.commitSync(parentId) } catch (e) { throw new Error('V2 auto report state was not persisted: ' + String(e)) }
+      scheduleDeliver()
+      const state = autoReportState()
+      return { enabled: state !== undefined, since: state?.since ?? null, afterSettlementId: state?.afterSettlementId ?? null }
+    },
+    autoReportState() {
+      const state = autoReportState()
+      return { enabled: state !== undefined, since: state?.since ?? null, afterSettlementId: state?.afterSettlementId ?? null }
+    },
+    deliverStageReports,
+    scheduleDeliver,
+    stageReport(afterId?: number) { return { ...ledger.stageReport(afterId), recoveryPending, startBlocked: startBlockedReason(), lastDrain, ...(recoveryPending ? { recoverySandbox: this.pendingRecoverySandbox() } : {}), fenceCleared: ledger.fenceReleases().length } },
+    async requestReview(userMessageId: string, input: { requestId?: number; mode: 'file' | 'report' }) {
+      if (!readUserMessage(userMessageId)) throw new Error('V2 review requires an active user message')
+      if (input.mode !== 'file' && input.mode !== 'report') throw new Error('Invalid review mode')
+      let requestId = input.requestId
+      if (requestId === undefined) {
+        const choices = ledger.pendingReviewChoices()
+        if (choices.length !== 1) return { status: 'blocked', reason: choices.length ? 'review-target-required' : 'no-pending-review', examples: choices }
+        requestId = choices[0].id
+      }
+      if (!Number.isSafeInteger(requestId) || requestId <= 0) throw new Error('Invalid review request ID')
+      const { attempt, fileCheck } = ledger.reviewCandidate(requestId)
+      if (!attempt || attempt.phase !== 'submitted' || !attempt.artifact) return { status: 'blocked', reason: 'no-pending-review', requestId }
+      const receipt = { requestId, attemptId: attempt.id, artifact: attempt.artifact }
+      if (input.mode === 'report') return { requestId, ...await runReview(receipt) }
+      const { relativePath, expected } = fileCheck ?? {}
+      if (typeof relativePath !== 'string' || typeof expected !== 'string') {
+        return { status: 'blocked', reason: 'file-evidence-not-registered', requestId }
+      }
+      const evidence = ledger.checkFile(requestId, attempt.id, attempt.artifact, workspace => checkTeamFile(workspace, relativePath, expected))
+      return { status: 'file-evidence', requestId, evidence }
+    },
+    reportLocation(requestId: number, attemptId: number, artifact: string) {
+      return resolveReport(requestId, attemptId, artifact).target
+    },
+    get recoveryPending() { return recoveryPending },
+    /** ★1124：待核中断单的沙箱文件清单（默认不合并，用户看清单再勾）。 */
+    pendingRecoverySandbox() {
+      const rootDir = String(parent.workDir || '').trim()
+      let realRoot = ''
+      try { realRoot = rootDir ? fs.realpathSync.native(rootDir) : '' } catch { realRoot = '' }
+      const out: Array<{ attemptId: number; files: Array<{ path: string; size: number; inParent: boolean; parentSize?: number }> }> = []
+      for (const aid of ledger.pendingRecoveryAttempts()) {
+        const ws = ledger.workspaceOf(Number(aid))
+        if (!ws) { out.push({ attemptId: Number(aid), files: [] }); continue }
+        let realWs = ''
+        try { realWs = fs.realpathSync.native(ws) } catch { out.push({ attemptId: Number(aid), files: [] }); continue }
+        if (!realRoot || realWs === realRoot) { out.push({ attemptId: Number(aid), files: [] }); continue }
+        const files: Array<{ path: string; size: number; inParent: boolean; parentSize?: number }> = []
+        const walk = (rel: string) => {
+          if (files.length >= 200) return
+          let entries: fs.Dirent[]
+          try { entries = fs.readdirSync(path.join(realWs, rel), { withFileTypes: true }) } catch { return }
+          for (const entry of entries) {
+            if (entry.name.startsWith('.nis')) continue
+            const r = rel ? rel + '/' + entry.name : entry.name
+            if (entry.isDirectory()) { walk(r); continue }
+            if (!entry.isFile()) continue
+            let size = 0
+            try { size = fs.statSync(path.join(realWs, r)).size } catch { size = 0 }
+            let inParent = false, parentSize: number | undefined
+            try {
+              const p = path.join(realRoot, r)
+              if (fs.existsSync(p) && fs.statSync(p).isFile()) { inParent = true; parentSize = fs.statSync(p).size }
+            } catch { /* ignore */ }
+            files.push({ path: r, size, inParent, ...(parentSize !== undefined ? { parentSize } : {}) })
+            if (files.length >= 200) return
+          }
+        }
+        walk('')
+        out.push({ attemptId: Number(aid), files })
+      }
+      return out
+    },
+    confirmRecovery(attemptIds: number[], reviewer?: string, evidence?: string, picks?: string[]) {
+      /* ★1123：改成"点一下就重试"——不带证据也能确认（默认记为"用户一键重试"）。
+         仍然**先按 OS 事实复核**：进程还活着/查不出来的，照旧挂围栏、不放行（这条不能松，
+         否则新单会和残留进程抢同一个工作区）。 */
+      const who = String(reviewer || '').trim() || '用户一键重试'
+      const note = String(evidence || '').trim() || '用户点重试：旧执行已按 OS 事实确认退出'
+      /* ★人工确认 = "我看过产物了"，**不等于**"OS 里的进程清干净了"（独立验收第 2 条）。
+         先按 OS 事实复核这些 attempt 的预登记进程：还活着 / 查询未知的，先补登记持久围栏挡住 ——
+         确认按钮不能把它们清成 failed / 可开工。
+         ★第十三轮：复核**失败**不再静默跳过 —— 证明不了副作用状态的单，不许被这一下确认放过去。 */
+      const failed: string[] = []
+      for (const id of attemptIds) {
+        try {
+          const alive = ledger.attemptPids(Number(id))
+            .filter(p => !isFenceCleared(judgeFenceProbe(procStartStamp(p.pid), p.startStamp, sameStamp)))
+          /* ★1124：还没拿到 pid 的启动意图 = 崩溃窗口里起过进程、pid 没进账本 ⇒ 副作用未知，
+             和"pid 探活 unknown"同一条口径：不放行。人工确认不能把它当成"没有残留"。 */
+          const unbound = ledger.unboundProcIntents(Number(id))
+          if (!alive.length && !unbound.length) continue
+          const why = alive.length
+            ? `仍有进程状态未知或存活（pid ${alive.map(p => p.pid).join(',')}）`
+            : `有 ${unbound.length} 个工具启动意图没有 pid（${unbound.map(i => i.tool).slice(0, 5).join(',')}）`
+          const fenced = ledger.holdFenceOnInterrupted(Number(id),
+            `人工确认时复核：${why}，先清理再放行`, alive)
+          if (!fenced) failed.push(`attempt #${id} 的围栏没挂上（已不在 interrupted），${why} 状态未知`)
+        } catch (error) {
+          failed.push(`attempt #${id} 复核失败：${String((error as Error)?.message || error).slice(0, 300)}`)
+        }
+      }
+      if (failed.length) {
+        /* 一条都没确认：把原文原样抛回去（界面/工具调用方看得见），不放行、不改状态。 */
+        for (const line of failed) recordUnpersistedFailure('人工确认被拒：' + line)
+        throw new Error('V2 确认未执行：以下执行无法按 OS 事实复核 ⇒ ' + failed.join('；'))
+      }
+      if (!recoveryPending) throw new Error('V2 recovery is not pending')
+      /* 默认不合并；用户点名要的相对路径才从沙箱带回来（覆盖了哪些同名文件如实打日志）。 */
+      if (Array.isArray(picks) && picks.length) {
+        const rootDir = String(parent.workDir || '').trim()
+        let realRoot = ''
+        try { realRoot = rootDir ? fs.realpathSync.native(rootDir) : '' } catch { realRoot = '' }
+        if (realRoot) {
+          for (const aid of attemptIds) {
+            const ws = ledger.workspaceOf(Number(aid))
+            if (!ws) continue
+            let realWs = ''
+            try { realWs = fs.realpathSync.native(ws) } catch { continue }
+            if (realWs === realRoot) continue
+            const r = copyPickedFiles(realWs, realRoot, picks)
+            console.warn('[团队V2] 中断单 #' + aid + ' 按勾选合并：merged=' + r.merged.length +
+              (r.overwritten.length ? ' 覆盖同名=' + r.overwritten.slice(0, 10).join(',') : '') +
+              (r.missing.length ? ' 缺失=' + r.missing.slice(0, 10).join(',') : ''))
+          }
+        }
+      }
+      const count = ledger.acknowledgeRecovery(attemptIds, who, note)
+      /* ★1124：走到这里说明这些单已按 OS 事实复核过（没挂围栏才放行）⇒ 未绑定的启动意图随之结清；
+         否则残留的"pid 未知"意图会让这一单永远算"副作用未确认"。 */
+      for (const aid of attemptIds) ledger.clearProcIntents(Number(aid))
+      /* 有围栏的单不进人工核对阶段 ⇒ 确认完之后仍可能"有待核"（那是围栏还没解除），
+         所以这里按账本重算，不能无条件置 false。 */
+      recoveryPending = ledger.pendingRecoveryAttempts().length > 0
+      if (count === 0) publishMemberActivity(parentId, { teamWorkChanged: true })
+      scheduleDrain('confirm')
+      /* ★第十三轮补正：如实报"核了几条 / 因为围栏被跳过几条"，不让界面以为全都核过了。 */
+      return { reviewed: count, skipped: Math.max(0, attemptIds.length - count) }
+    },
+    /** ★1124（老板拍板）：**用户口头表态 ⇒ 直接落需求单状态**。
+     *  为什么：团队模式的价值是省心，不能事事让用户去界面点按钮。用户在对话里说一句
+     *  「#1 通过 / 打回」就够了 —— 这里把那句话落成账本动作。
+     *  授权规矩与派工同源：quote 必须**逐字**出现在那条真实用户消息里（`readUserMessage` 读的是存档原文），
+     *  evidence 里留原话，事后可回查是谁的哪句话改的状态。
+     *  ⚠️ 这不是"AI 自己判通过"：AI 只做搬运；它没有用户表态就不许调（工具描述里写死）。 */
+    acceptByUser(messageId: string, input: { requestId: number; attemptId: number; passed: boolean; quote: string }) {
+      const text = readUserMessage(messageId)
+      if (typeof text !== 'string' || !text.trim()) throw new Error('V2 验收需要一条真实用户消息')
+      const quote = String(input.quote || '').trim()
+      if (!quote) throw new Error('V2 验收需要用户那句话的逐字引用')
+      if (quote.length > 500) throw new Error('V2 验收的 quote 太长（≤500 字）')
+      if (!text.includes(quote)) throw new Error('V2 验收授权不成立：quote 必须是用户那条消息里的逐字片段')
+      const attempt = ledger.attempts(Number(input.requestId)).find(a => a.id === Number(input.attemptId))
+      if (!attempt) throw new Error('V2 验收失败：需求单或执行不存在')
+      if (!attempt.artifact) throw new Error('V2 验收失败：这一单还没有交付报告')
+      if (!['submitted', 'accepted', 'rejected'].includes(attempt.phase)) throw new Error('V2 验收失败：当前阶段不可验收（' + attempt.phase + '）')
+      /* 与 reviewReport 同一个落点（ledger.verify 是唯一写口），只是操作人写成"用户口头确认"。 */
+      readReport(Number(input.requestId), Number(input.attemptId), attempt.artifact)
+      const result = ledger.verify(Number(input.requestId), Number(input.attemptId), attempt.artifact, !!input.passed,
+        '用户口头确认（主 agent 代填）：' + quote)
+      if (input.passed) scheduleDrain('review-passed')
+      return result
+    },
+    verifyFile(requestId: number, attemptId: number, artifact: string, relativePath: string, expected: string) {
+      return ledger.checkFile(requestId, attemptId, artifact, workspace => checkTeamFile(workspace, relativePath, expected))
+    },
+    reviewReport(requestId: number, attemptId: number, artifact: string, passed: boolean, reviewer: string, evidence: string) {
+      if (typeof reviewer !== 'string' || !reviewer.trim() || reviewer.length > 200 || typeof evidence !== 'string' || !evidence.trim()) {
+        throw new Error('V2 report review requires an operator and evidence')
+      }
+      readReport(requestId, attemptId, artifact)
+      const result = ledger.verify(requestId, attemptId, artifact, passed, '人工报告验收 · ' + reviewer + '：' + evidence)
+      /* 阶段3：验收通过后，被依赖挡在队列里的后置需求要**自动**接着跑（不需要再派工/再点一次）。 */
+      if (passed) scheduleDrain('review-passed')
+      return result
+    },
+    dispatch(authorizationMessageId: string, tasks: Array<{ quote: string; title: string; acceptance: string; memberId: string; freshSession?: boolean }>) {
+      /* ★第十三轮补正（独立验收 R2）：派工**不再抢在上游预检**。
+         原来这里有 `if (recoveryPending) throw` —— 那等于"待对账时连单都不许建"，是第二道门：
+         入口被挡掉了，就永远证明不了"派工入口也受同一放行判据约束"。
+         现在派工只管合法收单（排队），能不能开工由 drain 里**唯一那道门**判（围栏/待核对/不可持久化失败）。
+         语义也更正确：收单是用户意图，开工才是安全边界。 */
+      const team = parent.teamId && readTeam(parent.teamId)
+      if (!team || !readUserMessage(authorizationMessageId)) throw new Error('V2 dispatch requires an active user message and live team')
+      const sources = parent.messages.filter(msg => msg.id && msg.role === 'user' && !isInjectedUserMsg(msg)).map(msg => ({
+        id: msg.id!, text: msg.content.filter(block => block.type === 'text').map(block => block.text).join(''),
+      }))
+      /* ★1124（老板定稿第 4 节）：**换段只发生在派单前**，绝不中断正在跑的任务。
+         三条触发：① 主 agent 显式声明这一单与该成员上次无关（freshSession）
+                   ② 该成员上一单已跑满 3 次仍未过（错误方向污染上下文，后端按账本判，不靠 AI）
+                   ③ 该成员当前段已经压缩过（contextSummaries 非空 —— 这是"压缩次数"的既有权威口径） */
+      for (const memberId of new Set(tasks.map(task => task.memberId))) {
+        const forced = tasks.some(task => task.memberId === memberId && task.freshSession === true)
+        const reason = rotateReason(memberId, forced)
+        if (!reason) continue
+        try {
+          const handoff = buildHandoffPacket(memberId, reason)
+          const rotated = newMemberSessionFor(parentId, memberId, handoff)
+          sessionLog(parentId, 'info', 'lifecycle', `[团队V2] 成员 ${memberId} 换段（${reason}）→ 新段 #${rotated.seq}，旧段已归档`)
+        } catch (error) {
+          /* 换段失败不拦派工：这一单照旧在当前段跑（并如实留痕），下一单还会再试。 */
+          sessionLog(parentId, 'warn', 'lifecycle', `[团队V2] 成员 ${memberId} 换段失败（本单继续用当前段）：${String((error as Error)?.message || error).slice(0, 200)}`)
+        }
+      }
+      const rows = ledger.receiveAndAssign(authorizationMessageId, resolveTeamV2Intake(sources, tasks, new Set(team.members.map(member => member.id))))
+      if (rows.some(row => row.created)) scheduleDrain('dispatch')
+      return rows.map(row => ({ id: row.request.id, phase: row.attempt.phase, memberId: row.attempt.memberId, created: row.created }))
+    },
+    /** 阶段1·追加/改验收：必须带**真实用户消息 id + 逐字来源**，版本 +1，来源记入 request_revision。
+     *  运行中（queued/running/submitted）不允许改要求：先结算当前尝试再改（底层已有的安全边界）。 */
+    reviseRequest(input: { requestId: number; acceptance: string; messageId: string; quote: string }) {
+      const source = readUserMessage(input.messageId)
+      if (typeof source !== 'string') throw new Error('V2 revise requires a real user message')
+      if (typeof input.quote !== 'string' || !input.quote.trim() || !source.includes(input.quote)) {
+        throw new Error('V2 revise requires a verbatim quote from that user message')
+      }
+      const current = ledger.reviewCandidate(input.requestId)
+      const before = current.request.revision
+      const updated = ledger.reviseAcceptance(input.requestId, current.request.revision, input.acceptance, {
+        messageId: input.messageId, quote: input.quote,
+      })
+      /* 改版是权威状态变化：推送一次，让所有打开同一会话的窗口自行刷新（不靠前端互相广播）。 */
+      publishMemberActivity(parentId, { teamWorkChanged: true })
+      /* 同一用户消息重复提交同内容 ⇒ 账本幂等（revision 不变），把"这是重放"如实告诉模型，不再重复升版。 */
+      return { ...updated, replayed: updated.revision === before }
+    },
+    /** 阶段1·返工：复用底层 `assign`（仅 failed/rejected 可重派），同一 requestId 开新 attempt，不新增顶层需求。 */
+    reworkRequest(input: { requestId: number; memberId: string }) {
+      const team = parent.teamId && readTeam(parent.teamId)
+      if (!team || !team.members.some(member => member.id === input.memberId)) throw new Error('V2 rework assignee is not in the team')
+      const current = ledger.reviewCandidate(input.requestId)
+      const attempt = ledger.assign(input.requestId, current.request.revision, input.memberId)
+      publishMemberActivity(parentId, { teamWorkChanged: true })
+      scheduleDrain('rework')
+      return { requestId: input.requestId, revision: current.request.revision, attemptId: attempt.id, phase: attempt.phase, memberId: attempt.memberId }
+    },
+    /** 阶段2·取消：queued 立即取消；running 先登记取消请求并**真停**成员会话 agent（不假装已停），
+     *  执行器返回后由调度器落成 cancelled。返回的 phase 是当前事实：'cancelled' 或 'stopping'。 */
+    async cancelRequest(input: { requestId: number; reason: string }) {
+      const current = ledger.reviewCandidate(input.requestId)
+      if (!current.attempt) throw new Error('V2 request has no current attempt to cancel')
+      const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : '用户取消'
+      const updated = ledger.requestCancel(input.requestId, current.attempt.id, reason)
+      publishMemberActivity(parentId, { teamWorkChanged: true })
+      if (updated.phase === 'cancelled') return { requestId: input.requestId, attemptId: updated.id, phase: 'cancelled' as const, stopped: true }
+      const child = ensureMemberSession(parentId, updated.memberId)
+      const stopped = child ? abortMemberAgentNow(child.id) : false
+      return { requestId: input.requestId, attemptId: updated.id, phase: 'stopping' as const, stopped }
+    },
+    /** 副作用可能已交还（后台任务结束 / 进程退出）时，让调度器复核围栏并尝试恢复队列。
+     *  没有围栏时是空操作 —— 不拿它当常规轮询。 */
+    kickFenceRecheck() {
+      if (!ledger.fenceHolds().length) return false
+      scheduleDrain('fence-recheck')
+      return true
+    },
+    /** 阶段3·依赖：同会话内两单之间建立"后置等前置按当前版本验收通过"。自依赖/成环/不存在都拒绝。 */
+    dependRequests(input: { requestId: number; dependsOn: number }) {
+      return ledger.addDependency(input.requestId, input.dependsOn)
+    },
+    /** 阶段4·可归属用量的只读投影（另计，不与公共总量相加）。 */
+    attributableUsage() {
+      return ledger.attributableUsage()
+    },
+    /** 阶段2·普通补充：不改授权/验收，绑定当前有效 attempt；必须引用真实用户消息里的逐字片段。 */
+    noteRequest(input: { requestId: number; messageId: string; quote: string; text: string }) {
+      const source = readUserMessage(input.messageId)
+      if (typeof source !== 'string') throw new Error('V2 note requires a real user message')
+      if (typeof input.quote !== 'string' || !input.quote.trim() || !source.includes(input.quote)) {
+        throw new Error('V2 note requires a verbatim quote from that user message')
+      }
+      return ledger.addNote(input)
+    },
+  }
+}
+
+/** 阶段4：成员会话当前用量快照（结构见 usageTotals: uncached/cacheRead/cacheWrite/output）。
+ *  执行前后取差 = 这一轮执行的可归属用量；每个成员会话独立，不会串到别的成员。 */
+function memberUsageSnapshot(childId: string) {
+  const state: any = sessions.get(childId)
+  const totals = state?.usageTotals || {}
+  return {
+    uncached: Number(totals.uncached) || 0,
+    cacheRead: Number(totals.cacheRead) || 0,
+    cacheWrite: Number(totals.cacheWrite) || 0,
+    output: Number(totals.output) || 0,
+  }
+}
+
+/** 阶段2：真停一个成员会话 agent（运行中取消用）。只在该 agent **正忙**时 abort ——
+ *  空闲 agent 上 abort 会留下 aborted 标记，下一次 prompt 可能被拒，所以先看忙不忙。 */
+function abortMemberAgentNow(childId: string): boolean {
+  const agent: any = agents.get(childId)
+  if (!agent || typeof agent.abort !== 'function') return false
+  if (!sessionAgentBusy(childId)) return false
+  agent.abort()
+  return true
+}
+
+function teamV2LedgerFile(id: string): string {
+  if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error('Invalid V2 parent id')
+  const owner = (globalThis as any)[Symbol.for('nis.dataRuntimeLock')]
+  if (owner?.data !== DATA_ROOT) throw new Error('V2 ledger requires the data-root runtime lock')
+  return path.join(DATA_ROOT, 'team-v2', id + '.sqlite')
+}
+
+/** Only an explicitly created ledger opts a parent into V2. No scan or work starts on boot. */
+function teamV2HostFor(parent: SessionView) {
+  const current = teamV2Hosts.get(parent)
+  if (current || !parent.teamId || parent.parentSessionId || !/^[a-f0-9-]{36}$/i.test(parent.id)) return current
+  const file = teamV2LedgerFile(parent.id)
+  const st = fs.lstatSync(file, { throwIfNoEntry: false })
+  if (!st) return undefined
+  if (!st.isFile()) throw new Error('Invalid V2 ledger file')
+  const host = openTeamV2SessionHost(parent.id, file, true)
+  teamV2Hosts.set(parent, host)
+  return host
+}
+
+/** Operator entry for the trusted host boundary, not an Agent tool or public mutation RPC.
+ *  ★V1 拆除：旧团队会话首次访问任何真实入口（工单面板/用量/验收）都要**就地接管**成 V2，
+ *  不能要求"先读用量预热"或"先聊一句"——所以这里也走 `ensureTeamV2Host`。 */
+export function teamV2OperatorHost(parentId: string) {
+  const parent = sessions.get(parentId)
+  const host = parent && ensureTeamV2Host(parent)
+  if (!host) throw new Error('该会话未启用团队 V2')
+  return host
+}
+
+/** Explicitly activate an empty session before any prompt runs. */
+export function attachTeamV2Pilot(parentId: string) {
+  const parent = sessions.get(parentId)
+  if (!parent || agents.has(parentId) || parent.messages.length || teamV2HostFor(parent)) {
+    throw new Error('V2 pilot needs a fresh parent session')
+  }
+  const file = teamV2LedgerFile(parentId)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  sessionStore.commitSync(parentId)
+  const host = openTeamV2SessionHost(parentId, file)
+  teamV2Hosts.set(parent, host)
+  return host
+}
+
+/** ★V1 拆除（老板裁定）：旧的团队会话（有 teamId、账本还没建）首次真正用到团队能力时**接管**成 V2。
+ *  与 `attachTeamV2Pilot` 的区别：不要求"全新会话"—— 旧会话有历史消息，但它必须走同一条 V2 运行链；
+ *  历史只读（旧 subRuns / 黑板）不属于运行链，接管不动它们。 */
+export function adoptTeamV2(parentId: string) {
+  const parent: any = sessions.get(parentId)
+  if (!parent) throw new Error('session not found')
+  if (!parent.teamId) throw new Error('该会话没有团队')
+  if (parent.parentSessionId) throw new Error('成员/分身子会话不单独接管')
+  const existing = teamV2HostFor(parent)
+  if (existing) return existing
+  const file = teamV2LedgerFile(parent.id)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const host = openTeamV2SessionHost(parent.id, file)
+  teamV2Hosts.set(parent, host)
+  /* ★V1 退役配套：旧会话可能带着"上一次仍在运行"的 subRuns 登记（V1 派工链的账）。
+     这里**复用既有的 `sweepZombieRunsIn`**（唯一判据：`startedAt <= PROCESS_BOOT_AT` = 上个进程遗留），
+     不另写一套"无条件清 running"的规则 —— 两套规则就是两个真相。
+     V1 执行实现已删除 ⇒ 这些 run 不会再有人推进；如实标成 interrupted，
+     否则界面上就是"永远在跑"（成员卡一直转）。不重跑、不改产物、不给完成结论。 */
+  const retired = sweepZombieRunsIn(parent)
+  if (retired > 0) {
+    try { schedulePersist(parent.id) } catch { /* 落盘失败不影响接管 */ }
+    sessionLog(parent.id, 'warn', 'session',
+      `[团队V2] 接管旧团队会话：${retired} 个上个进程遗留的执行已标为「已停止」（不自动重跑）`)
+  }
+  sessionLog(parent.id, 'info', 'session', '[团队V2] 旧团队会话已接管：V1 运行链已拆除，派工/验收/取消走 V2 账本')
+  return host
+}
+
+/** 统一的"这个会话的 V2 宿主"入口：已启用就返回；旧团队会话就地接管；其它会话（无团队 / 子会话）返回 undefined。 */
+export function ensureTeamV2Host(parent: SessionView) {
+  const host = teamV2HostFor(parent)
+  if (host) return host
+  if (!parent.teamId || parent.parentSessionId) return undefined
+  return adoptTeamV2(parent.id)
 }
 
 function ensureMemberSession(parentId: string, memberId: string): any | null {
@@ -19566,7 +20388,11 @@ async function handleChannelIncoming(
       workspace: session.workDir || '',
     })
 
-    const promptText = imPrefix + textOut
+    /* ★1124y（结构性修复 · 系统提示词露进气泡的真凶）：
+       原来这里是 `const promptText = imPrefix + textOut` 再整串交给 runPromptCore ——
+       于是落盘的就是拼后文本，即使两端都有剥离逻辑，只要清单没登记 `[系统提示：` 就整段画成用户气泡
+       （实测会话 8daa099c：user 消息正文就是 `[系统提示：场景 = QQ单聊…]`）。
+       现在情境块走 `modelContext`（只进模型上下文），正文只存 textOut（用户原话）。 */
     /* ★1020（身份统一 · 通道侧收尾）：给这条通道消息一个**确定性、可追溯**的 id，三处共用：
        ① 排队项 id  ② 落盘用户消息的持久 id（rpcId）  ③ 日志里能对上。
        原来入队 id 是 `ch_${Date.now()}`（纯时间戳，既可能撞又不可追溯），且 runPromptCore 不带 rpcId
@@ -19576,10 +20402,12 @@ async function handleChannelIncoming(
     if (session.status === 'running') {
       // 正在跑：入队（复用既有队列能力），避免并发同一 agent。
       // 0920：入队的是**拼好 IM 上下文的 promptText**（不再是裸 textOut）。
+      // ★1124y：队列项也把情境与正文分开存（`text` = 用户原话，`modelContext` = 只给模型看的情境块）
       if (!Array.isArray(session.queuedMessages)) session.queuedMessages = []
       session.queuedMessages.push({
         id: chRpcId,
-        text: promptText,
+        text: textOut,
+        modelContext: imPrefix,
         ...(imgAttachments.length ? { attachments: imgAttachments } : {}),
         createdAt: Date.now(),
       })
@@ -19590,7 +20418,8 @@ async function handleChannelIncoming(
     /* ★1020：把通道消息的 id 交给落盘逻辑（`message_start(user)` 会 take 它作为持久 id） */
     pushPendingUserRpcId(sid, chRpcId)
     await runPromptCore(sid, {
-      message: promptText,
+      message: textOut,
+      modelContext: imPrefix,
       rpcId: chRpcId,
       ...(imgAttachments.length ? { attachments: imgAttachments } : {}),
     })
@@ -19643,7 +20472,7 @@ function agentForSession(sessionId: string): any {
   return agents.get(sessionId) || memberAgents.get(sessionId) || null
 }
 
-function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): void {
+function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent, presetCheck?: PresetPlanCheck): void {
   const session = sessions.get(sessionId)
   if (!session) return
   /* ★1032（P45）：**成员/分身会话只跑内容管线**（累加器 → 投影帧 → 落盘）。
@@ -19665,6 +20494,11 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
         session.firstTokenTime = undefined
         session.toolMsTotal = 0
         session.toolStartTime = undefined
+        /* ★1126：本轮**纯解码时长**累加器（每次 LLM 请求"首 token → 结束"之和）——
+           tok/s 的正确分母。原来用 `llmMs - 一次ttft`，多跳轮次里只减了一次首字，
+           分母虚高（实测 3 跳各 10s 首字 ⇒ 只减 10s，速度被算低 2~3 倍）。 */
+        ;(session as any).turnDecodeMs = 0
+        ;(session as any)._hopFirstTokenAt = 0
         // 撞墙检测窗口重置（每轮全新判定，上轮残留不误杀）
         session.loopWindow = { sigs: new Map<string, number>(), buf: '' }
         // ★0929 P1（刀4 误杀）：审批超时计数同步跨轮复位 —— 同理"上轮残留不误杀"：
@@ -19692,10 +20526,12 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
           const labelSrc = lastRealUser || lastUser
           setSnapshotTurn(sessionId, labelSrc ? { turnId: cleanTurnLabel(labelSrc), turnIndex: userCount } : null)
         }
-      } else if ((event.type === 'message_update') && session.turnStartTime != null && session.firstTokenTime == null) {
+      } else if ((event.type === 'message_update') && session.turnStartTime != null) {
     const ae = (event as any).assistantMessageEvent
     if (ae && (ae.type === 'text_delta' || ae.type === 'thinking_delta')) {
-      session.firstTokenTime = Date.now()
+      if (session.firstTokenTime == null) session.firstTokenTime = Date.now()
+      /* ★1126：**每跳各自**记首 token 时刻（不是只记本轮第一次）—— 见 agent_start 处说明。 */
+      if (!(session as any)._hopFirstTokenAt) (session as any)._hopFirstTokenAt = Date.now()
     }
   }
 
@@ -19848,12 +20684,23 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
            ⚠️ 真正的新问题不会走到这里：上一轮结束时 `agent_end` 已经删过累加器了。 */
         if (session.status !== 'running') turnAccumulators.delete(sessionId)
         /* ★1004 记忆召回根治：落盘只存**用户原文**（剥行首注入行）——拼注入只进出站 finalMessage
-         * （transcript/模型上下文保留拼后文本是合理的）；复制/轮次标注/侧栏预览读的是这里存的 text。 */
-        const text = stripInjectedLines(typeof msg.content === 'string'
+         * （transcript/模型上下文保留拼后文本是合理的）；复制/轮次标注/侧栏预览读的是这里存的 text。
+         * ★1124y：剥离清单已收口到 `injectMarkers.mjs` 的 `TEXT_INJECT_RULES`（唯一一处）——
+         *   IM 场景块 / 定时任务前缀 / [技能:x] 之前都不在清单里，于是整段画成用户气泡（实测）。 */
+        const _rawUserText = typeof msg.content === 'string'
           ? msg.content
           : Array.isArray(msg.content)
             ? (msg.content as Array<{ type: string; text?: string }>).filter(b => b.type === 'text').map(b => b.text).join('')
-            : JSON.stringify(msg.content))
+            : JSON.stringify(msg.content)
+        /* 开发期自检（NIS_INJECT_ASSERT=1）：开头是【…】/[…] 却没登记剥离规则 ⇒ 这条注入迟早会露进气泡。
+           只喊、不改数据 —— 新增注入忘了登记时，日志里当刻就能看到是哪个前缀。 */
+        if (process.env.NIS_INJECT_ASSERT === '1') {
+          try {
+            const _unreg = unregisteredInjectPrefix(_rawUserText)
+            if (_unreg) console.warn(`[inject] 未登记的注入前缀「${_unreg}」（会话 ${sessionId.slice(0, 8)}）—— 落盘会画进用户气泡，请在 injectMarkers.mjs 的 TEXT_INJECT_RULES 里登记`)
+          } catch { /* 自检失败不影响落盘 */ }
+        }
+        const text = stripInjectedLines(_rawUserText)
         /* ★1020 S3.2：优先采用前端带来的 rpcId 作**持久 id** ——
            这样"乐观气泡(key=user:rpcId)"与"权威回显(key=user:message.id)"是同一个 key，
            一 upsert 就合并（不必再靠"最后一条 user + 5s + 文本相等"去猜）。
@@ -20152,6 +20999,15 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
       if (msg.role !== 'assistant') {
         break
       }
+      /* ★1126：累加**这一跳的纯解码时长**（首 token → 本跳结束）——
+         tok/s 的正确分母；`llmMs - 一次 ttft` 在多跳轮次里会虚高。累完就清，下一跳重新计。 */
+      {
+        const _hf = Number((session as any)._hopFirstTokenAt) || 0
+        if (_hf > 0) {
+          ;(session as any).turnDecodeMs = (Number((session as any).turnDecodeMs) || 0) + Math.max(0, Date.now() - _hf)
+          ;(session as any)._hopFirstTokenAt = 0
+        }
+      }
       /* ★1032（P37 id 单源，修正落点）：**在这里给"存储里那条" assistant 消息补 id**。
          原来在 message_start 把 id 写在 event.message 上——pi 在 message_end 会用它自己的最终对象替换，
          写进去的 id 就丢了（实测：transcript 里 assistant 全是「(无)」，只有 user 带 id）。
@@ -20422,26 +21278,19 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
       /* ★g4：自动验收 —— **不阻塞回复**（回复这时已经交给用户了，等验收跑完再改口径没意义）；
          条件全在 maybeAutoVerify 内部判（无 verifyCmd / 计划没全完成 / 同一份计划已验过 ⇒ 直接返回）。
          结果落在 session.__verifyResult，由下一轮消息头带出（见 runPromptCore 的 [验收结果]）。 */
-      void maybeAutoVerify(sessionId, session)
+      if (!presetCheck) void maybeAutoVerify(sessionId, session)
       /* ★P119（实测：**"排队汇报"一直挂着不消失**，下一轮任务都回归了它还在）：
          忙的时候回归通知会入队 + 把成员标成 `reportQueued`（蓝徽标），
          而**消费队列的地方只有"建 agent 时"**（`drainBgNotices`）—— 主 agent 自己收轮后没人再去看队列
          ⇒ 这条通知永远送不出去、蓝标永远挂着。
          这里收轮后主动补送一次（200ms 让收尾跑完；走空闲送达 = 开新一轮，与 P92 的语义一致）。 */
-      setTimeout(() => {
-        try {
-          const _q = pendingBgNotices.get(sessionId)
-          if (!_q || !_q.length) return
-          if (sessionAgentBusy(sessionId)) return
-          pendingBgNotices.delete(sessionId)
-          /* ★fx1（Bug3 同一口井）：队列里可能还有历史遗留的「裸字符串」元素 —— 这里也归一取文/取身份，
-             否则 `n.text` 对字符串求值 = undefined，整段变成 "undefined"。 */
-          const _text = _q.map((n: any) => String(typeof n === 'string' ? n : (n?.text ?? ''))).filter(Boolean).join('\n\n')
-          const _ids = _q.flatMap((n: any) => (Array.isArray(n?.memberIds) ? n.memberIds : []))
-          if (!_text.trim()) return
-          injectSessionNotice(sessionId, _text, { memberIds: _ids.length ? _ids : undefined })
-        } catch (e) { console.warn('[bg] 收轮后补送排队通知失败:', String((e as any)?.message || e)) }
-      }, 200)
+      /* ★1124w（**自动续跑的最后一条残留路径，已删**）：
+         这里原来挂了一个 `setTimeout(…, 200)` —— 收轮后 200ms 再补送一次 inbox，
+         而补送走的是 `injectSessionNotice` 的"空闲 ⇒ 开一轮"分支 ⇒ **正文说完又冒一轮**。
+         `[DIAG-turn]` 真机取证：收轮同一秒 `stack=injectSessionNotice <- Timeout._onTimeout`，
+         那一轮正文只有一条「后台任务通知」—— 就是老板截图那条。
+         inbox 的唯一消费点现在是 `runPromptCore` 开头（下一轮真正开跑时），不再另外开轮。
+         原注释（P119）提的问题"通知永远送不出去"由那处 drain 解决，不靠延迟开轮。 */
       const endUsage = extractUsage(event)
       /* ★ 0925ad（用户质疑实锤："回复完成"原来无条件打——异常中断也报完成，日志无法区分）：
          按最后消息的 stopReason 区分收尾形态（正常/中断/异常分开记），下次"断没断"有实证。 */
@@ -20674,6 +21523,18 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
       const hasTurnSums = !!(turnSums.input || turnSums.output || turnSums.cacheRead || turnSums.cacheWrite)
       let turnOutputTokens = usage?.completionTokens || 0
       if (turnSums.output > 0) turnOutputTokens = turnSums.output
+      /* ★1126（**记账闸门的根因，实测驱动**）：判"这一轮跑没跑过 LLM"**不能看 agent_end 事件里
+         带没带 usage** —— 1103 s6 的"每跳落账"（creditHopSnapshot）已经在**每一跳**把 usage 消费掉了，
+         到 agent_end 这里 turnSums / usage 往往是空的。旧判据 `hasTurnSums || turnOutputTokens > 0`
+         因此把下游 4 处记账全挡住：
+           · `session.lastTurnTiming`（本轮耗时快照）
+           · `timingFrame` / `session.turnMetas`（每轮统计行的数据源）
+           · `usageTotals.turns` 与 `llmMs`（胶囊"本会话平均"的分子分母）
+         实测证据：全库 660 个会话里 **652 个记了 output（每跳路径）**，却只有 **6 个记了 turns**
+         ⇒ 胶囊按"累计耗时 ÷ 1 轮"算，把 4 分 37 秒的一轮显示成 321m47s（差 70 倍）。
+         新判据用**结构事实**：`agent_start` 给 `turnStartTime` 打过点，就说明这一轮真的开始了
+         （该字段每轮重设，见 agent_start 分支）。 */
+      const _ranLlm = !abortedTurn && session.turnStartTime != null
       // 个别供应商不回填消息级 usage 时退回旧口径（末跳 + 整轮输出），统计条不空白
       const turnUsageFrame = hasTurnSums
         ? { promptTokens: turnSums.input, completionTokens: turnOutputTokens, cacheReadTokens: turnSums.cacheRead, cacheWriteTokens: turnSums.cacheWrite }
@@ -20726,16 +21587,18 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
       // turn 计时：TTFT = 首 token - 开始；LLM 耗时 = 结束 - 开始 - 工具耗时
       //（工具执行/团队子 agent 等待时间不计入 LLM 耗时，否则团队轮 llmMs 虚高数倍）
       // 中断轮不覆盖 lastTurnTiming（保留上一轮真实值）
-      if (!abortedTurn && (hasTurnSums || turnOutputTokens > 0) && session.turnStartTime != null) {
+      if (!abortedTurn && _ranLlm && session.turnStartTime != null) {
         const totalMs = Date.now() - session.turnStartTime
         const toolMs = session.toolMsTotal || 0
         session.lastTurnTiming = {
           llmMs: Math.max(0, totalMs - toolMs),
           ttftMs: session.firstTokenTime != null ? session.firstTokenTime - session.turnStartTime : 0,
           toolMs,
+          /* ★1126：纯解码时长（Σ 每跳"首 token→结束"）—— 前端算 tok/s 用它，不再用 llmMs 减一次首字。 */
+          decodeMs: Number((session as any).turnDecodeMs) || 0,
         }
       }
-      const timingFrame = abortedTurn || !(hasTurnSums || turnOutputTokens > 0) ? undefined : { ...(session.lastTurnTiming || { llmMs: 0, ttftMs: 0 }) }
+      const timingFrame = !_ranLlm ? undefined : { ...(session.lastTurnTiming || { llmMs: 0, ttftMs: 0 }) }
       // 写时补全：本轮 timing/usage 落 turnMetas（ts = 本轮最后一条 assistant 消息的 timestamp，
       // history 响应时服务端按 ts 挂到消息 _turnMeta）。中断轮无权威数据不落
       /* ★1032（P30）：**还有子任务在跑 ⇒ 这一轮先不结账**（不写 turnMetas）。
@@ -20795,7 +21658,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
       /* ★ 0924（token 对账修）：会话级 usage 单调账本 —— 每轮累加（**含中断轮**：中断轮已消耗的
          token 是真实账单，不记就对不上账）。只增不减：删轮/重跑不回退 —— 账单也不退款。
          （turnMetas 只留最近 200 条、删轮还移除条目，拿它求和会让长会话"累计"越跑越少。） */
-      if (hasTurnSums || turnOutputTokens > 0) {
+      if (_ranLlm) {
         const ut = session.usageTotals || (session.usageTotals = { uncached: 0, cacheRead: 0, cacheWrite: 0, output: 0, turns: 0 })
         /* ★1020bg：`llmMs/toolMs` 是新增字段，老会话没有历史累计（胶囊里"LLM"会显示 `--`）。
            首次就地用 `turnMetas`（保留最近 200 条真实轮次，含 timing）求和打底，之后正常逐轮累加。 */
@@ -20832,7 +21695,13 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
            平均生成速度 = Σ输出 / Σ解码时长（解码 = llmMs - ttftMs，与 DSH `decodeMs` 同口径），
            这样"平均"不会被"等首字"的时长稀释。老会话没有这两个字段时按 0 起算。 */
         /* 首字延迟/解码：本轮已有跳入账过 ttft 就不再重复加（同轮每跳携带同一个 ttft） */
-        if (!_credSameTurn || (Number(_cred.steps) || 0) === 0) {
+        /* ★1126：优先累加**本轮真实解码时长**（Σ 每跳 首token→结束，timingFrame.decodeMs）——
+           老口径 `llmMs - ttftMs` 在多跳轮次里只减一次首字，分母虚高（胶囊"生成速度"因此偏低）。 */
+        const _frameDecode = Number((timingFrame as any)?.decodeMs) || 0
+        if (_frameDecode > 0) {
+          ut.ttftMs = (ut.ttftMs || 0) + (Number(timingFrame?.ttftMs) || 0)
+          ut.decodeMs = (ut.decodeMs || 0) + _frameDecode
+        } else if (!_credSameTurn || (Number(_cred.steps) || 0) === 0) {
           ut.ttftMs = (ut.ttftMs || 0) + (Number(timingFrame?.ttftMs) || 0)
           ut.decodeMs = (ut.decodeMs || 0) + Math.max(1, (Number(timingFrame?.llmMs) || 0) - (Number(timingFrame?.ttftMs) || 0))
         } else {
@@ -20854,7 +21723,7 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
          `turn.model`/全局配置只在前者缺失时兜底（真缺失才用，不做数据修正）。用量按会话累计。 */
       const turnModel = String((session as any).model || '') || turnAccumulators.get(sessionId)?.model || currentLlmConfig().model
       /* ★1032（P80）：主轮只结一次账（子任务不再影响），P33 担心的"假收尾 + 真收尾"重复累计不再存在。 */
-      if (!abortedTurn && turnModel && (hasTurnSums || turnOutputTokens > 0)) {
+      if (_ranLlm && turnModel) {
         if (!session.modelUsage) session.modelUsage = {}
         if (!session.usedModels) session.usedModels = []
         if (!session.usedModels.includes(turnModel)) session.usedModels.push(turnModel)
@@ -21094,14 +21963,16 @@ function handleAgentEvent(sessionId: string, event: AgentEvent, agent?: Agent): 
           void settledAgent.waitForIdle().then(() => {
             if (agents.get(sessionId) !== settledAgent) return
             flushNextQueued(sessionId)
-            /* ★ 0923：队列优先（用户消息先发）—— 队列空了才轮到「后台事件自动续跑」 */
-            if (!queueSnapshot(sessionId).length) drainBgResumeAfterIdle(sessionId)
+            /* ★1124x：**这一行就是老板报的"强行拉起"** —— 本轮自然结束、队列一空，就立刻开一轮
+               "后台事件续跑"（AI 正文已经说完，却又冒出一段，计时/用量从 0 重新算）。
+               自动续跑链已拆除 ⇒ 删掉；排队的后台事件留在 inbox，等下一次任何轮次开始前由
+               `drainBgNotices` 一并带给模型（ZCode / Claude Code 的 task-notification 同构做法）。
+               ⚠️ 团队回归唤醒（wakeTeamReturn）保持原样，本次一行不动。 */
             if (!flushInFlight.has(sessionId)) wakeTeamReturn(sessionId, offered)
           }).catch(() => { /* ignore */ })
         } else if (settledAgent && abortedTurn) {
-          /* ★ 0923：本轮是用户中断的 → 续跑链暂停（与 session.cancel 同口径的双保险） */
-          const c = bgResumeChains.get(sessionId)
-          if (c) { c.stopped = true; parkBgResumePending(sessionId) }
+          /* ★1124x：自动续跑链已拆除 —— 这里原来要"暂停续跑链并把排队事件退回待办"，
+             现在没有续跑队列（inbox 本身就是待办），中断无需额外处理。 */
         }
       }
       /* ★mg2（方案 A）：本轮正式 messages 已落定 ⇒ 草稿使命结束，删掉（位置必须在这里，
@@ -21441,6 +22312,15 @@ function stopTunnel(): any {
     做法：按「前端报的 → 5174（Vite dev）→ PORT」顺序试，谁的 `/` 返回 200 且是 HTML 就用谁；
     都不通就退回原值（宁可让报错可见，也不静默指错端口）。 */
 async function probeUiPort(preferred: number): Promise<number> {
+  /* ★1128（老板远程实测：公网隧道把流量转给了 dev 前端，导致"慢 + 进界面空白"）：
+     packaged 形态下**本进程就是界面源**（它自己 serve NIS_DIST_DIR 里的 dist），隧道只可能指向 PORT。
+     原来一律按 [preferred, 5174, PORT, 8766] 顺序探测"谁的 / 返回 HTML"，而 5174 是 dev 的 vite ——
+     只要 dev 那边开着，它就会先命中 ⇒ 公网打开拿到的是「未打包的开发界面 + dev 后端」，
+     而 dev 后端的远程开关通常是关的 ⇒ 每个 /api 都 403（页面能开、数据全空、开屏还要等三次超时）。
+     实测证据（2026-11-26）：安装版后端拉起的隧道是
+       ssh -N -R 0.0.0.0:8080:127.0.0.1:5174 ubuntu@…        ← 指向了 vite，不是自己
+     ⇒ packaged 不探测，只认自己；只有 dev（没有 dist）才需要猜。 */
+  if (NIS_DIST_DIR) return PORT
   const cands = [...new Set([preferred, 5174, PORT, 8766].filter((n) => Number(n) > 0))]
   for (const port of cands) {
     try {
@@ -21571,6 +22451,20 @@ function lanUrls(port: number, token = ''): string[] {
 /* ★1128【头像与设置分离】用户头像的**内容指纹** —— 给 /api/avatar 拼版本号、做 ETag。
    为什么不逐字符算校验：头像实测 1.72MB，遍历它本身就会变成新的堵塞源；
    取首尾各 256 字符 + 总长度已足够区分"换过/没换过"（缓存失效场景不要求抗碰撞）。 */
+/** ★1126：**广播用的设置快照** —— 与 `settings.get` 同一口径。
+ *  两件事在这一处一起做掉，因为它们是同一个根：
+ *    · 头像本体不进帧：历史上头像 base64 单张能到 1.7MB，每次"设置变了"的广播都塞一份
+ *      （settings.get 早就为此只下发指纹，广播漏了）；
+ *    · **必须带 avatarVersion 指纹**：缺了它，前端 applyBackendSettings 会把"这一帧没提到"
+ *      当成"头像被清空了" ⇒ nisAvatar 回落默认 logo，下一帧才恢复（老板实测的头像闪烁）。
+ *  前端拿到版本号后拼 `/api/avatar?v=` 单独取图（可缓存 / 走 304）。 */
+function settingsFrame(): any {
+  const frame: any = { ...globalSettings }
+  frame.avatar = ''
+  frame.avatarVersion = avatarVersionOf(String((globalSettings as any)?.avatar || ''))
+  return frame
+}
+
 function avatarVersionOf(s: string): string {
   const str = String(s || '')
   if (!str) return ''
@@ -21875,7 +22769,6 @@ const server = http.createServer(async (req, res) => {
       const full = resolveReadPath(session, rel)   // ★1016 s1：预览静态资源放行到允许根（只读）
       const st = await fs.promises.stat(full)
       if (st.isDirectory()) { res.writeHead(400); res.end('is directory'); return }
-      let data = await fs.promises.readFile(full)
       const ext = path.extname(full).toLowerCase()
       const mimes: Record<string, string> = {
         '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
@@ -21883,7 +22776,44 @@ const server = http.createServer(async (req, res) => {
         '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon', '.md': 'text/plain; charset=utf-8',
         '.txt': 'text/plain; charset=utf-8', '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+        '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
       }
+      /* ★1126：**HTTP Range 支持** —— 视频拖动进度条必须靠它。
+         没有 Range 时浏览器只能整段下完才能拖（我们生成的 mp4 实测 4~8MB，勉强能等；
+         但用户一拖就回到开头，体验很差）。这里流式返回，不为一段就整读几十 MB。 */
+      const rangeHeader = String(req.headers.range || '').trim()
+      if (rangeHeader) {
+        const total = st.size
+        const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader)
+        if (m) {
+          let start = m[1] ? Number(m[1]) : NaN
+          let end = m[2] ? Number(m[2]) : NaN
+          if (!Number.isFinite(start) && Number.isFinite(end)) {   // bytes=-500 → 最后 500 字节
+            start = Math.max(0, total - end); end = total - 1
+          }
+          if (!Number.isFinite(start)) start = 0
+          if (!Number.isFinite(end)) end = total - 1
+          if (start > end || start >= total) {
+            res.writeHead(416, { 'content-range': `bytes */${total}` })
+            res.end()
+            return
+          }
+          end = Math.min(end, total - 1)
+          res.writeHead(206, {
+            'content-type': mimes[ext] || 'application/octet-stream',
+            'content-range': `bytes ${start}-${end}/${total}`,
+            'accept-ranges': 'bytes',
+            'content-length': String(end - start + 1),
+            'cache-control': 'no-cache',
+            'x-content-type-options': 'nosniff',
+          })
+          const rs = fs.createReadStream(full, { start, end })
+          rs.on('error', () => { try { res.destroy() } catch { /* 对端已断 */ } })
+          rs.pipe(res)
+          return
+        }
+      }
+      let data = await fs.promises.readFile(full)
       // HTML 注入 <base href="/api/workspace-file/<sessionId>/<dir>/">：预览页相对链接
       // （页面互链/相对 css/js/图片，含 ../）按 base 目录解析 → 落回本 handler，sessionId 随 pathname 带上。
       // 注入点在 <head> 后（无 head 则置顶）。仅响应侧改动，不碰用户文件。
@@ -21912,6 +22842,49 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404)
       res.end(String(e?.message || e))
     }
+    return
+  }
+
+  // This local-only action is deliberately outside the public RPC and WS command tables.
+  if (req.method === 'POST' && url.pathname === '/api/desktop/team-work-review') {
+    const send = (status: number, value: unknown) => {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(value))
+    }
+    const token = req.headers['x-nis-shell-key']
+    if (req.headers.origin || !hostIsLoopback(req) || !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress || '') || typeof token !== 'string' || !/^[a-f0-9]{32}$/.test(token)) {
+      send(403, { error: 'Desktop operator authentication required' }); return
+    }
+    const [descriptor] = shellDescriptorPaths()
+    let trusted = false
+    if (descriptor && fs.existsSync(descriptor)) {
+      try {
+        const shell = JSON.parse(fs.readFileSync(descriptor, 'utf8'))
+        trusted = shell.app === 'nis-shell' && shell.dataRoot === DATA_ROOT && typeof shell.token === 'string' && /^[a-f0-9]{32}$/.test(shell.token) && timingSafeEqual(Buffer.from(token, 'hex'), Buffer.from(shell.token, 'hex'))
+      } catch {
+        send(403, { error: 'Desktop operator credential unavailable' }); return
+      }
+    }
+    if (!trusted) { send(403, { error: 'Desktop operator authentication required' }); return }
+    try {
+      const b = await readJsonBody(req) as Record<string, unknown>
+      if (typeof b.sessionId !== 'string' || !b.sessionId) throw new Error('Session ID is required')
+      const host = teamV2OperatorHost(b.sessionId)
+      if (b.kind === 'file') {
+        const { requestId, attemptId, artifact, relativePath, expectedHash } = b
+        if (typeof requestId !== 'number' || !Number.isSafeInteger(requestId) || requestId <= 0 || typeof attemptId !== 'number' || !Number.isSafeInteger(attemptId) || attemptId <= 0 || typeof artifact !== 'string' || typeof relativePath !== 'string' || typeof expectedHash !== 'string') throw new Error('Invalid file evidence request')
+        send(200, { ok: true, result: host.verifyFile(requestId, attemptId, artifact, relativePath, expectedHash) })
+        return
+      }
+      /* ★1123：一键重试（kind=recover）不要求填证据；报告验收仍然强制要证据。 */
+      if (b.kind !== 'recover' && (typeof b.evidence !== 'string' || !b.evidence.trim() || b.evidence.length > 4000)) throw new Error('Evidence is required (up to 4000 characters)')
+      const reviewer = 'Windows desktop operator'
+      if (b.kind === 'recover' && Array.isArray(b.attemptIds) && b.attemptIds.every(id => Number.isSafeInteger(id) && id > 0)) {
+        send(200, { ok: true, result: host.confirmRecovery(b.attemptIds, reviewer, b.evidence, Array.isArray(b.picks) ? (b.picks as string[]) : undefined) })
+      } else if (b.kind === 'report' && Number.isSafeInteger(b.requestId) && Number.isSafeInteger(b.attemptId) && typeof b.artifact === 'string' && typeof b.passed === 'boolean') {
+        send(200, { ok: true, result: host.reviewReport(b.requestId as number, b.attemptId as number, b.artifact, b.passed, reviewer, b.evidence) })
+      } else throw new Error('Invalid desktop review action')
+    } catch (e) { send(409, { error: e instanceof Error ? e.message : String(e) }) }
     return
   }
 
@@ -22725,7 +23698,10 @@ function startMainTurn(session: SessionView, source: SidebarTurnSource | undefin
 }
 
 /** Bind the accepted native prompt to its own agent_start, not the earlier queue admission. */
-async function promptMainAgent(sessionId: string, session: SessionView, agent: Agent, text: string, images: ImageContent[] | undefined, source: SidebarTurnSource, input?: MemberInput, teamAttempt?: TeamReturnAttempt): Promise<void> {
+async function promptMainAgent(sessionId: string, session: SessionView, agent: Agent, text: string, images: ImageContent[] | undefined, source: SidebarTurnSource, input?: MemberInput, teamAttempt?: TeamReturnAttempt, v2?: TeamV2Turn): Promise<void> {
+  if (v2 && (sessionAgentBusy(sessionId) || queueSnapshot(sessionId).length || pendingUserRpcId.has(sessionId))) {
+    throw new Error('V2 member session is occupied')
+  }
   const inbox = teamReturnInboxes.get(session)
   if (teamAttempt && (sessions.get(sessionId) !== session || inbox?.stopped || teamAttempt.batch.attempt !== teamAttempt)) return
   // Batch inputs share the real prompt boundary, not a second queue inside Agent.steer().
@@ -22749,9 +23725,27 @@ async function promptMainAgent(sessionId: string, session: SessionView, agent: A
   }
   const start = { source }
   nativeSidebarStarts.set(agent, start)
+  const offV2 = v2 && agent.subscribe(event => {
+    /* ★第十三轮：开工边沿 = 身份绑定点。先 `started()`（账本真开工，可能拒绝），
+       再绑定 —— 被拒的那一单不许留下绑定，否则后续工具会把 pid 记到没开工的单上。 */
+    if (event.type === 'agent_start') {
+      v2.started()
+      bindTeamAttempt(sessionId, v2.attempt)
+    }
+    if (event.type === 'agent_end') v2.result = event
+  })
+  if (v2) {
+    beginTurnMark(session, source)
+    pushPendingUserRpcId(sessionId, v2.id)
+  }
   try {
     await memberActivityBridge.native(agent, input, () => payload ? agent.prompt(payload) : agent.prompt(text, images))
   } finally {
+    offV2?.()
+    /* ★第十三轮：这一轮结束 = 身份解绑点（按 attemptId 校验，迟到解绑不抢新单的绑定）。
+       之后这一会话里再起的进程不再属于这条 attempt —— 它已经结算/中断，归属由账本事实决定。 */
+    if (v2) unbindTeamAttempt(sessionId, v2.attempt.attemptId)
+    if (v2 && pendingUserRpcId.get(sessionId) === v2.id) pendingUserRpcId.delete(sessionId)
     if (nativeSidebarStarts.get(agent) === start) nativeSidebarStarts.delete(agent)
     for (const attempt of merged) {
       if (attempt.batch.attempt === attempt) delete attempt.batch.attempt
@@ -22773,6 +23767,11 @@ function endTurnState(sessionId: string, session: any): void {
   delete (session as any).turnAnchorAt
   /* status 是"这个会话还有没有活在跑"（成员不随主 agent 停止）——与 agent_end 同一口径。 */
   session.status = runningSubAgentCount(sessionId) > 0 ? 'running' : 'idle'
+  /* Foreground just went idle: that is the moment V2 may deliver a pending stage brief.
+     No timer, no polling — the switch is the turn boundary itself. */
+  try { teamV2Hosts.get(session)?.scheduleDeliver() } catch (e) {
+    console.warn('[team-v2] 阶段汇报调度失败:', String((e as any)?.message || e))
+  }
 }
 
 /** 0909⑦：session.prompt 核心逻辑抽函数（RPC 手动发送与队列自动续发共用同一条路径，
@@ -22786,6 +23785,15 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   if ((session as any).importReview?.historyOnly) throw new Error('这是导入的历史副本，不执行旧对话。请新建会话并手动复制所需内容。')
   const message = p?.message as string | undefined
   if (!message) throw new Error('message required')
+  /* ★1124y（结构性）：**只给模型看的本轮情境** —— IM 场景/成员/工作区/回复要求、定时任务标题这类。
+     以前调用方直接把前缀拼进 `message`，于是"落盘的是拼后文本"，只能靠 stripInjectedLines 事后剥；
+     实测就漏过：QQ 单聊那条 `[系统提示：场景 = …]` 整段画成了用户气泡（会话 8daa099c）。
+     现在情境走这个参数：只进 finalMessage（模型可见），落盘仍是 `message`（用户原话）。
+     ⚠️ 剥离规则仍保留 —— 那是给**存量脏数据**与其它拼入点用的兼容层，不是本参数的回退路径。 */
+  const modelContext = typeof (p as any)?.modelContext === 'string' ? String((p as any).modelContext) : ''
+  /* ★1126 撤回 `/imagine` 直出注入：实测证明 modelContext 最终会随 finalMessage 一起落进用户消息
+     （promptMainAgent 收到的 text 就是落盘那份），于是用户气泡里出现了整段指令 —— 违背"只给模型看"的初衷。
+     要用斜杠命令直出，得走真正的旁路（模拟工具事件），不能靠拼提示词。详见老板反馈。 */
   /* ★P119：**这一轮是谁发起的**（user / notice）。
      成员回归、后台任务完成这类注入会主动唤醒主 agent 跑一轮 —— 它确实在跑，
      但用户没发问，界面不该显示"处理中/停止键"（实测：主 agent 明明已经回完了，底下还挂一条没计时的处理中）。
@@ -22798,10 +23806,14 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
   }
   const activityInput = memberPromptInputs.get(p)
   const teamAttempt = teamReturnPrompts.get(p)
+  const v2 = teamV2Turns.get(p)
+  if (v2 && (sessionAgentBusy(sessionId) || session.mainRunning || queueSnapshot(sessionId).length || isExternalPreset(session.presetId))) {
+    throw new Error('V2 requires an idle native member session')
+  }
   if (teamAttempt && (sessionAgentBusy(sessionId) || session.mainRunning || queueSnapshot(sessionId).length)) return { ok: true, queued: true }
   if (teamAttempt && isExternalPreset(session.presetId)) throw new Error('团队回归尚未接纳：当前主会话已切换到外部引擎')
   const sidebarSource: SidebarTurnSource = p.source === 'notice' ? 'notice' : 'user'
-  beginTurnMark(session, (p as any)?.source)
+  if (!v2) beginTurnMark(session, (p as any)?.source)
 
   /* ══ ★0927 N1：**不许插队** —— 队列非空时，新消息一律排到队尾（FIFO，先来先发）══════════════
      病案：直发路径从不看队列 ⇒ 用户新消息会抢在早先排队的消息前面（实测"先发后到"）。
@@ -22999,6 +24011,9 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
 
   // 技能标记：前端 skill 标签随消息发送 → 简短引导
   let finalMessage = message
+  /* ★1124y：本轮情境（IM 场景块等）放在**最前**（与它原来"拼进 message 最前面"的位置一致）——
+     只进 finalMessage，落盘仍是用户原话。 */
+  if (modelContext) finalMessage = modelContext + finalMessage
   let skillHint = ''
   if (Array.isArray(p?.skills) && p.skills.length > 0) {
     const names = (p.skills as unknown[]).filter(x => typeof x === 'string').map(String)
@@ -23242,7 +24257,15 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     return { ok: true, ...(turnLevelFailure(sessionId) || {}) }
   }
 
+  if (v2 && (sessionAgentBusy(sessionId) || session.mainRunning || queueSnapshot(sessionId).length)) {
+    throw new Error('V2 member session became occupied before start')
+  }
   const agent = getOrCreateAgent(sessionId)
+  /* ★1124y（**拆除自动续跑后补的缺口**）：
+     inbox（`pendingBgNotices`：后台任务完成 / 团队回归 / 回访）原来只在"建 agent"时被 drain，
+     可 agent 在连续对话里是**常驻**的 ⇒ 忙时进 inbox 的通知再也送不到模型（等于被吞掉）。
+     现在每轮开始前补一次，与"建 agent 时"同一实现（steer 进本轮首个 LLM 调用之前）。 */
+  drainBgNotices(sessionId, agent)
   // subscribe 已由 getOrCreateAgent 统一注册（只一次），此处不再重复订阅
   resetLoopGuard(sessionId) // 0908 新用户回合清空上一轮的连续失败计数（换参重试熔断按"单回合内连击"计）
   /* ★1013：上游泄漏自愈计数同口径复位（新用户回合=重新给机会；修复只在本回合内连击计数） */
@@ -23296,9 +24319,9 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
     /* ★1130：同下面那条 —— 注入身份在真正发送这一刻才登记回来（见 `enqueueBusyPrompt` 的解释） */
     if ((p as any).__inject) pushInjectMeta(sessionId, (p as any).__inject as InjectMeta)
     try {
-      await promptMainAgent(sessionId, session, freshAgent, finalMessage, images, sidebarSource, activityInput, teamAttempt)
+      await promptMainAgent(sessionId, session, freshAgent, finalMessage, images, sidebarSource, activityInput, teamAttempt, v2)
     } catch (e) {
-      if (teamAttempt) throw e
+      if (teamAttempt || v2) throw e
       /* ★0927 P0-1：裸错一律不许当产品错误漏给用户；忙时把消息抢救进队列 */
       const _rid = rescueBusyPromptToQueue(sessionId, p, message, e, noticeReason)
       if (_rid) return { ok: true, queued: true, ...queuePosOf(sessionId, _rid) }
@@ -23316,9 +24339,9 @@ export async function runPromptCore(sessionId: string, p: Record<string, unknown
      登记点放在这里而不是入队处：入队到真正发出可能隔几十分钟，中间任何一轮都可能抢走这份 meta。 */
   if ((p as any).__inject) pushInjectMeta(sessionId, (p as any).__inject as InjectMeta)
   try {
-    await promptMainAgent(sessionId, session, agent, finalMessage, images, sidebarSource, activityInput, teamAttempt)
+    await promptMainAgent(sessionId, session, agent, finalMessage, images, sidebarSource, activityInput, teamAttempt, v2)
   } catch (e) {
-    if (teamAttempt) throw e
+    if (teamAttempt || v2) throw e
     /* ★0927 P0-1：上面的忙检查与本调用之间仍有窄竞态（同刻两条都过检查）→ 这里兜住 pi 的裸抛，
        消息按忙时策略入队，绝不"整条蒸发"。 */
     const _rid = rescueBusyPromptToQueue(sessionId, p, message, e, noticeReason)
@@ -24175,6 +25198,75 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         ids: [...agents.keys()].slice(0, 50).map(id => ({ id: String(id).slice(0, 8), running: !!(agents.get(id) as any)?.activeRun })),
       }
     }
+    case 'session.teamAutoReport': {
+      const host = teamV2OperatorHost(String(sessionId || ''))
+      if (p?.enabled === undefined) return host.autoReportState()
+      return host.setAutoReport(p?.enabled)
+    }
+    case 'session.teamV2Usage': {
+      const sid = String(sessionId || '')
+      const session = sessions.get(sid)
+      /* ★V1 拆除：旧团队会话也要能查（就地接管），不再要求"事先已启用" */
+      const host = session && ensureTeamV2Host(session)
+      if (!session || !host) throw new Error('该会话未启用团队 V2')
+      const segments = readMemberSegmentRows(sid, undefined, true)
+      const team = session.teamId ? readTeam(session.teamId) : undefined
+      const memberRows = [...collectMemberUsageViews(segments, sid)].map(([memberId, usage]) => {
+        const row = { memberId, memberName: team ? memberName(team, memberId) : memberId, runs: 0 }
+        applyUsageViewToRecord(row, usage)
+        return row
+      })
+      /* C 的用量来自它自己的账本（`review_execution`），与 A / 成员各记各的，这里只做一次投影。
+         ★1124：后台协调也一起投影 —— 按"这一轮调没调 team_v2_* 工具"归因，数据源是每条 assistant 消息
+         自带的 usage（`message_end` 的权威值），不是拿会话累计值估算。 */
+      const projected = projectTeamV2Usage(session.usageTotals, segments, sid, host.ledger.verificationRecords(),
+        projectCoordinationUsage((session.messages || []) as any[]))
+      /* 阶段4：成员执行的可归属用量**另计**下发，不并入上面的公共总量（避免双算）。 */
+      return { sessionId: sid, ...projected, attributable: host.attributableUsage(), memberRows }
+    }
+    case 'session.teamWorkReport':
+    case 'session.teamWorkReportLocation': {
+      if (typeof p?.artifact !== 'string' || typeof p?.requestId !== 'number' || typeof p?.attemptId !== 'number') throw new Error('Invalid report reference')
+      const host = teamV2OperatorHost(String(sessionId || ''))
+      return method === 'session.teamWorkReportLocation'
+        ? host.reportLocation(p.requestId, p.attemptId, p.artifact)
+        : host.readReport(p.requestId, p.attemptId, p.artifact)
+    }
+    case 'session.teamWork': {
+      const sid = String(sessionId || '')
+      const session = sessions.get(sid)
+      if (!session) throw new Error('会话不存在')
+      /* ★V1 拆除：**工单面板是旧团队会话的第一个真实入口**，必须在这里就接管成 V2。
+         以前这里只读 `teamV2HostFor`（要账本已存在），于是"删账本+重启后第一次打开面板"
+         会返回 legacy —— 独立验收反例就是这么复现的。 */
+      const host = ensureTeamV2Host(session)
+      /* ★1124：V1 渲染已下线（老板定）—— 非团队会话不再降级成 legacy 卡，直接如实报错。 */
+      if (!host) throw new Error('V2 team work is only available inside a team session')
+      /* ★1124b：分页改成**最新优先**（从新往旧翻）。`beforeId` 省略 = 第一页（最新 N 条）。 */
+      const beforeId = p?.beforeId ?? null
+      const limit = p?.limit ?? 20
+      if ((beforeId !== null && typeof beforeId !== 'number') || typeof limit !== 'number') throw new Error('Invalid team work cursor')
+      const page = host.ledger.page(beforeId, limit, p?.messageId)
+      const team = session.teamId ? readTeam(session.teamId) : undefined
+      const items = page.items.map(row => {
+        const attempt = row.attempt
+        if (!attempt) return row
+        const turn = attempt.artifact ? host.reportTurn(attempt.memberId, attempt.artifact) : undefined
+        const seq = turn?.child.memberSessionSeq
+        const name = team ? memberName(team, attempt.memberId) : attempt.memberId
+        const model = turn?.reply.model
+        return { ...row, attempt: { ...attempt, memberName: seq ? name + '#' + seq : name, model } }
+      })
+      return { sessionId: sid, mode: 'v2', logEpoch: LOG_EPOCH, recoveryPending: host.recoveryPending,
+        /* ★交接单第 3 条「人工确认不能清掉未确认副作用 / 阻塞原因可见」：
+           `startBlocked` = 此刻挡住开工的那条后端事实（null = 没挡），`lastDrain` = 上一次调度是被哪个入口唤起、
+           过了还是被什么挡住。两者都直接来自后端，前端**不自己推断**"为什么队列停了"。 */
+        startBlocked: host.startBlocked(),
+        /* ★1124：待核中断单的沙箱清单（默认不合并，用户看清单再勾）—— 与 recoveryAttemptIds 同一时点下发给前端。 */
+        ...(beforeId === null && host.recoveryPending ? { recoverySandbox: host.pendingRecoverySandbox() } : {}),
+        lastDrain: host.lastDrain(),
+        ...page, items, ...(beforeId === null ? { sourceMessageIds: host.ledger.sourceMessageIds(), recoveryAttemptIds: host.recoveryPending ? host.ledger.pendingRecoveryAttempts() : [] } : {}), memberActivity: readMemberActivity(session) }
+    }
     case 'session.state': {
       /* ★1032-TM（M3/M4）：**状态全量快照** —— 前端发现 stateRev 跳号（丢帧）时用它对齐一次。
          只读内存（不读盘、不建会话）：这是"状态"，不是"正文"。 */
@@ -24217,7 +25309,14 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         /* ★1032（P22）：子会话有两个显式判据 ——
      `parentSessionId`（归属父会话）+ `inMainList === false`（显式"不进主列表"）。
      只认前者时，父字段一旦没落盘/被清，分身/成员的窗口就会漏回会话列表（实测）。 */
-        .filter(s => !s.parentSessionId && s.inMainList !== false)
+        /* ★1120（方案A · 老板 11-19 定案）：**列表只排结构性子会话，不再替前端做"可见性"决定**。
+           原来这里连 `inMainList === false` 一起剔掉 —— 任务会话 / 通道会话 / 旧版成员会话都是它，
+           于是 `session.list` 里根本查不到它们 ⇒ 前端 `getActive()` 拿到 null ⇒
+           从定时任务卡片点「查看」进的是一个**空态对话**（老板 11-19、11-20 两次实测）。
+           正确分工：后端只回答"谁是谁的子会话"（`parentSessionId`），
+           "进不进侧栏"由前端同一个可见性谓词回答（`isSidebarVisible`：parentSessionId / taskId / origin / inMainList）。
+           数据能返回 ≠ 会显示；主区要渲染一条会话，前端必须先在列表里认得它（后端是唯一源）。 */
+        .filter(s => !s.parentSessionId)
         // 安装助手已是正式预设：会话正常进聊天列表（不再按预设隐藏）
         .map(s => {
           // 0908三：带出会话模型归属供应商+base，供前端刷新后回填 convModel（隔离不串台）。
@@ -24251,7 +25350,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
             // evictIdleBodies pins it until those exact runtime IDs finish.
             // Calling sessions.get here upgrades every cold skeleton synchronously.
             memberActivity: readMemberActivity(s),
-            members: countLiveSubRuns((s as any)._body?.subRuns, isRunActive).members,
+            members: splitRunningAgentsIn(s, (s as any)._body?.subRuns).members,
             /* ★1126d：**成员异常告警数**（老板需求：成员失败/中断时聊天列表也要红）。
                判据见 memberAlertOf —— error/interrupted 且 unread=true；
                用户看过（打开成员窗口/对成员说话）unread 归 false ⇒ 红条自动熄灭，不造新接口。 */
@@ -24295,7 +25394,10 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
                （`channel.sessions` 早就返回这两个字段，但那条 RPC 只服务通道页；列表侧一直没有。） */
             originBot: s.originBot, originKind: s.originKind,
             // 0912 十九批：定时任务支线 → 前端打 ⏰ 标记 / 主列表放行 / 右键改为「放回定时任务」
-            taskId: s.taskId, inMainList: s.inMainList === true,
+            /* ★1120（方案A）：**原值透传** `inMainList` —— 以前只把 true 给出去、false 压成 undefined，
+               前端于是拿不到"后端说它不进主列表"这唯一可见判据（旧版成员会话只有这一个标记）。
+               压扁字段＝前端只能靠猜，正是方案A要治的病。 */
+            taskId: s.taskId, inMainList: s.inMainList,
             // ★ 0922z2b：迁入主列表的时间（前端列表排序用：刚挪进来的排最前）
             movedInAt: s.movedInAt || 0,            // 完整首条消息（对话界面标题用，比列表标题更长）
             /* ★1027c：同上次落盘时的摘要口径（`firstMessageBriefOf`，剥注入行 + 80 字） */
@@ -24303,7 +25405,29 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
           }
         }) }
 
+    /* ★V1 运行链已完全拆除，但**这个只读 RPC 必须保留**（独立验收第 4 条给了两个选项，我们走"只读兼容"）：
+       证据：源码 `backend/`、`frontend/src` 里已无调用方，但**已构建的 dist 里仍有调用**
+       （删掉后 `_v2_default_e2e` 立刻报"未实现的方法 session.teamV2Trial"）。
+       语义：永远 `false` —— 不再读 `NIS_TEAM_V2_TRIAL`、也**不代表任何能力开关**；
+       有团队就是 V2（`session.create` 已拒绝 `teamRuntime` 参数），它只是一个给老前端读的常量。
+       新代码请改读 `session.teamWork` 的 `mode` 字段。 */
+    case 'session.teamV2Trial':
+      return { enabled: false }
+
     case 'session.create': {
+      /* ★老板裁定（V1 完全拆除）：**有团队就必然是 V2**。
+         不再接受 `teamRuntime` 参数、不再有试用门、也没有 legacy 返回值 ——
+         团队会话只有一条运行链，不存在"失败回退 V1"。
+         普通会话（无 teamId）不受影响：它们本来就没有团队运行时。 */
+      if (p?.teamRuntime !== undefined) throw new Error('团队运行时已统一为 V2，不再接受 teamRuntime 参数')
+      const teamId = typeof p.teamId === 'string' && p.teamId.trim() ? p.teamId.trim() : ''
+      if (teamId) {
+        const team = readTeam(teamId)
+        if (!team || !team.members.length || p.presetId !== team.mainPreset || isExternalPreset(team.mainPreset)) {
+          throw new Error('团队 V2 需选择使用原生主预设的有效团队')
+        }
+        if (typeof p.workDir !== 'string' || !path.isAbsolute(p.workDir)) throw new Error('团队 V2 需明确指定绝对工作区路径')
+      }
       const session = createSession(
         p?.title as string | undefined,
         p?.workDir as string | undefined,
@@ -24313,8 +25437,15 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
         undefined,
         p?.projectId as string | undefined,
       )
+      if (teamId) {
+        if (!session.workDir || !fs.statSync(session.workDir).isDirectory()) {
+          sessions.delete(session.id)
+          throw new Error('团队 V2 工作区没有创建成功')
+        }
+        attachTeamV2Pilot(session.id)
+      }
       broadcastHost({ type: 'host/session-added', sessionId: session.id, blank: true, cwd: session.workDir ?? process.cwd() })
-      return { sessionId: session.id, title: session.title, workDir: session.workDir, presetId: session.presetId, teamId: session.teamId, projectId: session.projectId }
+      return { sessionId: session.id, title: session.title, workDir: session.workDir, presetId: session.presetId, teamId: session.teamId, projectId: session.projectId, teamRuntime: teamId ? 'v2' : undefined }
     }
 
     /* ★c1：把当前「默认 AGENT.md」**覆盖**写入该会话工作区（设置里改完、想推给**已有会话**时用）。
@@ -24397,6 +25528,9 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
       // 团队绑定：空串=解绑；未传=保持现状
       const newTeam = p?.teamId !== undefined ? (String(p.teamId || '').trim() || undefined) : session.teamId
       const teamChanged = newTeam !== session.teamId
+      if ((teamChanged || newPreset !== session.presetId) && teamV2HostFor(session)) {
+        throw new Error('团队 V2 会话的团队与预设在创建时确定；请新建会话')
+      }
       const changed = newPreset !== session.presetId || newSystem !== session.system || teamChanged
       if (newPreset !== session.presetId) session.presetBy = 'user'   // 二十一批：PC 明确选过 → 通道配置不再覆盖
       session.presetId = newPreset
@@ -24987,9 +26121,7 @@ async function dispatchMethod(method: string, payload: unknown): Promise<unknown
     case 'session.prompt': {
       if (!sessionId) throw new Error('sessionId required')
       if (!p?.message) throw new Error('message required')
-      /* ★ 0923：用户亲自发话 = 新一轮工作 → 续跑额度重置、解除暂停
-         （语义：每次用户交互重新给一整份额度，免得一条会话聊久了永久卡在上限） */
-      if (sessionId) resetBgResumeChain(sessionId)
+      /* ★1124x：用户亲自发话不再需要"重置续跑额度"—— 自动续跑链已拆除，没有额度这回事了。 */
       /* ★1020 S3.2：把前端带来的 rpcId 入队 —— 落盘时它会成为这条用户消息的**持久 id**（身份唯一）
          ★1020 修（实测"卡的时候消息变成两条"）：前端直发路径传的字段是 `clientMessageId`，
          这里原来只认 `rpcId` ⇒ take 不到 ⇒ 持久 id 回退随机值 ⇒
@@ -26924,8 +28056,8 @@ const allowed = [
       /* ★1109：这里原来把 envDir 同步给浏览器引擎的 PLAYWRIGHT_BROWSERS_PATH（本地内核要用）——
          local 内核已下线，桌面壳模式不读这个变量，整块删除。 */
       // 广播设置更新：前端立即同步（AI 改名后设置界面/聊天气泡实时更新）
-      broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(globalSettings)) })
-      return { ok: true, settings: JSON.parse(JSON.stringify(globalSettings)) }
+      broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() })
+      return { ok: true, settings: settingsFrame() }
     }
 
     /* ── 定时任务（0912 十二批）── */
@@ -27088,12 +28220,8 @@ const allowed = [
       if (_ext) { try { _ext.abort() } catch { /* ignore */ } }
       // 停止生成：只 abort agent 并清理流式状态，不删除会话
       if (!sessionId) throw new Error('sessionId required')
-      /* ★ 0923：用户按「停止」= 该会话的后台自动续跑链暂停（尊重「我不想它再自己跑」）；
-         待续跑事件退回「下次发话补送」通道，信息不丢。 */
-      {
-        const c = bgResumeChains.get(sessionId)
-        if (c) { c.stopped = true; parkBgResumePending(sessionId) }
-      }
+      /* ★1124x：用户按「停止」不再需要"暂停续跑链"—— 自动续跑链已拆除，
+         排队中的后台结果本来就在 inbox 里等下一次交互，不存在"自己又跑起来"这回事。 */
       const session = sessions.get(sessionId)
       if (session) stopTeamReturnWake(session)
       const agent = agentForSession(sessionId)
@@ -28054,7 +29182,7 @@ const allowed = [
           } catch (e) { swallowed('导入后回写 ui-state.json 失败（草稿/开屏主题等可能丢）', e) }
         }
         try { loadSettings() } catch { /* ignore */ }
-        try { broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(globalSettings)) } as any) } catch { /* ignore */ }
+        try { broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() } as any) } catch { /* ignore */ }
       }
       /* 0919：**v1 老包**（清单里没有 `parts`）→ 按"整包导入"处理。
          为什么之前报错：老包在弹窗里只给一个合成项 `__all__`（见 data.importInspect），
@@ -28317,7 +29445,7 @@ const allowed = [
         try {
           reloadProviders()
           loadSettings()
-          broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(globalSettings)) } as any)
+          broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() } as any)
         } catch (e) {
           console.error('[import] 重载设置/供应商失败：', e)
         }
@@ -28448,7 +29576,7 @@ const allowed = [
             ;(globalSettings as any).storagePath = from
             throw new Error('存储路径已迁移，但 settings.json 写入失败（内存设置已回滚）——请检查磁盘权限后重试')
           }
-          broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(globalSettings)) } as any)
+          broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() } as any)
         }
         return r
       } catch (e: any) {
@@ -29412,6 +30540,10 @@ const allowed = [
             effortsResolved: resolveModelEfforts(p.id, m.id),
             // 0907 A+B：能力真相源快照（前端本轮不消费，UI 接入徽标/闸门提示时直接用，避免再造一套推断）
             caps: resolveModelCaps(p.id, m.id),
+            /* ★1126：用途分类（单值，唯一源）—— 前端 `kind` 只读不推：
+               'text'=能当聊天模型（含多模态）／'image'/'video'/'audio'=只能被对应生成工具调用。
+               会话/成员模型下拉据此只列 text；设置页模型列表据此分组。 */
+            kind: resolveModelKind(p.id, m.id),
           })),
           }
         }),
@@ -29549,7 +30681,164 @@ const allowed = [
       const pid = p?.providerId ?? p?.provider as string | undefined
       if (!pid) throw new Error('providerId required')
       setModels(pid, (p?.models as ProviderModel[]) || [])
-      return { ok: true }
+      /* ★1126：把后端算好的 kind 随写回一起回传。前端本地新增/改类型时算不出权威 kind
+         （前端没有 models.dev 快照），不回传就只能等下一次全量 providers.list ——
+         中间这段窗口里模型会在会话下拉里"凭空消失"。只回 id+kind，轻。 */
+      const written = getState().providers.find(x => x.id === pid)?.models || []
+      return { ok: true, kinds: written.map(m => ({ id: m.id, kind: resolveModelKind(pid, m.id) })) }
+    }
+
+    /* ══ ★1126：生成模型（生图/视频）配置 ══
+       只存 {providerId, modelId} 指针 + 一个"生成前确认"开关；key/base/代理全部复用 providers.json。
+       设置页「供应商 → 生成模型」卡片读 get、写 setTarget/setConfirm。 */
+    case 'mediaTools.get': {
+      const st = getMediaTools()
+      return {
+        ...st,
+        /* 下拉候选：只列"有 key 且 kind 匹配"的模型（选了也用不了的不往里放）。
+           前端只显示 providerName/modelId，不需要自己再判能力。 */
+        candidates: { image: listMediaCandidates('image'), video: listMediaCandidates('video') },
+      }
+    }
+
+    case 'mediaTools.setTarget': {
+      const kind: MediaKind = String(p?.kind || 'image') === 'video' ? 'video' : 'image'
+      const providerId = String(p?.providerId || '').trim()
+      const modelId = String(p?.modelId || '').trim()
+      /* 传空 = 清除该项。选了具体模型时 setMediaTarget 内部会校验（供应商存在/有 key/模型在表里/类型匹配），
+         任何一条不满足都抛明确错误 —— 宁可当场报错，也别让用户到"真去出图"时才发现配错。 */
+      return setMediaTarget(kind, providerId && modelId ? { providerId, modelId } : null)
+    }
+
+    /* ★1126：画廊删除 → 进回收站（**不是真删**，老板问"删了想返回怎么办"）。
+       做法：文件移到 `screenshots/.trash/`（保留文件名），索引打 deletedAt 标记。
+       恢复 = 移回 + 清标记；彻底删除才真 unlink（media.gallery.purge）。 */
+    case 'media.gallery.delete': {
+      const sid = String(p?.sessionId || '').trim()
+      const ref = String(p?.shotRef || '').trim()
+      if (!sid || !ref) throw new Error('sessionId / shotRef required')
+      const s = sessions.get(sid)
+      let moved = false
+      if (s?.workDir) {
+        const root = path.resolve(s.workDir)
+        const abs = path.resolve(root, ref)
+        if (abs.startsWith(root + path.sep) && fs.existsSync(abs)) {
+          const trashDir = path.join(root, 'screenshots', '.trash')
+          try {
+            fs.mkdirSync(trashDir, { recursive: true })
+            fs.renameSync(abs, path.join(trashDir, path.basename(abs)))
+            moved = true
+          } catch (e: any) {
+            throw new Error(`移到回收站失败：${String(e?.message || e)}`)
+          }
+        }
+      }
+      markDeleted(sid, ref, Date.now())
+      return { ok: true, moved, trashed: true }
+    }
+
+    /* ★1126：从回收站恢复（文件从 .trash 移回 screenshots/，索引清 deletedAt） */
+    case 'media.gallery.restore': {
+      const sid = String(p?.sessionId || '').trim()
+      const ref = String(p?.shotRef || '').trim()
+      if (!sid || !ref) throw new Error('sessionId / shotRef required')
+      const s = sessions.get(sid)
+      let moved = false
+      if (s?.workDir) {
+        const root = path.resolve(s.workDir)
+        const trashFile = path.join(root, 'screenshots', '.trash', path.basename(ref))
+        const back = path.resolve(root, ref)
+        if (back.startsWith(root + path.sep) && fs.existsSync(trashFile)) {
+          try {
+            fs.mkdirSync(path.dirname(back), { recursive: true })
+            fs.renameSync(trashFile, back)
+            moved = true
+          } catch (e: any) {
+            throw new Error(`恢复文件失败：${String(e?.message || e)}`)
+          }
+        }
+      }
+      restoreEntry(sid, ref)
+      return { ok: true, moved }
+    }
+
+    /* ★1126：彻底删除（回收站里"删干净"）：真删文件 + 从索引移除 */
+    case 'media.gallery.purge': {
+      const sid = String(p?.sessionId || '').trim()
+      const ref = String(p?.shotRef || '').trim()
+      if (!sid || !ref) throw new Error('sessionId / shotRef required')
+      const s = sessions.get(sid)
+      let deleted = false
+      if (s?.workDir) {
+        const root = path.resolve(s.workDir)
+        const cands = [path.resolve(root, ref), path.join(root, 'screenshots', '.trash', path.basename(ref))]
+        for (const f of cands) {
+          if (f.startsWith(root + path.sep) && fs.existsSync(f)) {
+            try { fs.unlinkSync(f); deleted = true } catch { /* 删不掉就留着，索引照样移除 */ }
+          }
+        }
+      }
+      removeGalleryEntry(sid, ref)
+      return { ok: true, deleted }
+    }
+
+    /* ★1126：画廊列表 —— 侧栏「画廊」面板的数据源。默认只列当前会话，
+       传 sessionId='' 可列全部；kind 分「生成 / 截图」；trash=true 看回收站。 */
+    case 'media.gallery.list': {
+      const raw = typeof p?.sessionId === 'string' ? p.sessionId : undefined
+      /* ★1126：三段范围 —— session=只当前对话 / workspace=同一工作区的所有对话 / all=全部。
+         为什么需要 workspace 这一档：一个工作区（项目目录）下常常有几十个会话，
+         用户想看的往往是"这个项目里出过哪些图/视频"，而不是"这一条对话里的"。 */
+      const scope = String(p?.scope || 'session')
+      let sid: string | undefined
+      let ids: Set<string> | undefined
+      if (scope === 'all') { /* 不过滤 */ }
+      else if (scope === 'workspace') {
+        const wd = String((raw ? sessions.get(raw)?.workDir : '') || '').trim()
+        if (wd) {
+          ids = new Set<string>()
+          for (const [id, s] of sessions) {
+            if (String((s as any)?.workDir || '').trim() === wd) ids.add(id)
+          }
+        } else if (raw) {
+          sid = raw        // 这个会话没工作区 → 退化成只看它自己（不是"全看"）
+        }
+      }
+      else if (raw) sid = raw
+
+      const kindRaw = typeof p?.kind === 'string' ? p.kind : ''
+      const kind = kindRaw === 'image' || kindRaw === 'screenshot' || kindRaw === 'video' ? kindRaw : undefined
+      const trash = p?.trash === true
+      const limit = Number(p?.limit) || 200
+      return {
+        entries: listGallery({ sessionId: sid, sessionIds: ids, kind, limit, trash }),
+        total: galleryCount(sid, undefined, false, ids),
+        counts: {
+          image: galleryCount(sid, 'image', false, ids),
+          screenshot: galleryCount(sid, 'screenshot', false, ids),
+          video: galleryCount(sid, 'video', false, ids),
+          trash: galleryCount(sid, undefined, true, ids),
+        },
+      }
+    }
+
+    /* ★1126：图片「另存为」—— 用户在图片查看器点下载，先由主进程弹系统保存对话框选路径，
+       再把**原图字节**写过去（不是前端缩放后的画布，所以存下来就是生成的那张原图）。
+       安全：targetPath 是用户自己在系统对话框里选的，这里只做"目录可建、写入失败报错"。 */
+    case 'mediaTools.saveFile': {
+      const targetPath = String(p?.targetPath || '').trim()
+      const b64 = String(p?.base64 || '')
+      if (!targetPath) throw new Error('targetPath required')
+      if (!b64) throw new Error('base64 required')
+      const buf = Buffer.from(b64, 'base64')
+      if (!buf.length) throw new Error('图片数据为空')
+      try {
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+        fs.writeFileSync(targetPath, buf)
+      } catch (e: any) {
+        throw new Error(`写入失败：${String(e?.message || e)}`)
+      }
+      return { ok: true, path: targetPath, bytes: buf.length }
     }
 
     case 'providers.fetchModels': {
@@ -29855,7 +31144,13 @@ const allowed = [
             这里只是把"读出来的这份"补上，随 RPC 响应返回。 */
       {
         const _sid = sessionId || String(p?.sessionId || '')
-        const _bb: any = loadBlackboard(_sid)
+        /* ★1124（老板实测截图）：V2 派单**不写黑板**（它用独立账本），所以团队会话的 `loadBlackboard()` 常为 null,
+           而下面这段"按账本补算成员用量"被 `if (_bb)` 整段跳过 ⇒ 成员卡五格全「—」，可团队用量弹窗却有数
+           （弹窗直接调 memberUsageDetail，不经过黑板）。修法：团队会话即使没有黑板也给一个空壳，
+           让同一个 `collectMemberUsage` 把 memberTotals 补出来；非团队会话保持 null（语义不变）。 */
+        const _s0: any = sessions.get(_sid)
+        const _team0: any = _s0?.teamId ? readTeam(String(_s0.teamId)) : null
+        const _bb: any = loadBlackboard(_sid) ?? (_team0 ? {} : null)
         if (_bb) {
           try {
             const _s: any = sessions.get(_sid)
@@ -30098,7 +31393,7 @@ const allowed = [
       gs.externalBrowser = p0
       bumpSettingsVersion()
       persistSettings()
-      broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(gs)) })
+      broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() })
       return { exe: p0, customs: list }
     }
     /* ★1116-4：把某个自定义浏览器从列表里移除（卸载了/加错了）。
@@ -30112,7 +31407,7 @@ const allowed = [
       if (String(gs.externalBrowser || '').toLowerCase() === p0.toLowerCase()) gs.externalBrowser = ''
       bumpSettingsVersion()
       persistSettings()
-      broadcastHost({ type: 'host/settings-updated', settings: JSON.parse(JSON.stringify(gs)) })
+      broadcastHost({ type: 'host/settings-updated', settings: settingsFrame() })
       return { customs: gs.externalBrowserCustoms, current: gs.externalBrowser }
     }
     case 'browser.cacheStats':
@@ -30856,11 +32151,18 @@ async function maybeInterjectInGroup(botId: string, ev: any, speakerLabel: strin
   if (ijImages.length && ijGate.blocked) {
     console.log(`[interject] 群 ${groupId.slice(0, 8)}：有 ${ijImages.length} 张图待认领，但模型「${ijGate.model}」不支持看图 → 本次不带图`)
   }
-  /* ★1020（身份统一 · 通道侧收尾）：群插嘴也是"用户发话" —— 给确定性 id 并交给落盘（同单聊口径） */
+  /* ★1020（身份统一 · 通道侧收尾）：群插嘴也是"用户发话" —— 给确定性 id 并交给落盘（同单聊口径）
+     ★1124y（**实测 357 条**：插嘴的整段指令被当成用户消息落盘 ⇒ 会话里长出一堆
+       「【群聊插嘴】群里 X 刚说…你主动接一句…只有完全接不上时才回（跳过）」的用户气泡）：
+       · 落盘正文只留**那句引述**（`【群聊插嘴】群里 X：「…」`）—— 用户看得懂"谁说了什么"；
+       · 完整指令走 `modelContext`（只给模型看）；
+       · `__inject` + INJECT_MARKERS 的 `【群聊插嘴` ⇒ 这一轮是**注入段**（前端按通知显示，不算用户轮）。 */
   const ijRpcId = `ch:group:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
   pushPendingUserRpcId(sid, ijRpcId)
   await runPromptCore(sid, {
-    message: hint,
+    message: `【群聊插嘴${hitWord ? '·有人点名' : ''}】群里 ${speakerLabel}：「${text}」`,
+    modelContext: hint,
+    __inject: { merge: false, at: Date.now(), kind: 'group_interject' },
     rpcId: ijRpcId,
     __busyPolicy: 'wait',
     ...(ijAttachments.length ? { attachments: ijAttachments } : {}),
@@ -31014,7 +32316,10 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     console.log(`[1035] /api/ws 已挂载（来源: ${wsSrc}）—— 与 SSE 并存，前端连哪种由 ?transport= 决定`)
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, PORT === 0 ? '127.0.0.1' : '0.0.0.0', () => {
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Backend did not bind a TCP port')
+    PORT = address.port
     /* ★1012d：若上次隧道是开启状态，启动后自动接回来 —— 用户不必每次重启后端都手点一次。
        ★P116：**推迟 6 秒再连**。启动瞬间有三件事同时拉外部进程：密钥解密（PowerShell，实测 10 秒）、
        隧道（ssh，实测 10 秒）、python 记忆内核（5 秒）—— 三个一起冲会互相抢 CPU/磁盘，
@@ -31026,6 +32331,11 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     console.log(`[pi-bridge] LLM: ${cfg.model} via ${cfg.providerName} (${cfg.base})`)
     /* ★1014f：PC 会话接管配对码 —— 手机（QQ/微信）私聊发「/pc <码>」即放行（仅私聊可配对，见 channels/pcAccess.ts） */
     try { getPairCode() } catch { /* 取码失败不挡启动 */ }
+    /* ★1126：**重启后接回在跑的视频任务** —— 上游任务在服务端跑着，本地进程死了不等于任务死了。
+       放在 listen 回调里（providers 已加载完），延迟 5 秒避开启动期的几路外部进程抢资源。 */
+    setTimeout(() => {
+      try { resumeVideoPolls() } catch (e: any) { console.warn('[bg] 恢复视频任务失败:', String(e?.message || e).slice(0, 120)) }
+    }, 5000)
     console.log(`[pi-bridge] Ready for DSH frontend to connect`)
     /* ★P115：**启动期 CPU 采样器**（只在 `NIS_STARTUP_PROFILE=1` 时开）。
        为什么需要：启动那几秒的主线程堵塞靠日志只能看到"堵了多久"，看不到"谁在堵"；
@@ -31171,8 +32481,13 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     },
     onStatus: (botId, st) => {
       console.log(`[channel] QQ bot ${botId} 状态: ${st.connected ? '已上线' : '离线'}${st.error ? ' · ' + st.error : ''}`)
-      // 推给前端（通道弹窗展示在线状态）
-      broadcastHost({ type: 'host/settings-updated', settings: { __channelStatus: { qq: qqBotStatus() } } } as any)
+      /* ★1126 修（老板实测「对话跑着头像会回退成 logo，过会儿又变回来」）：
+         这里原来发的是 `host/settings-updated`，但 settings **只带 __channelStatus 一个字段**。
+         前端 applyBackendSettings 会把它当一次完整同步、把帧里没有的 `avatarVersion` 清空
+         ⇒ nisAvatar 回落到默认 logo，直到下一次全量广播才恢复 —— 头像闪烁的真因。
+         窄帧必须走窄事件：设置通道只承载"整份设置"。前端目前还没有这条事件的消费方
+         （将来做通道弹窗时按这个事件名接），所以这里只保留推送意图、不再污染 settings。 */
+      broadcastHost({ type: 'host/channel-status', status: { qq: qqBotStatus() } } as any)
     },
   })
   syncQqBotsFromConfig().catch((e: any) => {
@@ -31193,7 +32508,8 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     },
     onStatus: (botId, st) => {
       console.log(`[channel] 微信 bot ${botId} 状态: ${st.connected ? '已连接' : '断开'}${st.error ? ' · ' + st.error : ''}`)
-      broadcastHost({ type: 'host/settings-updated', settings: { __channelStatus: { wechat: wechatBotStatus() } } } as any)
+      /* ★1126：同上 —— 窄帧走 `host/channel-status`，不再冒充设置更新（否则每次微信上下线都会清空头像指纹）。 */
+      broadcastHost({ type: 'host/channel-status', status: { wechat: wechatBotStatus() } } as any)
     },
   })
   try { syncWechatBotsFromConfig() } catch (e: any) {
@@ -31296,7 +32612,9 @@ getSkills().catch(() => { /* 目录缺失/加载失败=无技能，不拦启动 
     }catch (e) { /* ignore */ swallowedThrottled('broadcast', e, 'bg/updated|' + String(t.conversationId || '')) }
   })
   /* ★ 0922e：进程监控 —— 注册表变更 → mux 广播（前端「进程」面板实时增删；
-   设计口径：只显示正在运行的，结束就消失）。有归属会话就发该会话订阅者，否则发全量桶。 */
+   设计口径：只显示正在运行的，结束就消失）。有归属会话就发该会话订阅者，否则发全量桶。
+   ★第十三轮：这里**只负责发布**。原来它兼做落库（按成员 ID 猜 attempt）且 catch 吞错 ——
+   落库已移到工具启动层（见下方 `setProcRegistrar`），身份由启动层带下来。 */
 setProcEmitter((p) => {
   try {
     const payload: any = { type: 'proc/updated', proc: JSON.parse(JSON.stringify(p)) }
@@ -31305,7 +32623,80 @@ setProcEmitter((p) => {
     else broadcastMux('', payload)
   }catch (e) { /* ignore */ swallowedThrottled('broadcast', e, 'proc/updated|' + String((p.origin && p.origin.conversationId) || '')) }
 })
+/* ★第十三轮：**持久登记**（工具生命周期内，不在广播回调里）。
+   身份来自 `origin.team` —— 开工边沿绑定的确切 attempt，不再从成员会话反推。
+   失败处置写在这一处（唯一策略点）：
+     · 能挂围栏 ⇒ 挂持久围栏（这一步本身就是"副作用状态未知"的持久事实，会挡住所有后单）；
+     · 连围栏都写不进 ⇒ 进阻断态 `blockToolsRegistrationFailed`（fail-closed：证明不了就不许开工），
+       并把原文留成可见证据（error 日志 + stageReport）。 */
+setProcRegistrar((p, phase) => {
+  /* ★1123（老板）：成员可以挂后台长任务 —— bg_start 拉起的进程**不进团队账本的围栏表**：
+     它是有意的、有 task_id 可管理的后台任务，不是"工具执行的未确认副作用"。
+     它照样进 processRegistry（进程监控可见）与 bgList（按任务管理）；崩溃恢复靠这两处发现它。 */
+  if (p.origin?.tool === 'bg_start') return
+  const team = p.origin?.team
+  if (!team) return                       /* 非团队执行：没有账本可记，普通会话零影响 */
+  const parent: any = team.hostSessionId ? sessions.get(team.hostSessionId) : null
+  const host = parent?.teamId ? teamV2HostFor(parent) : undefined
+  if (!host) {
+    /* 宿主没了（会话被删/已不是团队）⇒ 这条 pid 无处登记。不是"没有残留"，而是"没有账本能证明它"，
+       如实留一条 error，供人工按 pid 处置；不假装成功。 */
+    try { console.error(`[团队V2] 工具进程 pid ${p.pid} 无法登记：团队账本宿主已不存在（attempt #${team.attemptId}）`) } catch { /* ignore */ }
+    return
+  }
+  host.noteToolProcess(team, p, phase)
+  /* ★1124：pid 一拿到就把**启动意图**补成"已知 pid"（同一件事的两个阶段）。
+     补不上由 host 留痕；意图行留在"pid 未知"状态就会让这一单按未确认副作用处理（保守方向）。 */
+  if (phase === 'spawned' && p.origin?.intentToken) host.bindProcIntent(team.attemptId, String(p.origin.intentToken), Number(p.pid))
+})
+/* ★1124：**启动意图**（`spawn()` 之前，pid 还不存在）。
+   身份来源与 registrar 完全相同（`origin.team`，开工边沿绑定），只是发生得更早。
+   返回的 token 由工具层带进 origin：拿到 pid 后补回同一行，进程结束删行。 */
+setProcIntentHook({
+  begin: (origin) => {
+    const team = origin?.team
+    if (!team) return null                        /* 非团队执行：没有账本可写，普通会话零影响 */
+    if (origin.tool === 'bg_start') return null   /* 有意后台任务不进团队账本（与 registrar 同口径） */
+    const parent: any = team.hostSessionId ? sessions.get(team.hostSessionId) : null
+    const host = parent?.teamId ? teamV2HostFor(parent) : undefined
+    if (!host) {
+      try { console.error(`[团队V2] 工具启动意图无法落库：团队账本宿主已不存在（attempt #${team.attemptId}）`) } catch { /* ignore */ }
+      return null
+    }
+    const token = `${team.hostSessionId}#${crypto.randomUUID()}`
+    try {
+      /* 这单已结算（不是 queued/running）⇒ 不落意图、也不伪造：返回 null，pid 仍走常规登记。 */
+      return host.beginProcIntent(team.attemptId, token, String(origin.tool || 'run_command')) === null ? null : token
+    } catch (error) {
+      /* 账本写不进 = 证明不了副作用状态 ⇒ fail-closed：先挂持久围栏；围栏都写不进就抛，
+         让这轮工具失败（模型看得见），绝不静默当成"没问题"。 */
+      const text = `工具启动意图写入失败（attempt #${team.attemptId}，tool ${String(origin.tool || 'run_command')}）：${String((error as Error)?.message || error).slice(0, 300)}`
+      try {
+        host.ledger.holdFence(team.requestId, team.attemptId, `${text}；副作用状态未知，必须先确认清理才放行`)
+        try { console.error(`[团队V2] ${text}（已挂持久围栏）`) } catch { /* ignore */ }
+        return null
+      } catch (fenceError) {
+        throw new Error(`${text}；围栏也写不进：${String((fenceError as Error)?.message || fenceError).slice(0, 200)}`)
+      }
+    }
+  },
+  end: (token) => {
+    const text = String(token || '')
+    const cut = text.indexOf('#')
+    if (cut <= 0) return
+    const parent: any = sessions.get(text.slice(0, cut))
+    const host = parent?.teamId ? teamV2HostFor(parent) : undefined
+    /* 删不掉就留着：残留意图会让这一单被当成"未确认副作用"挡住（保守方向，不是掩盖）。 */
+    host?.endProcIntent(text)
+  },
+})
 setProcRemover((p) => {
+  try {
+    /* 阶段4补正：成员会话里的工具进程退出，可能正是围栏等的那件事 ⇒ 让父团队会话复核一次。 */
+    const _pc: any = p.origin?.conversationId ? sessions.get(String(p.origin.conversationId)) : null
+    const _pp: any = _pc?.parentSessionId ? sessions.get(String(_pc.parentSessionId)) : null
+    if (_pp && _pp.teamId) teamV2HostFor(_pp)?.kickFenceRecheck()
+  } catch { /* ignore */ }
   try {
     const payload: any = { type: 'proc/removed', id: p.id, pid: p.pid }
     const _procConv = String((p.origin && p.origin.conversationId) || '')
@@ -31315,6 +32706,14 @@ setProcRemover((p) => {
 })
 setBgNotifier((t) => {
     const convId = String(t.conversationId || '')
+    /* 阶段4补正：成员会话的后台任务结束，可能正是围栏等待的那个副作用交还了 ⇒
+       立刻让它的父团队会话复核一次（只在该父会话确实挂着围栏时才动作）。 */
+    try {
+      const child: any = convId ? sessions.get(convId) : null
+      const parentId = String(child?.parentSessionId || '')
+      const parent: any = parentId ? sessions.get(parentId) : null
+      if (parent && parent.teamId) teamV2HostFor(parent)?.kickFenceRecheck()
+    } catch { /* 复核失败不影响通知本身 */ }
     if (!convId) return
     const head = t.status === 'completed' ? '后台任务完成' : t.status === 'cancelled' ? '后台任务已取消' : '后台任务失败'
     const body = String(t.result || t.error || '').slice(0, 600)
@@ -31378,11 +32777,16 @@ setBgNotifier((t) => {
           const mm = _msgs[i]
           if (mm?.role === 'assistant' && mm.id) {
             _segId = String(mm.id)
-            /* 该段所属轮 = 它前面最近的 user（注入消息用 `injectedTurnId`，与 `buildTurns` 同口径） */
+            /* 该段所属轮 = 它前面最近的 user（注入消息用 `injectedTurnId`，与 `buildTurns` 同口径）
+               ★1126 纠偏（**老板实测"后台任务完成通知直接没显示"**）：
+               注入消息的 id 是 `inj-…`，而前端**不为注入轮建节点**（`turnIds` 里没有它）
+               ⇒ 把它当 `afterTurnId`，这条通知就永远命中不了、静默不渲染。
+               正确做法：**跳过注入消息，继续往前找真实用户消息** —— 通知归到它真正发生的那一轮。
+               这是结构性修正，不是兜底：锚点必须指向前端真实存在的轮，否则它就没有位置。 */
             for (let j = i - 1; j >= 0; j--) {
               const uu: any = _msgs[j]
               if (uu?.role !== 'user') continue
-              if (isInjectedUserMsg(uu)) { _segTurnId = String(injectedTurnId(uu) || '') || _segTurnId; break }
+              if (isInjectedUserMsg(uu)) continue
               if (uu.id) { _segTurnId = String(uu.id); break }
             }
             break
@@ -31414,31 +32818,34 @@ setBgNotifier((t) => {
         broadcastMux(convId, { type: 'session/projection', sessionId: convId, key: 'session-notice', seq: Date.now(), value: { text: userLine, at, afterToolId: _afterToolId, afterSegId: _segId, afterTurnId: _segTurnId, standalone: _standalone } } as any)
       }catch (e) { /* 广播失败不影响收尾：noticeLog 仍在，日志可查 */ swallowedThrottled('broadcast', e, 'session/projection|' + String(convId)) }
     }
-    /* ★0930（需求要求"通知别打断正在干活的 AI"）：**不再 steer 插话** —— 忙时事件挂起，
-       本轮结束自动处理（与续跑链同款让路规则：不打断、按序）；空闲才立刻开一轮。
-       ★0930b（反馈"同一任务出现两条通知"）：给 AI 的投递消息本身会渲染成一条提示，
-       与 userLine 并排就是重复 ⇒ 空闲即时投递时不再另发 userLine；忙时排队才发 userLine
-       （事件即时可见，AI 的处理消息本轮结束才出现，两条隔开且内容侧重不同）。 */
-    const agent = agents.get(convId)
-    /* ★1020（活跃口径统一）：工具批次/待审批/子代理期间 `isStreaming` 是 false ⇒ 被判"空闲"，
-       通知会立刻投递而不是挂起等本轮结束（打断正在干活的 AI）。改用 sessionAgentBusy()。 */
-    const busy = sessionAgentBusy(convId)
-    if (scheduleBgResume(convId, note, String(t.status))) {
-      t.notified = true
-      /* ★1022at（实测"后台任务完成完全没提示"，并指出位置应该在第一轮之后）——
-         原来这里是 `if (busy) pushUserLine()`：**空闲时故意不发**，因为怕和"AI 收到投递消息后说的话"重复
-         （0930b 的取舍）。但 1022ap 之后，注入类消息（`【后台任务完成】…`）已经**不显示**给用户了
-         ⇒ 两头都空 ⇒ 用户什么都看不到。
-         现在无条件发：注入消息不再渲染，userLine 就是唯一用户可见的通知源，不会重复。 */
-      pushUserLine()
-      sessionLog(convId, 'info', 'lifecycle', `${head}：${t.title}（已交给自动续跑链${busy ? '，挂起等本轮结束' : '，立即处理'}）`)
-      return
-    }
+    /* ★1124x（**自动续跑已拆除**）：这里原来是两条路 —— `scheduleBgResume`（忙时排队、**本轮结束自动开新轮**）
+       与"记待办"。老板实测的问题就出在第一条：AI 正文已经说完，收轮后又冒出一段，计时/用量从 0 重算。
+       现在统一走**与团队回归同构**的投递口径 `injectSessionNotice`：
+         · AI 空闲（mainRunning=false）⇒ 开一轮把结果带走（老板认可，保留）；
+         · AI 正忙 ⇒ 只入 inbox，下一次任何轮次开始前由 `drainBgNotices` 带给模型；
+       用户可见通知照发（`pushUserLine` → session-notice / noticeLog），与上面那段分工不变。 */
+    t.notified = true
     pushUserLine()
-    const q = pendingBgNotices.get(convId) || []
-    q.push({ text: note })
-    pendingBgNotices.set(convId, q.slice(-10))
-    sessionLog(convId, 'info', 'lifecycle', `${head}：${t.title}（已记为待办提示）`)
+    try {
+    /* ★1124v：**不加任何前缀** —— 前端段首横线只在 `noticeLabel` 非空时才画
+       （`INJECT_MARKERS` 里 `bg_resume` 的 label 本来就是空的，就是这个道理）。
+       前缀一加，对话流里就多一条「后台任务通知」横线（老板截图否掉的那条）。
+       模型照样看得懂正文（`后台任务完成：…`），用户看的是那一行 `session-notice` 小字。 */
+      /* ★1126 纠偏（**1124v 那步把 bug 引回来了**）：前缀不是"装饰"，它是 `isInjectedUserMsg` 的
+         **身份判据** —— 删掉它，这条消息就认不出是注入，走普通 user 分支落盘 ⇒ 前端画成
+         用户气泡（老板实测：视频任务完成后多出一条蓝色"用户消息"）。
+         而 `_inject` 的补写又发生在 `if (isInjectedUserMsg(msg))` **内部** ⇒ 靠它进门、进门才补它，死锁。
+         ⇒ 前缀必须保留（身份），横线由 `INJECT_MARKERS` 的 label 控制（已把 bg_notice 的 label 置空，
+         前端"无标签无头像 ⇒ 不画段首"，效果与 1124v 想要的一致，但身份不再丢）。 */
+      injectSessionNotice(convId, `【后台任务通知】${note}`)
+      sessionLog(convId, 'info', 'lifecycle',
+        `${head}：${t.title}（已投递给模型：${(sessions.get(convId) as any)?.mainRunning === true ? '主 agent 正忙 → 就地喂进本轮，做完手头的事一并处理' : '空闲 → 开一轮'}）`)
+    } catch (e: any) {
+      const q = pendingBgNotices.get(convId) || []
+      q.push({ text: note })
+      pendingBgNotices.set(convId, q.slice(-10))
+      sessionLog(convId, 'warn', 'lifecycle', `${head}：${t.title}（投递失败转待办：${String(e?.message || e).slice(0, 120)}）`)
+    }
   })
 
   /* ★ 0922：AI 自约定的「后台回访」——到点把任务现状推回给 AI。
@@ -31468,9 +32875,9 @@ setBgNotifier((t) => {
       return
     }
     sessionLog(convId, 'info', 'lifecycle', `后台回访（LLM 裁决放行）：${verdict.reason}`)
-    /* ★0930（需求要求"别打断正在干活的 AI"）：回访不再 steer 插话 —— 优先交续跑链
-       （忙时挂起等本轮结束、空闲立即处理）；链关了/到限时忙则记待办、空闲才唤醒。 */
-    if (scheduleBgResume(convId, text, 'watch')) return
+    /* ★1124x（自动续跑已拆除）：这里原来先走 `scheduleBgResume`（忙时排队、本轮结束自动开新轮），
+       它一接管就直接 return ⇒ 后面的"忙进待办 / 关掉则不打扰 / 空闲开一轮"三条分支形同虚设。
+       现在删掉那一行，回访自己的三分支本来就已经是正确形态（忙→inbox、设置关→inbox、空闲→开一轮）。 */
     const agent = agents.get(convId)
     /* ★1020（活跃口径统一）：同上一处 —— 用 sessionAgentBusy() 判"在不在跑"，别只看文本流。 */
     const streaming = sessionAgentBusy(convId)
@@ -31503,10 +32910,11 @@ setBgNotifier((t) => {
     // 模型口径（0912）：按任务配置钉死；配置有问题就抛错，任务会被标 error 并把原因写进会话
     applyTaskModel(task, sessionId)
     // 与手打消息同一条路径 —— 结果自然落进会话，打开对话就能看到
-    const prefix = `[定时任务「${task.name}」· ${describeSchedule(task.schedule)}] `
+    /* ★1124y：任务标题是**给模型看的上下文**，不进 message（否则落盘/气泡里带着 `[定时任务「…」· 每天 09:00]`） */
+    const modelContext = `[定时任务「${task.name}」· ${describeSchedule(task.schedule)}] `
     /* ★0927 P0-1：定时任务**要本轮结果**才敢往下走（后面还要推通知）→ 忙时等空闲再发（blocking 语义不变）；
        等不到（超 10 分钟）自动转队列，消息不丢。 */
-    await runPromptCore(sessionId, { message: prefix + task.prompt, __busyPolicy: 'wait', source: 'notice' })
+    await runPromptCore(sessionId, { message: String(task.prompt || ''), modelContext, __busyPolicy: 'wait', source: 'notice' })
     /**
      * 执行完 → 按配置推结果到微信 / QQ 机器人。
      * 推送失败只记日志（在 notifyTaskResult 内部 catch），**不影响任务状态** ——

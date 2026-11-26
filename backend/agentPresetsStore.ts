@@ -25,6 +25,8 @@ interface AgentPresetFile {
   role: string
   /** 原装工具名清单 */
   tools?: string[]
+  /** Optional preset-owned command required before completing a native plan. */
+  requiredPlanCheck?: string
   /** 命名工具集：会话级构建的工具包（install=安装助手工具；preset-admin=预设管理工具） */
   toolsets?: string[]
   /** 可用技能引用清单（空=不限制，全部技能可用） */
@@ -99,6 +101,10 @@ const ALL_TOOLS = [
      存量预设里的旧成员名由 server.ts 的 TOOL_ALIAS 归一（勾任一旧成员=家族可用），功能不减。 */
   'notebook',
   'bg',
+  /* ★1126：生成图片。模型不在会话/成员里选，只在「设置 → 供应商 → 生成模型」配一次，全员共用 */
+  'image',
+  /* ★1126：生成视频（异步任务，提交即返回，跑在后台任务里） */
+  'video',
 
 ]
 
@@ -145,7 +151,7 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
     builtin: true, createdAt: 0,
   },
   {
-    id: 'standard', name: '标准模式', version: 18,
+    id: 'standard', name: '标准模式', version: 20,
 
     description: '功能完整的编码 Agent：文件编辑、命令执行、检索、记忆知识、联网、计划、子代理。',
     /* ★p3x（需求）：标准模式**不加 role 增量**。原文是「你是资深全栈工程师。先探索再修改…」，
@@ -159,16 +165,20 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
   },
   // ── 团队指挥官（内置第 5 预设：团队模式的主 agent；团队工具仅团队会话运行时挂载） ──
   {
-    id: 'team-lead', name: '团队指挥官', version: 27,   // ★h2x：role 追加「验收与编排纪律」（需求：团队纪律改到指挥官预设里）。bump 否则存量 preset.json 不刷新。前史 ★m1x：+ check_run（验收可真跑，仍禁 fs_write/fs_edit/run_command）；★1036-S3 补 sub_read
+    id: 'team-lead', name: '团队指挥官', version: 30,   // ★h2x：role 追加「验收与编排纪律」（需求：团队纪律改到指挥官预设里）。bump 否则存量 preset.json 不刷新。前史 ★m1x：+ check_run（验收可真跑，仍禁 fs_write/fs_edit/run_command）；★1036-S3 补 sub_read
 
     description: '团队模式主 agent：拆解任务、派发成员、追踪进度、审核产出、汇总答复。不亲自干活。',
     role: `职责：编排团队完成任务，不亲自执行成员职责内的工作。
 
 任务量级判断（第 1 步读完成员清单后先做）：
 - 任务不涉及工作区文件（咨询/问答）→ 直接回答，不进编排流程
-- **任何要动工作区文件的活（哪怕只改一个词/一处样式）→ 一律派给成员**。
-  你没有写文件/跑命令的工具（这是硬约束，不是建议）：只有 check_run 能跑验收命令、只看退出码（ok:true 才算过），改文件、跑任意命令依然做不到——想直接改也改不了。
-  只有一种例外：**你只是读**（读代码、搜符号、看历史）→ 自己用只读工具做，别为读一个文件去派活。
+- **任何要动工作区文件的活（哪怕只改一个词/一处样式、哪怕只是新建一个空文件）→ 一律派给成员**。
+  你没有 fs_write / fs_edit / run_command（这是硬约束，不是建议）。
+  ⚠️ **check_run 只用于验收**（跑测试/类型检查/构建，只拿退出码）：**绝不许**拿它当干活手段
+  （例如 \`cmd /c echo x> file\`、\`git commit\`、\`npm install\`）—— 那等于你自己干了活、又绕过了团队的验收与账本，
+  用户开团队模式就是为了让成员干这些。想改文件却改不了，正确的做法是**派给成员**，不是找后门。
+  只有一种例外：**你只是读/排查**（读代码、搜符号、看历史、回答技术问题、给方案建议）→ 自己用只读工具做，
+  别为读一个文件去派活。
 
 工作流程：
 1. 收到任务后先读团队成员清单（系统注入），理解每个成员的唯一职责，并按上面的判据判断任务量级
@@ -177,7 +187,7 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
    - **一个成员同时只干一件事**：同一成员的多条步骤会串行执行（他是同一个人）；想并行就派给不同成员。
      owner 必须与成员职责匹配，不要为凑数派给不相关成员
    - deps: [] 的步骤同批并行派发；有 deps 的等前置完成
-3. 派发：用 team_dispatch 派发成员（一次可派多个=并行）；派发前把 goal/plan 写入黑板
+3. 派发：用 team_v2_dispatch 派发成员（一次可派多个=并行）
    - **派发是异步的**：它立刻返回「已派出 N 项」，此刻成员还在跑。**就此收轮**（一两句告知用户即可），
      不要空等、不要马上去 bb_write 审核（成员没跑完，会被"步骤从未派发执行"拦住）、不要重复派发同一批
 4. 巡检：收到「【团队回归】」通知后重读黑板，检查计划是否需要调整（缺漏→补步骤补派发）；
@@ -226,7 +236,7 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
 【成员换段】
 - 成员会话会累积历史，旧任务的路径/报错/参数会留在压缩摘要里干扰当前判断。
 - 三个时机换段：上一阶段的活全部收尾、要派新阶段；该段已压缩 ≥2 次；明显换话题。
-- 用 team_dispatch 的 freshSession（与派活同一动作，后端在发任务前原子完成归档+新建+交接）。**不要在跑任务中途换**（成员绑在旧会话上，这一趟会断成两半）。`,
+- 用 team_v2_dispatch 的 freshSession（与派活同一动作，后端在发任务前原子完成归档+新建+交接）。**不要在跑任务中途换**（成员绑在旧会话上，这一趟会断成两半）。`,
     /* ★p3x（需求）：+ web_search / web_fetch / github_search —— 三个都是**只读**联网工具
        （不改文件、不跑命令），因此不违反「指挥官不自己干活」；该纪律禁的是 fs_write / run_command /
        schedule / settings_update（见 server.ts 的 COMMANDER_WRITE_TOOLS）。
@@ -235,14 +245,14 @@ const BUILTIN_PRESETS: AgentPresetFile[] = [
     tools: ['fs_read', 'fs_grep', 'list_dir', 'repo', 'memory', 'knowledge', 'notebook', 'plan_write', 'ask_user', 'use_skill', 'spawn_clone',
       'team_dispatch', 'member_tell', 'member_new_session', 'bb_goal', 'bb_write', 'bb_read', 'team_info', 'sub_read',
       'web_search', 'web_fetch', 'github_search',
-      'check_run'],   // 共 23 个（内置 11 + 团队 8 + 联网 3 + 验收 1）   // ★1036-S2（需求「指挥官彻底不自己干活」）：删 run_command / fs_write / git（能改能提交）；再删 history（它的 restore 能回滚文件=写操作）；保留 spawn_clone（分身是只读调研员，属于"读"）
+      'check_run', 'image', 'video'],   // 共 25 个（+ 生成图片/视频）（内置 11 + 团队 8 + 联网 3 + 验收 1）   // ★1036-S2（需求「指挥官彻底不自己干活」）：删 run_command / fs_write / git（能改能提交）；再删 history（它的 restore 能回滚文件=写操作）；保留 spawn_clone（分身是只读调研员，属于"读"）
     toolsets: [],
     builtin: true, createdAt: 0,
   },
   {
     // 0918：显示名「升级模式」→「改造模式」（按要求改）。id 保持 cordis 不变，避免存量会话/配置失联。
     //   ⚠️ 改内置预设内容必须同步 bump version，否则存量的 preset.json 不会刷新（先改内容再 bump 的顺序别反）。
-    id: 'cordis', name: '改造模式', version: 23,
+    id: 'cordis', name: '改造模式', version: 25,
 
     description: '理解并改造 NiusDream 项目本身：架构分析、功能开发、板块升级、Agent 预设与自定义工具创作。',
     role: `职责：既做项目开发，也做 Agent 预设与自定义工具创作。
@@ -305,6 +315,13 @@ export function validateAgentPreset(p: any): string | null {
   if (p.role.length > 20000) return 'role 过长（>20000 字符）'
   if (p.tools !== undefined && (!Array.isArray(p.tools) || p.tools.some(t => typeof t !== 'string' || !t.trim()))) return 'tools 必须是非空字符串数组'
   if (p.toolsets !== undefined && (!Array.isArray(p.toolsets) || p.toolsets.some(t => !VALID_TOOLSETS.includes(t)))) return `toolsets 只能是：${VALID_TOOLSETS.join(', ')}`
+  if (p.requiredPlanCheck !== undefined) {
+    if (typeof p.requiredPlanCheck !== 'string' || p.requiredPlanCheck.length > 1000 || /[\r\n\0]/.test(p.requiredPlanCheck)) return '验收命令必须为单行，最多 1000 字符'
+    if (p.requiredPlanCheck.trim()) {
+      if ((p.engine && p.engine !== 'native') || p.toolsets?.includes('install')) return '验收规则仅适用于原生工作预设'
+      if (p.tools && (!p.tools.includes('check_run') || !p.tools.includes('plan_write'))) return '使用验收规则时请保留「验收命令」和「写计划」工具'
+    }
+  }
   if (p.skills !== undefined && (!Array.isArray(p.skills) || p.skills.some(s => typeof s !== 'string' || !s.trim()))) return 'skills 必须是非空字符串数组'
   // MCP 总开关（④c）：布尔，缺省 true；旧 mcpServers 字段仅兼容读取（允许 [] 与字符串数组，不再参与挂载）
   if (p.mcp !== undefined && typeof p.mcp !== 'boolean') return 'mcp 必须是布尔值（true=启用 MCP / false=关闭）'
@@ -368,6 +385,7 @@ export function writeAgentPreset(input: AgentPresetFile): { ok: true; preset: Ag
     description: input.description.trim(),
     role: input.role,
     tools: Array.isArray(input.tools) ? input.tools : undefined,
+    requiredPlanCheck: input.requiredPlanCheck?.trim() || undefined,
     toolsets: Array.isArray(input.toolsets) ? input.toolsets : undefined,
     skills: Array.isArray(input.skills) ? input.skills : undefined,
     // 头像（0913）：非空字符串才写入；空串/未传 = 清除（回到默认头像）
@@ -433,22 +451,22 @@ const ROLE_PRESET_SEEDS: AgentPresetFile[] = [
     id: 'analyst', name: '需求分析师',
     description: '把想法整理成结构化需求文档：目标/功能清单/验收标准/边界。只做分析不做实现。',
     role: '只做需求分析，不做任何实现。把用户的想法整理成结构化需求文档（markdown）：① 项目目标 ② 功能清单（逐条，可验收）③ 明确不做的边界 ④ 验收标准。信息不足时列出待澄清问题。产出写入需求文档文件。',
-    tools: ['fs_read', 'fs_grep', 'fs_write', 'web_search', 'ask_user', 'project_note', 'repo', 'list_dir'],
-    builtin: false, createdAt: 0, version: 3,
+    tools: ['fs_read', 'fs_grep', 'fs_write', 'web_search', 'ask_user', 'project_note', 'repo', 'list_dir', 'image', 'video'],
+    builtin: false, createdAt: 0, version: 5,
   },
   {
     id: 'frontend-dev', name: '前端工程师',
     description: '只写前端：HTML/CSS/JS/Vue 页面与组件，遵循现有代码风格。不碰后端逻辑。',
     role: '只负责前端：页面结构、样式、交互（HTML/CSS/JS/Vue）。遵循项目现有代码风格与依赖；产出物写入指定目录；不写后端逻辑，不修改需求。完成后说明产出文件清单与查看方式。',
-    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'web_search', 'github_search', 'sub_plan', 'project_note', 'repo', 'list_dir'],
-    builtin: false, createdAt: 0, version: 3,
+    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'web_search', 'github_search', 'sub_plan', 'project_note', 'repo', 'list_dir', 'image', 'video'],
+    builtin: false, createdAt: 0, version: 5,
   },
   {
     id: 'backend-dev', name: '后端工程师',
     description: '只写服务端：Node/API/数据逻辑。不碰前端页面。',
     role: '只负责服务端：Node/API 设计/数据逻辑/接口实现。遵循项目现有代码风格；不碰前端页面，不修改需求。完成后说明接口清单与启动方式。',
-    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'web_search', 'sub_plan', 'project_note', 'repo', 'list_dir'],
-    builtin: false, createdAt: 0, version: 3,
+    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'web_search', 'sub_plan', 'project_note', 'repo', 'list_dir', 'image', 'video'],
+    builtin: false, createdAt: 0, version: 5,
   },
   {
     id: 'qa-tester', name: '测试工程师',
@@ -463,8 +481,8 @@ const ROLE_PRESET_SEEDS: AgentPresetFile[] = [
       '',
       '报告：用 fs_write 写成 md 文件（不要用 run_command 拼 echo/python 写文件），结构＝每条验收标准一行 PASS/FAIL + 跑的命令与退出码 + 问题描述与复现方式 + 未覆盖项（说明为什么没测）。',
     ].join('\n'),
-    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'check_run', 'web_search', 'sub_plan', 'project_note', 'repo', 'list_dir'],   // ★m1x：+ check_run（真跑验收，共 10 个）
-    builtin: false, createdAt: 0, version: 4,   // ★m1x：role 改「真测」+ check_run
+    tools: ['fs_read', 'fs_grep', 'fs_write', 'run_command', 'check_run', 'web_search', 'sub_plan', 'project_note', 'repo', 'list_dir', 'image'],   // ★m1x：+ check_run（真跑验收，共 10 个）+ image
+    builtin: false, createdAt: 0, version: 5,   // ★m1x：role 改「真测」+ check_run
   },
   /* ★1010（需求）：代码审计官收录为出厂角色预设 —— 与上面四个岗位同类（builtin:false：
      可编辑可删除、可入队），随包 seed，只对"该预设文件夹不存在"的新装生效，老用户手改不覆盖。 */
@@ -472,10 +490,10 @@ const ROLE_PRESET_SEEDS: AgentPresetFile[] = [
     id: 'code-auditor', name: '代码审计官',
     description: '调用阿里开源 OpenCodeReview（ocr）对代码库做结构化审计：确定性管道 + 审查 Agent，产出带行级定位的分级审计报告。适合：安全审计、上线前体检、陌生代码库摸底。',
     role: '专责用 OpenCodeReview（ocr，阿里开源的 AI 代码审计 CLI）对代码库做结构化审计。\n\n## 工具调用模板（run_command）\nocr 不随 NiusDream 分发，**先确认它在本机的实际位置，禁止假定写死路径**：\n① 探测：\`where.exe opencodereview\`，或看「设置 → 软件环境」里 ocr 的安装记录；\n② 探不到就停下来明确告诉用户「需要先安装 ocr」，不要猜路径硬试；\n③ 确认后按下列形态调用（三个环境变量缺一不可，否则报错/弹窗/找不到 git）：\n```\n$env:USERPROFILE=\'<ocr-home 实际路径>\'; $env:HOME=\'<同上>\'; $env:PATH=\'C:\\Program Files\\Git\\cmd;<node 所在目录>;\'+$env:PATH; <ocr 安装目录>\\node_modules\\@alibaba-group\\ocr-win32-x64\\bin\\opencodereview.exe scan --repo <目标仓库绝对路径> --path <相对路径，逗号分隔> --format json --audience agent -o <输出报告.json>\n```\n（HOME 指向 ocr-home 是配置隔离；PATH 注入 Git\\cmd 与 toolchain\\node 是因为 ocr 内部要喊 git、getkey 要喊 node）\n\n## 工作流程（不要跳步）\n1. **先侦察**：确认目标仓库路径与范围（用户指定，或问清楚）。\n2. **预览不烧 token**：先跑 `scan --preview --path <范围>` 看会选中哪些文件、排除哪些（too_large 自动排除属正常）。\n3. **分批扫描**：每批 ≤10 个文件（或一个小目录），必须带 `--max-tokens-budget 200000` 保险丝；超过 3 个文件的扫描**挂后台跑**（bg 工具），别在会话里干等。\n4. **读报告汇总**：报告 json 里 comments 每条含 path/start_line/end_line/severity/category/content/suggestion_code。按 **bug(high/medium) → maintainability → documentation** 的优先级汇总；low/documentation 可一句话带过。\n5. **落盘报告**：写一份 Markdown 审计报告到会话工作区 `_audit_<日期>.md`（分级清单：文件:行号、问题、影响、修复建议），并用 project_note 记一条摘要。\n\n## 纪律（硬规矩）\n- **只读不改**：审计阶段绝不修改目标代码；修复是另一步、必须用户拍板。\n- **绝不打印/记录 API key**（密钥由 getkey.cjs 动态解密，不落 ocr 配置文件）。\n- 每批扫描后**汇报 token 消耗**（summary.total_tokens）与用时。\n- ocr 报告说「发现 0 条」时如实汇报，**不要为了交差自己编问题**；它的风格是宁缺毋滥。\n- 会话很长时可用 `--resume <session-id>` 续跑（session id 在扫描输出里）。\n- 用户要求"审查某个 diff/改动"时改用 `ocr review`（diff 模式），全库摸底才用 `ocr scan`。',
-    tools: ["fs_read","fs_grep","fs_write","list_dir","run_command","project_note","ask_user"],
+    tools: ["fs_read","fs_grep","fs_write","list_dir","run_command","project_note","ask_user","image"],
     mcp: false,
     toolsets: ["ask-user"],
-    builtin: false, createdAt: 0, version: 1,
+    builtin: false, createdAt: 0, version: 2,
   },
 ]
 

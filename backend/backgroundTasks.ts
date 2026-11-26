@@ -31,10 +31,19 @@ import { resolveShellForCommand, writeTempCmdFile, writeTempPs1File, needsPsFile
 /* ★ 0922e：进程身份指纹工具（CIM + 2 秒容差）与「进程注册表」 */
 import { procStartStamp, sameStamp, snapshotProcesses } from './procIdentity.ts'
 import { procRegister, procEndByPid } from './processRegistry.ts'
+/* ★第十三轮：团队 V2 执行身份（开工边沿绑定 / 启动层取），带进进程 origin */
+import { teamAttemptOf } from './teamV2AttemptScope.ts'
+/* ★1126：视频生成任务（提交 → 轮询 → 下载成品），异步任务制，归这里管生命周期 */
+import { resolveMediaTarget, type ResolvedMediaTarget } from './mediaTools.ts'
+import { submitVideo, pollVideoOnce, downloadVideoTo } from './videoGen.ts'
+/* ★1126：视频成品也进画廊索引（第三类 tab） */
+import { addGalleryEntry } from './mediaGallery.ts'
 
 
 type BgStatus = 'background' | 'paused' | 'completed' | 'failed' | 'cancelled'
-type BgKind = 'command' | 'download'
+/* ★1126：`video` = 视频生成任务（上游异步任务制：提交拿 task_id → 轮询 → 下载成品）。
+   它不跑子进程、也不是直链下载，所以是独立的第三种 kind。 */
+type BgKind = 'command' | 'download' | 'video'
 
 interface BgStep { id: string; label: string; status: 'active' | 'done' | 'pending' }
 interface BgRecord {
@@ -73,6 +82,14 @@ export interface BgTask {
   /** 下载任务 */
   url?: string
   dest?: string
+  /** ★1126：视频任务的**上游任务 id**（task_xxx）。持久化 —— 重启后能显示"有个未完成的视频任务" */
+  videoTaskId?: string
+  /** ★1126：视频任务的原始 prompt（成品落盘后写进画廊索引，回顾时知道这条视频是怎么来的） */
+  videoPrompt?: string
+  /** ★1126：视频任务的落盘根目录（会话工作区绝对路径）。轮询器自己拼 screenshots/video-*.mp4 */
+  workDir?: string
+  /** ★1126：视频任务**连续查询失败次数**（网络抖动/网关 5xx 很常见，连续 5 次才判死） */
+  pollErrors?: number
   /** ★ 0922c-5：url 模式的**自定义请求头**（用于需要鉴权的直链）；随任务持久化 */
   headers?: Record<string, string>
   /** ★ 0922c-7（Q2）：AI 是否用 bg_note 自报过进度 —— 面板据此决定"画读条 / 显示一行灰字 / 只显示计时" */
@@ -150,8 +167,12 @@ function load(): void {
     const raw: any = r.data || {}
     const list: BgTask[] = Array.isArray(raw?.tasks) ? raw.tasks : []
     for (const t of list) {
-      // 上次进程退出时还在跑的 → 状态改「已中断」，别让 UI 一直转圈
-      if (t.status === 'background' || t.status === 'paused') {
+      /* ★1126：**视频任务不标"已中断"** —— 它的上游任务跑在服务端，本地重启不影响它。
+         保住 status='background' 和 videoTaskId，由 `resumeVideoPolls()` 重新接上轮询。
+         （其它类型（命令/下载）确实随进程一起死了，照旧标失败。） */
+      const resumableVideo = t.kind === 'video' && !!t.videoTaskId
+      if ((t.status === 'background' || t.status === 'paused') && !resumableVideo) {
+        // 上次进程退出时还在跑的 → 状态改「已中断」，别让 UI 一直转圈
         t.status = 'failed'
         t.error = '应用退出导致中断'
         t.finishedAt = t.finishedAt || Date.now()
@@ -494,8 +515,13 @@ async function runCommandTask(t: BgTask): Promise<void> {
     stampPidIdentity(t)
     trackTree(t)
     /* ★ 0922e：登记进「进程监控」注册表（AI 工具拉起的进程都该在那儿看得到）；
-       结束/停止时由 finish() 注销 —— 设计口径：只显示正在运行的，结束就消失。 */
-    procRegister(cp.pid as number, { exe, cmdline: t.command, cwd: t.cwd, origin: { tool: 'bg_start', conversationId: t.conversationId, label: t.title } })
+       结束/停止时由 finish() 注销 —— 设计口径：只显示正在运行的，结束就消失。
+       ★第十三轮：团队 V2 执行身份在启动层取（后台任务可能比这一轮活得久，
+       身份必须**在启动那一刻**就定下来，落库才有确切归属）。 */
+    {
+      const team = teamAttemptOf(t.conversationId)
+      procRegister(cp.pid as number, { exe, cmdline: t.command, cwd: t.cwd, origin: { tool: 'bg_start', conversationId: t.conversationId, label: t.title, ...(team ? { team } : {}) } })
+    }
     t.steps[0].status = 'done'
     t.steps[1].status = 'active'
     t.progress = { ...t.progress, note: '执行中…' }
@@ -602,6 +628,213 @@ function sanitizeHeaders(raw: any): { ok: boolean; headers?: Record<string, stri
     out[k] = v
   }
   return { ok: true, headers: out }
+}
+
+/* ══ ★1126：视频生成任务（异步任务制）══════════════════════════════════════
+   为什么不放在工具里同步等：上游实测 ~140 秒才出片，同步等会把整轮对话卡死
+   （AI 干不了别的、用户插不上话）。挂到 bg 任务后天然获得：
+     · 持久化（重启能显示"已中断"）
+     · 进度条（`progress.percent`，前端胶囊/面板已经在用）
+     · 完成通知（`finish()` → notifier → 会话内提示 + steer 通知派它的 AI）
+     · 前端 BgTaskPill / BgTaskModal —— **UI 零改动**
+   轮询节奏按业界口径（腾讯云/火山接入实践一致）：起步 10s，60s 后 20s，180s 后 30s。 */
+export interface BgStartVideoOpts {
+  prompt: string
+  conversationId: string
+  /** 成品落盘根目录（会话工作区绝对路径）；轮询器自己拼 `screenshots/video-*.mp4` */
+  workDir: string
+  spawnedByCall?: string
+  title?: string
+  /** 秒数 1~15 */
+  duration?: number
+  /** 画面比例（1:1 / 16:9 / 9:16 / 4:3 / 3:4 / 3:2 / 2:3 / 21:9 / 5:2） */
+  aspectRatio?: string
+  /** 分辨率（480p / 720p / 1080p） */
+  resolution?: string
+  /** ★1126：首帧图（图生视频）—— base64 dataURL */
+  image?: string
+}
+
+const videoTimers = new Map<string, NodeJS.Timeout>()
+
+function clearVideoTimer(bgId: string): void {
+  const tm = videoTimers.get(bgId)
+  if (tm) { clearTimeout(tm); videoTimers.delete(bgId) }
+}
+
+/** 退避：别固定 1 秒一次，纯属浪费配额 */
+function videoNextDelay(elapsedMs: number): number {
+  const s = elapsedMs / 1000
+  if (s < 60) return 10_000
+  if (s < 180) return 20_000
+  return 30_000
+}
+
+export function bgStartVideo(opts: BgStartVideoOpts): { ok: boolean; task?: BgTask; error?: string } {
+  load()
+  const prompt = String(opts.prompt || '').trim()
+  if (!prompt) return { ok: false, error: 'prompt 不能为空' }
+  const wd = String(opts.workDir || '').trim()
+  if (!wd) return { ok: false, error: '缺少工作区目录（workDir）' }
+  let target: ResolvedMediaTarget
+  try { target = resolveMediaTarget('video') } catch (e: any) { return { ok: false, error: String(e?.message || e) } }
+
+  const t: BgTask = {
+    task_id: nextId(),
+    title: opts.title || `视频：${prompt.slice(0, 22)}${prompt.length > 22 ? '…' : ''}`,
+    kind: 'video',
+    status: 'background',
+    conversationId: String(opts.conversationId || ''),
+    spawnedByCall: opts.spawnedByCall ? String(opts.spawnedByCall) : undefined,
+    createdAt: Date.now(),
+    workDir: wd,
+    videoPrompt: prompt,
+    steps: [
+      { id: 's1', label: '提交', status: 'active' },
+      { id: 's2', label: '生成', status: 'pending' },
+      { id: 's3', label: '下载', status: 'pending' },
+    ],
+    records: [],
+    output: [],
+    progress: { percent: 0, note: '提交中…' },
+    notified: false,
+  }
+  tasks.set(t.task_id, t)
+  persist()
+  emit(t)
+
+  const bgId = t.task_id
+  /* 提交异步做（1.7s）：工具立刻返回"已提交"，用户马上能继续聊 */
+  void (async () => {
+    try {
+      const sub = await submitVideo(target, {
+        prompt,
+        ...(opts.duration ? { duration: opts.duration } : {}),
+        ...(opts.aspectRatio ? { aspectRatio: opts.aspectRatio } : {}),
+        ...(opts.resolution ? { resolution: opts.resolution } : {}),
+        ...(opts.image ? { image: opts.image } : {}),
+      })
+      const cur = tasks.get(bgId)
+      if (!cur || cur.status !== 'background') return   // 提交期间被 stop 掉了
+      cur.videoTaskId = sub.taskId
+      cur.steps[0].status = 'done'
+      cur.steps[1].status = 'active'
+      pushRecord(cur, { kind: 'system', content: `已提交，上游任务 ${sub.taskId}` })
+      bgNote(bgId, '排队中…', 0)
+      scheduleVideoPoll(bgId, target, 8_000)            // 首查 8s（刚提交就去查必然是 0%，白跑一趟）
+    } catch (e: any) {
+      const cur = tasks.get(bgId)
+      if (cur) finish(cur, 'failed', undefined, String(e?.message || e))
+    }
+  })()
+
+  return { ok: true, task: t }
+}
+
+function scheduleVideoPoll(bgId: string, target: ResolvedMediaTarget, delayMs: number): void {
+  clearVideoTimer(bgId)
+  const tm = setTimeout(() => { void pollVideoTask(bgId, target) }, delayMs)
+  /* 定时器别阻止进程退出 */
+  if (typeof (tm as any).unref === 'function') (tm as any).unref()
+  videoTimers.set(bgId, tm)
+}
+
+async function pollVideoTask(bgId: string, target: ResolvedMediaTarget): Promise<void> {
+  const t = tasks.get(bgId)
+  if (!t || t.status !== 'background' || !t.videoTaskId) { clearVideoTimer(bgId); return }
+
+  let r
+  try {
+    r = await pollVideoOnce(target, t.videoTaskId)
+  } catch (e: any) {
+    /* 查询失败不判死（网络抖动/网关 5xx 很常见）：连续 5 次才认输 */
+    t.pollErrors = (t.pollErrors || 0) + 1
+    if (t.pollErrors >= 5) {
+      finish(t, 'failed', undefined, `查询状态连续失败：${String(e?.message || e)}`)
+      clearVideoTimer(bgId)
+      return
+    }
+    scheduleVideoPoll(bgId, target, 15_000)
+    return
+  }
+  t.pollErrors = 0
+  const cur = tasks.get(bgId)
+  if (!cur || cur.status !== 'background') { clearVideoTimer(bgId); return }
+
+  if (r.state === 'failed') {
+    finish(cur, 'failed', undefined, r.failReason || `上游返回 ${r.rawStatus}`)
+    clearVideoTimer(bgId)
+    return
+  }
+
+  if (r.state === 'success') {
+    if (!r.videoUrl) { finish(cur, 'failed', undefined, '任务成功但没给成品地址'); clearVideoTimer(bgId); return }
+    const rel = `screenshots/video-${Date.now()}.mp4`
+    const abs = path.join(cur.workDir!, rel)
+    cur.steps[1].status = 'done'
+    cur.steps[2].status = 'active'
+    bgNote(bgId, '下载成品…', 95)
+    try {
+      const { bytes } = await downloadVideoTo(target.proxyUrl, r.videoUrl, abs, (info) => {
+        /* ⚠️ 下载百分比**不能**直接写进 progress.percent —— 那会让进度条从 99% 掉回 6%（实测过，很难看）。
+           生成阶段已经到 95%，下载属于最后一段，固定 95% + 报已下字节即可。 */
+        bgNote(bgId, `下载中 ${(info.bytes / 1024 / 1024).toFixed(1)}MB`, 95)
+      })
+      const c = tasks.get(bgId); if (!c) return
+      c.dest = rel
+      c.url = r.videoUrl
+      pushRecord(c, { kind: 'system', content: `成品已保存：${rel}（${(bytes / 1024 / 1024).toFixed(2)}MB${r.duration ? `，${r.duration}s` : ''}）` })
+      /* ★1126：视频也进画廊索引（第三类）—— 不然画廊只看得到图，视频得去工作区翻 */
+      try {
+        addGalleryEntry({
+          shotRef: rel,
+          sessionId: c.conversationId || '',
+          prompt: c.videoPrompt || '',
+          model: '',
+          size: r.duration ? `${r.duration}s` : '',
+          ts: Date.now(),
+          kind: 'video',
+        })
+      } catch { /* 索引写失败不影响视频本身（文件已经在工作区） */ }
+      finish(c, 'completed', `视频已生成：${rel}`)
+    } catch (e: any) {
+      const c = tasks.get(bgId); if (!c) return
+      finish(c, 'failed', undefined, `下载成品失败：${String(e?.message || e)}`)
+    }
+    clearVideoTimer(bgId)
+    return
+  }
+
+  /* 还在跑：把上游百分比透给前端 —— 这是**真进度**（不像图片只能给不定态）。
+     ⚠️ 两个约束：
+     ① 钳到 90%：上游会一路走到 99%，而下载段固定 95%，不钳就会 99→95 倒退。
+     ② **note 里不再带百分比** —— 面板上进度条 + 数字已经在显示 `percent` 了，
+        文案再写一遍就是"两个进度"（老板实测截图：进度条 37% + 下面"37% · 生成中 37%"）。 */
+  const pct = r.percent != null ? Math.min(90, r.percent) : undefined
+  bgNote(bgId, '生成中', pct)
+  scheduleVideoPoll(bgId, target, videoNextDelay(Date.now() - cur.createdAt))
+}
+
+/** ★1126：**重启后续跑视频任务** —— 上游任务在服务端跑着，本地进程死了不等于任务死了。
+ *  由 server 在 providers 加载完之后调一次（这里要解析视频模型配置，不能放在 load 里自调）。
+ *  对每个 kind='video'、status='background'、有 videoTaskId 的任务重新挂上轮询定时器。 */
+export function resumeVideoPolls(): { resumed: number; skipped: number } {
+  load()
+  let resumed = 0
+  let skipped = 0
+  let target: ResolvedMediaTarget | null = null
+  try { target = resolveMediaTarget('video') } catch { target = null }
+  for (const t of tasks.values()) {
+    if (t.kind !== 'video' || t.status !== 'background' || !t.videoTaskId) continue
+    if (!target) { skipped++; continue }
+    /* 首查给 3 秒：应用刚起，别跟启动抢带宽 */
+    scheduleVideoPoll(t.task_id, target, 3_000)
+    pushRecord(t, { kind: 'system', content: '应用重启，已重新接上这个视频任务的进度' })
+    resumed++
+  }
+  if (resumed) { persist(); console.log(`[bg] 已恢复 ${resumed} 个视频任务的轮询`) }
+  if (skipped) console.warn(`[bg] ${skipped} 个视频任务因未配置视频模型无法续跑`)
+  return { resumed, skipped }
 }
 
 function httpGet(url: string, redirects = 0, headers?: Record<string, string>): Promise<http.IncomingMessage> {

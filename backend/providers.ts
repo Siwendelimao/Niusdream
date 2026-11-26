@@ -673,9 +673,15 @@ interface ModelCaps {
 const REASONING_NAME_RE = /o[1-9]|o3|o4|r1|reasoner|k2|think|thinking|z1|glm-z1|deepseek-reasoner|glm-5|glm-4\.7|glm-4-plus|step-2|kimi-k|qwq|moonshot-reasoner|claude-sonnet-4|claude-opus-4/i
 /** 视觉模型名兜底表（与前端 stores/providers.autoDetectCaps 的 image 推断同源；无 capabilities 的新模型才会走到） */
 const VISION_NAME_RE = /(mimo|vl|vision|omni|multimodal|gpt-4o|gpt-4\.1|gpt-5|grok|gemini|claude-3|claude-sonnet|claude-opus|glm-4v|glm-4\.\d+v|glm-5v|qwen-vl|qwen2?-vl|hunyuan-vision|ernie-4|step-1v|step-2v|kimi-vl|deepseek-vl|mini-cpm-v|llava|yi-vl|internvl|phi-4-multimodal|paligemma|seed-vl)/i
-/** 纯生图/视频/语音（输出模态推断）：命中则 chatEligible=false */
-const GEN_IMAGE_RE = /^(gpt-image|dall-e|dall3|flux|stable-diffusion|sdxl|midjourney|agnes-image|imagen|nano-banana)/i
-const GEN_VIDEO_RE = /(kling|runway|sora|veo-|pika|luma|hailuo|seedance|wan-|vidu|gen-3|ray2)/i
+/** 纯生图/视频/语音（输出模态推断）：命中则 chatEligible=false
+ *  ★ 1126：**去掉了 `^` 锚头**——中转站/聚合平台的模型 id 带供应商前缀
+ *  （`openai/gpt-image-1`、`bytedance-seed/seedream-4.5`、`gemini-3.1-flash-image-c`），
+ *  锚开头必然漏判，而这些漏判在"按类型分组/会话选模型"落地后会直接变成 400。
+ *  改子串匹配后必须防误伤：都是"生图专有词"，不会命中普通聊天模型。 */
+const GEN_IMAGE_RE = /(gpt-image|dall-e|dall3|flux|stable-diffusion|sdxl|midjourney|agnes-image|imagen|nano-banana|seedream|kolors|qwen-image|cogview|grok.*image|gemini\S*image|hunyuan-image|doubao-image|wanx)/i
+/* ★1126：视频模型名识别。**必须含 `video` 本身** —— 之前漏了，导致 `grok-imagine-video-1.5`
+   一条都匹配不上（它既不在 kling/sora 名单里，也不含 veo-），于是被当成文本模型。 */
+const GEN_VIDEO_RE = /(video|kling|runway|sora|veo-|pika|luma|hailuo|seedance|wan-|vidu|gen-3|ray2)/i
 const GEN_AUDIO_RE = /(tts|whisper|cosyvoice|suno|elevenlabs|paraformer|speech-|fish-speech)/i
 
 /** 解析某模型有效能力：显式三轴 > providers.json 已存 capabilities（手写=最高，含 LongCat）
@@ -702,12 +708,33 @@ export function resolveModelCaps(providerId: string, modelId: string): ModelCaps
   let output: string[]
   if (m?.outputModalities?.length) output = m.outputModalities
   else if (dev && dev.output.length) output = dev.output
-  else if (GEN_IMAGE_RE.test(modelId || '')) output = ['image']
+  /* ★1126：**视频必须排在生图前面** —— `GEN_IMAGE_RE` 里有 `grok.*image`，
+     `grok-imagine-video-1.5` 会被它先命中、判成生图。 */
   else if (GEN_VIDEO_RE.test(modelId || '')) output = ['video']
+  else if (GEN_IMAGE_RE.test(modelId || '')) output = ['image']
   else if (GEN_AUDIO_RE.test(modelId || '')) output = ['audio']
   else if (hasCapArr) output = arr!.includes('text') ? ['text'] : arr!.includes('image') ? ['image'] : ['text']
   else output = ['text']
   return { input: vision ? ['text', 'image'] : ['text'], reasoning, vision, output }
+}
+
+/** ── ★1126：模型用途分类（**后端唯一源**，前端只读 `kind`，不许自己再推一遍）──
+ *  为什么单列一个单值：`output` 是数组（能力描述），而 UI/闸门要的是"归哪一栏"，
+ *  这个映射是语义决策，必须只发生在一个地方。历史上前端 stores/providers.ts 的 modelType()
+ *  自己推了一份，与这里的数据源不同（前端没有 models.dev 快照、正则也不一致）→ 两份真相必然漂移。
+ *  规则：output 含 text = 能当聊天模型（多模态也归 text，它本来就能聊）；
+ *       纯 video > 纯 audio > 纯 image；无信息按 text（与 resolveModelCaps 的默认一致）。 */
+export type ModelKind = 'text' | 'image' | 'video' | 'audio'
+/** 输出模态数组 → 用途分类。**全站唯一映射**（resolveModelKind 与"获取模型"候选清单共用）。 */
+export function kindOfOutput(output: string[]): ModelKind {
+  if (output.includes('text')) return 'text'
+  if (output.includes('video')) return 'video'
+  if (output.includes('audio')) return 'audio'
+  if (output.includes('image')) return 'image'
+  return 'text'
+}
+export function resolveModelKind(providerId: string, modelId: string): ModelKind {
+  return kindOfOutput(resolveModelCaps(providerId, modelId).output)
 }
 
 
@@ -779,6 +806,9 @@ interface SuggestedCaps {
   reasoning: boolean
   input: string[]
   output: string[]
+  /** ★1126：用途分类（与 providers.list 的模型 kind 同一口径）—— 前端「获取模型」弹窗
+   *  直接按它分组显示，不再自己从 output 数组推一遍。 */
+  kind: 'text' | 'image' | 'video' | 'audio'
   context?: number
   /** 0917：models.dev 的真实输出上限（弹窗保存时带入 ProviderModel.maxOutput，空=未查到） */
   maxOutput?: number
@@ -809,7 +839,7 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
     if (existing && ((existing.inputModalities) || (existing.supports) || (arr && arr.length))) {
       const c = resolveModelCaps(providerId, id) // manual：直接取权威解析
       return {
-        id, vision: c.vision, reasoning: c.reasoning, input: c.input, output: c.output,
+        id, vision: c.vision, reasoning: c.reasoning, input: c.input, output: c.output, kind: kindOfOutput(c.output),
         // 已存手写最高；没存到就用网关真值补上
         context: existing.maxContext || gwCtx || undefined,
         maxOutput: existing.maxOutput || gwOut || undefined,
@@ -826,6 +856,7 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
         reasoning: !!dev.reasoning,
         input: dev.input.length ? dev.input : ['text'],
         output: dev.output.length ? dev.output : ['text'],
+        kind: kindOfOutput(dev.output.length ? dev.output : ['text']),
         // 网关值优先（实测更准）
         context: gwCtx || dev.context,
         maxOutput: gwOut || dev.maxOutput,
@@ -834,12 +865,18 @@ function suggestCapsForIds(providerId: string, ids: string[], gw?: Record<string
         free,
       }
     }
+    /* ★1126：推断分支同样要**先视频后生图**（`grok.*image` 会抢走 grok-imagine-video） */
+    const inferredOut = GEN_VIDEO_RE.test(id) ? ['video']
+      : GEN_IMAGE_RE.test(id) ? ['image']
+      : GEN_AUDIO_RE.test(id) ? ['audio']
+      : ['text']
     return {
       id,
       vision: VISION_NAME_RE.test(id),
       reasoning: REASONING_NAME_RE.test(id),
       input: VISION_NAME_RE.test(id) ? ['text', 'image'] : ['text'],
-      output: GEN_IMAGE_RE.test(id) ? ['image'] : ['text'],
+      output: inferredOut,
+      kind: kindOfOutput(inferredOut),
       context: gwCtx || undefined,
       maxOutput: gwOut || undefined,
       source: 'inferred' as const,

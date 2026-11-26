@@ -13,13 +13,19 @@ import { spawnSync } from 'node:child_process'
 
 export const PS_EXE = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 
+/** 显式声明"探活能力不可用"（`NIS_PROC_STAMP_PROBE=off`）。
+ *  有真实用途：某些环境 PowerShell 被策略禁用 / 被裁掉，这时**必须**让调用方知道
+ *  "查不了"而不是"查了、查无此进程"。两者天差地别：后者会让围栏误判解除、放下一单开工。 */
+const PROBE_DISABLED = String(process.env.NIS_PROC_STAMP_PROBE || '').trim().toLowerCase() === 'off'
+
 /** 读某进程的创建时间（ToFileTimeUtc 字符串）。
- *  返回：非空串=指纹；''=确实查无此进程；null=**查询失败/参数非法**（证明不了身份，调用方必须按"不确定"处理）。
+ *  返回：非空串=指纹；''=确实查无此进程；null=**查询失败/参数非法/探活被显式关闭**（证明不了身份，调用方必须按"不确定"处理）。
  *  ★1003 安全批 4.26/4.27：① pid 是运行时值（TS 类型擦除后无人拦），原来直接拼进 PowerShell
  *  -Filter 字符串 = 命令注入面（`1'; Remove-Item …` 可逃逸）——先验正整数再用；
  *  ② 查询失败（PowerShell 超时/异常/非零退出）原来被吞成 '' ⇒ 调用方把"查失败"当"进程不存在"
  *  （活进程被注销+报成功）——现在分开回 null。 */
 export function procStartStamp(pid: number): string | null {
+  if (PROBE_DISABLED) return null
   if (!Number.isInteger(pid) || pid <= 0) return null
   try {
     const r = spawnSync(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',

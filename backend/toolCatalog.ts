@@ -68,27 +68,34 @@ export const TOOL_CATALOG: ToolRegistryEntry[] = [
   { name: 'memory', label: '记忆', description: '记忆工具箱：action=search 检索 / store 写入（归 category）/ delete 删除 / distill 蒸馏整理', group: '记忆', variant: 'search', tab: 'special' },
   { name: 'knowledge', label: '知识库', description: '知识库工具箱：action=query 查询（附现有分类）/ add 添加（先判断 entry_type 与分类）/ delete 删除', group: '知识库', variant: 'search', tab: 'special' },
   { name: 'notebook', label: '便签', description: '便签工具箱：action=list 读（接活前先看）/ add 记一条（先查重）/ update 改状态详情 / delete 删条目', group: '便签', variant: 'write', tab: 'special' },
+  /* ★1126：生成图片。**工具唯一事实源必须登记**（漏了会怎样：预设编辑器勾不到、工具页看不到、
+     AI 会话里被严格白名单裁掉 —— 三条全中，老板实测"工具面板里找不到"就是这个原因）。
+     group 单开「生成」：将来 video / audio 也归这里，不跟"特殊工具"混。
+     risky=true：按张计费，执行弹审批卡（server.ts assessRisk 的 image 分支）。 */
+  { name: 'image', label: '生成图片', description: '生成一张图片（文生图）。模型在「设置 → 供应商 → 生成模型」里配一次，全员共用；只在用户明确要求出图时调用', group: '生成', variant: 'others', tab: 'special', risky: true },
+  /* ★1126：生成视频 —— **异步**：提交即返回，跑在后台任务里（进度/完成通知走 bg 那套） */
+  { name: 'video', label: '生成视频', description: '生成一段视频（文生视频）。**提交后立刻返回**，实际生成跑在后台任务里（约 2~3 分钟，带真实进度），完成后自动通知', group: '生成', variant: 'others', tab: 'special', risky: true },
   // ── 联网（webTools.ts）──
   { name: 'web_search', label: '网页搜索', description: '联网搜索', group: '联网', variant: 'search', tab: 'system' },
   { name: 'web_fetch', label: '网页抓取', description: '抓取网页内容', group: '联网', variant: 'read', tab: 'system' },
   { name: 'github_search', label: 'GitHub 搜索', description: 'GitHub 代码/仓库搜索', group: '联网', variant: 'search', tab: 'system' },
   // ── 技能 ──
   { name: 'use_skill', label: '使用技能', description: '加载已安装技能（SKILL.md）的完整指令', group: '技能', variant: 'others', tab: 'system' },
-  // ── 团队（绑团队会话且主预设=团队指挥官时自动挂载；预设勾选不生效）──
-  { name: 'team_dispatch', label: '派发任务', description: '派发任务单给团队成员（数组+deps 依赖硬校验；stepId 可省、计划里没有会自动补建；打回≤2）', group: '团队', variant: 'others', tab: 'system', gating: 'team' },
-  { name: 'member_tell', label: '给成员补充', description: '给正在执行某一步的成员追加补充/修正（插话，不重派、不打断）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
-  { name: 'member_new_session', label: '给成员开新对话', description: '给成员换新窗口并交交接（旧段归档，只查不续）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
-  /* ★ 0925v（需求的"分身"功能）：非团队模式派 1~3 个自己并行干活（气泡/过程回放与团队成员同款）
-   * ★ 0925x（用户定）：派分身必弹权限申请 —— 批准后分身内部免审畅通（分身工具箱已圈安全区） */
-  { name: 'spawn_clone', label: '派出分身', description: '派出 1~3 个自己的分身并行执行子任务（同步等待完成后返回产出摘要）', group: '团队', variant: 'others', tab: 'system', risky: true },
-  { name: 'bb_goal', label: '写黑板目标', description: '写黑板：目标+计划步骤（owner/deps），同步用户计划卡', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
-  { name: 'bb_write', label: '写黑板', description: '写黑板：审核 done/打回 rejected（带 feedback）、发现、最终汇总', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
-  { name: 'bb_read', label: '读黑板', description: '读黑板快照（目标/计划进度/发现/汇总）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
-  /* ★1036-S3：指挥官读「某次执行的过程 + 用户与该成员的单聊」（只读） */
-  { name: 'sub_read', label: '读执行详情', description: '读某个成员/某次执行的过程与单聊记录（只读）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
-  { name: 'team_info', label: '读团队信息', description: '读团队成员清单（id/职责/工具/模型）', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
+  // ── 团队 V2（★1124：V1 的 team_dispatch / bb_* / member_* / sub_read / team_info / sub_plan 已随 V1 运行链拆除，
+  //    目录必须同步换成 V2 九件 —— 否则工具面板显示的是**运行时已经不存在的工具**，用户会以为没接线）──
+  { name: 'team_v2_dispatch', label: '团队收单并派发', description: '把用户明确要求的活收成需求单并派给成员，可随单声明 after / dependsOn 依赖', group: '团队', variant: 'others', tab: 'system', gating: 'team' },
+  { name: 'team_v2_status', label: '查看团队进度', description: '只读账本里的阶段，不派工、不复验', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
+  { name: 'team_v2_review', label: '复验需求单', description: '独立复验（C）只产出意见，**不改变需求单状态**', group: '团队', variant: 'read', tab: 'system', gating: 'team' },
+  { name: 'team_v2_revise', label: '修改需求要求', description: '追加或修改需求的要求与验收（排队/执行中的先结算再改）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_rework', label: '返工重派', description: '同一需求单开新尝试，不新增顶层需求', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_retry', label: '重试中断的执行', description: '先按 OS 事实确认旧进程已退出，再把中断项判失败并放行队列', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_cancel', label: '取消需求', description: '排队中的立即取消；运行中的先真停执行器再标已取消', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_note', label: '给需求补充信息', description: '给正在执行的需求按顺序插话（不改验收/范围）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_depend', label: '设置需求依赖', description: '前置验收通过后后置才开工；自依赖/成环会被拒', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  { name: 'team_v2_accept', label: '按用户原话验收', description: '用户口头表态（通过/打回）后落成需求单状态；quote 必须逐字引用用户那句话', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
+  /* ★ 0925v（"分身"功能）：非团队模式派 1~3 个只读分身并行查证（分身工具是硬白名单：不能跑命令、不能改文件） */
+  { name: 'spawn_clone', label: '派出分身', description: '派出 1~3 个只读分身并行查证子任务（同步等待完成后返回摘要）', group: '团队', variant: 'others', tab: 'system', risky: true },
   { name: 'project_note', label: '写项目档案', description: '维护工作区根的项目档案（NIS-notes.md）：项目约定/当前进度/决策记录/产物清单——让同项目的其他窗口了解项目背景与进度', group: '交互', variant: 'write', tab: 'system' },  // ★1010-E（已定案）：从「记忆」组挪到「交互」——"记忆"留给记忆库（memory），消除系统/特殊两个 tab 都出现"记忆"分组的疑惑
-  { name: 'sub_plan', label: '成员自列执行计划', description: '团队成员自列子任务清单（3~12 条），逐条推进并更新完成状态（只进自己的执行气泡，不动会话计划卡）', group: '团队', variant: 'write', tab: 'system', gating: 'team' },
   // ── 安装助手（toolsets: install 会话才有）──
   { name: 'install_skill', label: '安装技能', description: '安装技能包（git URL/本地目录 → backend/skills，含查重）', group: '特殊工具', variant: 'bash', tab: 'special', gating: 'toolset:install' },
   { name: 'uninstall_skill', label: '卸载技能', description: '卸载已安装的技能', group: '特殊工具', variant: 'delete', tab: 'special', gating: 'toolset:install' },

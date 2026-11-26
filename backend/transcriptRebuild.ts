@@ -112,7 +112,8 @@ export function rebuildTranscriptFromMessages(messages: any[], sysText?: string)
          也让下游块有 msgId 可用（缺 id 会触发 toBlocksOf 的留痕告警）。 */
       const _sid = String(m.id || '')
       if (_sid) segNo++
-      out.push({ role: 'assistant', content: cur, ...(_sid ? { id: _sid + '#' + segNo } : {}), ...(m.timestamp ? { timestamp: Number(m.timestamp) } : {}) })
+      const model = typeof m.model === 'string' && m.model ? { model: m.model } : {}
+      out.push({ role: 'assistant', content: cur, ...model, ...(_sid ? { id: _sid + '#' + segNo } : {}), ...(m.timestamp ? { timestamp: Number(m.timestamp) } : {}) })
       cur = []
     }
 

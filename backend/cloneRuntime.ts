@@ -58,9 +58,13 @@ export function cancelClones(sessionId: string): void {
 }
 
 // The safety boundary is enforced here, independently of member presets/tools.
-const READ_TOOLS = new Set(['fs_read', 'fs_grep', 'list_dir', 'web_search', 'web_fetch', 'github_search', 'use_skill'])
+/* ★1124：导出只为一个原因 —— 让单测能锁住"分身工具集里不许出现拉进程/写盘类工具"。
+   这条边界原先只能靠人读这行代码保证；将来谁往白名单里加 run_command，没有东西会拦。 */
+export const CLONE_READ_TOOLS = ['fs_read', 'fs_grep', 'list_dir', 'web_search', 'web_fetch', 'github_search', 'use_skill'] as const
+const READ_TOOLS = new Set<string>(CLONE_READ_TOOLS)
 const READ_ACTIONS: Record<string, string[]> = { repo: ['map', 'search'], memory: ['search'], knowledge: ['query'] }
-function readTools(tools: AgentTool<any>[]): AgentTool<any>[] {
+export const CLONE_READ_ACTIONS: Readonly<Record<string, readonly string[]>> = READ_ACTIONS
+export function readTools(tools: AgentTool<any>[]): AgentTool<any>[] {
   return tools.filter(t => READ_TOOLS.has(t.name) || t.name in READ_ACTIONS).map(t => {
     const allowed = READ_ACTIONS[t.name]
     if (!allowed) return t

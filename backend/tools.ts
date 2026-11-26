@@ -20,8 +20,13 @@ import { execFile } from 'node:child_process'
 import type { AgentTool } from './agentCompat.ts'
 import { snapshotFile, snapshotTree, markAfterContent, listChanges, changeStatus, restoreChange, historyStats, diffStat } from './fileHistory.ts'
 import { createTask, listTasks, updateTask, removeTask, runTaskNow, describeSchedule } from './scheduledTasks.ts'
+/* ★1126：视频生成挂到后台任务（异步任务制，不阻塞对话） */
+import { bgStartVideo } from './backgroundTasks.ts'
 import { acquireFileWrite, fileLockDenyMessage } from './fileLocks.ts'
 import { DATA_ROOT } from './paths.ts'
+/* ★1126：生图工具（配置在 mediaTools、适配器在 imageGen） */
+import { resolveMediaTarget, type ResolvedMediaTarget } from './mediaTools.ts'
+import { generateImage, editImage } from './imageGen.ts'
 /* ★1016 s1：只读类工具的「允许根」判定（工作区外可读/可列；写工具不改） */
 import { isReadablePath, readRootsDenyMessage } from './readRoots.ts'
 /* ★ 1001 修复（0930b 遗留）：git 族工具走 `gitExe()` 绝对路径解析，但本文件**漏了这行 import**
@@ -35,7 +40,9 @@ import { PROJECT_NOTE_FILE, NOTE_SECTIONS, buildNoteDigest, readNoteSection } fr
 /* 0920：后台任务（挂后台 / 查进度 / 读输出 / 停）—— 实现在 backgroundTasks.ts */
 import { bgStartCommand, bgStartDownload, bgReadOutput, bgStop, bgSummaryForModel, bgWatch, bgNote, bgSuggestWatchSec } from './backgroundTasks.ts'
 /* ★ 0922e：进程监控 —— 前台命令也要登记（面板里看得见 + 能停） */
-import { procRegister, procEndByPid } from './processRegistry.ts'
+import { procRegister, procEndByPid, procIntentBegin, procIntentEnd } from './processRegistry.ts'
+/* ★第十三轮：团队 V2 执行身份（开工边沿绑定 / 工具启动层取），带进进程 origin */
+import { teamAttemptOf } from './teamV2AttemptScope.ts'
 
 /** 文件写锁上下文（0911 反馈③）：成员 run 传入 { owner: runId, label: 成员名 }；
  *  主 agent 与其它场景不传 = 完全不参与锁（零影响）。 */
@@ -940,7 +947,13 @@ function runCommand(cwd: string, command: string, timeoutMs: number, meta?: RunM
     }
     /* ★ 1010-C：node -e 落盘走直跑（exe/argv 已在上面备好），完全绕开 shell 引号层 */
     if (direct) { exe = direct.exe; argv = [direct.arg] }
-    const cp = execFile(
+    /* ★1124：**先落启动意图，再起进程**。团队执行时账本立刻多一行（pid 未知）；
+       后端在这之后、拿到 pid 之前被 SIGKILL，重启后这条意图就是"未知副作用"的证据，
+       `drained` / `confirmRecovery` 都会因此不放行 —— 不再出现"没记上 pid = 没有残留"。
+       `execFile` 同步抛错（参数非法这类）时把意图撤回，不留脏行。 */
+    const team = teamAttemptOf(meta?.conversationId)
+    const intentToken = procIntentBegin({ tool: meta?.tool || 'run_command', conversationId: meta?.conversationId, projectId: meta?.projectId, label: command, ...(team ? { team } : {}) })
+    const cp = (() => { try { return execFile(
       exe,
       argv,
       {
@@ -958,8 +971,9 @@ function runCommand(cwd: string, command: string, timeoutMs: number, meta?: RunM
         windowsVerbatimArguments: isWin && /cmd\.exe$/i.test(exe),
       },
       (err: any, stdoutRaw: any, stderrRaw: any) => {
-        /* ★ 0922e：命令跑完（成功/失败/超时）→ 从「进程监控」移除 */
+        /* ★ 0922e：命令跑完（成功/失败/超时）→ 从「进程监控」移除；★1124：启动意图随之作废 */
         procEndByPid(cp.pid as number)
+        procIntentEnd(intentToken)
         cleanup?.()
         const stdout = decodeOutput(Buffer.isBuffer(stdoutRaw) ? stdoutRaw : Buffer.from(String(stdoutRaw ?? '')))
         const stderr = decodeOutput(Buffer.isBuffer(stderrRaw) ? stderrRaw : Buffer.from(String(stderrRaw ?? '')))
@@ -969,9 +983,15 @@ function runCommand(cwd: string, command: string, timeoutMs: number, meta?: RunM
         }
         resolve({ stdout, stderr, code: 0, shell: shellLabel })
       },
-    )
-    /* ★ 0922e：登记进「进程监控」注册表（结束/失败时在回调里注销） */
-procRegister(cp.pid as number, { exe, cmdline: command, cwd, origin: { tool: meta?.tool || 'run_command', conversationId: meta?.conversationId, projectId: meta?.projectId, label: command } })
+    ) } catch (error) { procIntentEnd(intentToken); throw error } })()
+    /* ★ 0922e：登记进「进程监控」注册表（结束/失败时在回调里注销）
+       ★第十三轮：**执行身份就在启动层取**（`teamAttemptOf`）—— 这一轮属于哪条 attempt
+       由开工边沿绑定好了，这里原样带进 origin，落库不再靠"成员 ID 反推当前 running"。
+       ★1124：身份在**起进程之前**就要用一次 —— 先落"启动意图"（pid 未知）再 `spawn()`，
+       把"进程已起、pid 还没进账本"这段同步代码的崩溃窗口彻底消灭（账本里有意图行，
+       重启后按"已知有进程、pid 未知"挡住，而不是当成没有残留）。非团队执行返回 null，零影响。
+       意图的 begin 在 `execFile` 之前，见上面的 `intentToken`。 */
+procRegister(cp.pid as number, { exe, cmdline: command, cwd, origin: { tool: meta?.tool || 'run_command', conversationId: meta?.conversationId, projectId: meta?.projectId, label: command, ...(team ? { team } : {}), ...(intentToken ? { intentToken } : {}) } })
 /* ★0930 修（实测"点停止分身还在跑命令，根本停不掉"）：**中止信号 = 立即树杀命令进程** ——
    工具 execute 本来就收 pi 的 AbortSignal（第 3 参），此前一直忽略（`_signal`）⇒
    点停止只断了 LLM 流，正在跑的命令子进程活到自然结束（2~5 分钟循环实测）。
@@ -1603,12 +1623,26 @@ export function buildScheduleTools(convId: string, readResult?: ScheduleResultRe
     },
     {
       name: 'schedule_list', label: '定时任务列表',
-      description: '列出全部定时任务（周期/下次时间/最近状态）。',
+      description: '列出全部定时任务（含身份：自跑/值守、投递位置、下次执行、上次执行、运行状态）。'
+        + '看某任务"今天跑没跑"看「上次执行」+ 状态，别只看「下次执行」。',
       parameters: Type.Object({}),
       async execute() {
         const rows = listTasks()
         if (!rows.length) return { content: [{ type: 'text', text: '（还没有定时任务）' }], details: { count: 0 } }
-        const lines = rows.map(t => `${t.id}「${t.name}」${describeSchedule(t.schedule)}｜下次 ${t.nextRunAt ? new Date(t.nextRunAt).toLocaleString('zh-CN', { hour12: false }) : '—'}｜${t.enabled ? '启用' : '停用'}｜已跑 ${t.runCount} 次${t.lastStatus ? '｜最近 ' + t.lastStatus : ''}`)
+        /* ★1120：列表必须把「身份」和「上次执行」写出来 —— 原来只有「下次执行」，两处信息缺口都踩过坑：
+           ① 没有值守标记 ⇒ 执行层 AI 看到"每天跑、也往对话里说话"的值守任务，误判成"重复任务"、
+              建议停用（2026-11-23 实测事故，差点把值守停掉）。watch / targetSessionId 本来就在
+              ScheduledTask 里，只是没输出 ⇒ 把事实给全，模型自然不会再猜。
+           ② 只有下次执行 ⇒ 每天任务的"下次"永远是明天，看列表**永远不知道今天跑没跑**
+              （老板 11-20 反馈"今天的巡检是不是又没触发"就是这个）。lastRunAt 是权威判据。 */
+        const fmtTs = (ts?: number) => (ts && ts > 0 ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '从未')
+        const whereOf = (t: any) => {
+          const target = String(t.targetSessionId || 'own')
+          const to = target === 'own' ? '任务会话' : target === 'new' ? '每次新建' : `${target.slice(0, 8)}…`
+          return t.watch === true ? `值守→${to}` : `自跑→${to}`
+        }
+        const lines = rows.map(t => `${t.id}「${t.name}」${describeSchedule(t.schedule)}｜[${whereOf(t)}]｜下次 ${t.nextRunAt ? new Date(t.nextRunAt).toLocaleString('zh-CN', { hour12: false }) : '—'}｜上次 ${fmtTs(t.lastRunAt)}｜${t.enabled ? '启用' : '停用'}｜已跑 ${t.runCount} 次${t.lastStatus ? '｜' + t.lastStatus : ''}`
+          + ((t as any).runningSince ? '｜正在运行' : ''))
         return { content: [{ type: 'text', text: `定时任务（${rows.length} 条）：\n${lines.join('\n')}` }], details: { count: rows.length } }
       },
     },
@@ -1729,6 +1763,278 @@ function gitRun(cwd: string, args: string[]): Promise<string> {
 }
 
 /* ══════ ★ 0929 批次C：repo 族（仓库地图 + 符号/概念级代码搜索）══════ */
+/* ══════ ★1126：生成视频工具 ══════
+ * 与 image 工具的关键差别：**它不等结果**。
+ *   · 上游是异步任务制（提交 1.7s → 轮询 → 约 140s 出片）；
+ *   · 所以这里只负责"提交 + 挂后台任务"，立刻返回，用户可以继续聊；
+ *   · 生成/下载/进度全在 bg 任务里跑，完成后走 bg 的 notifier 自动通知（会话提示 + 通知 AI）。
+ * 这么设计的原因：同步等 2 分半会把整轮对话卡死，而 bg 系统已经把进度条/通知/UI 都做好了。 */
+export function buildVideoTool(opts: {
+  conversationId: string
+  /** 成品落盘根目录（会话工作区绝对路径） */
+  workDir: string
+  /** ★1126：当前轮用户发的图 —— 图生视频默认拿它当首帧（与 image 工具的 edit 同口径） */
+  getTurnImages?: () => Array<{ data: string; mimeType: string }>
+  /** ★1126：按相对路径读工作区里的图（refShotRef 用，比如拿刚生成的那张当首帧） */
+  readWorkspaceImage?: (ref: string) => { data: string; mimeType: string } | null
+}): AgentTool<any> {
+  return {
+    name: 'video',
+    label: '生成视频',
+    description:
+      '生成一段视频。**只在用户明确要求出视频时调用**（说"生成个视频/做个动画/拍一段…"）。\n'
+      + '**两种模式**：\n'
+      + '· 文生视频（默认）：只给 prompt。\n'
+      + '· **图生视频**：**只有用户明确说"用这张图/把这张图做成视频"时**才传 `useTurnImage: true`（用本轮发的那张）'
+      + '或 `refShotRef`（指定工作区里的某张）—— 那张图会当**第一帧**，prompt 描述**动作和镜头**'
+      + '（如"人物缓缓转身，镜头推近"），不要重复描述图里已有的外观。\n'
+      + '⚠️ **不要因为"用户刚生成过图"就自作主张走图生视频** —— 没明说就按文生视频处理。'
+      + '**这个工具提交后立刻返回，不等成品** —— 视频要 2~3 分钟，跑在后台任务里，完成后自动通知你。\n'
+      + '提交后**不要反复查**（用户能看到真实进度）；也不要假装视频已经好了。\n'
+      + '参数：duration 1~15 秒；aspect_ratio 九档（1:1/16:9/9:16/4:3/3:4/3:2/2:3/21:9/5:2）；resolution 480p/720p/1080p。\n'
+      + '⚠️ 每次提交都计费，用户没明确要视频就别调。',
+    parameters: Type.Object({
+      action: Type.String({ description: '动作：generate=生成视频（文生视频或带首帧的图生视频）' }),
+      prompt: Type.String({ description: '画面描述（主体+动作+镜头+环境+风格）；图生视频时重点写动作与镜头运动' }),
+      duration: Type.Optional(Type.Number({ description: '视频秒数 1~15（默认用供应商设定）' })),
+      aspectRatio: Type.Optional(Type.String({ description: '画面比例：1:1 / 16:9 / 9:16 / 4:3 / 3:4 / 3:2 / 2:3 / 21:9 / 5:2' })),
+      resolution: Type.Optional(Type.String({ description: '分辨率：480p / 720p / 1080p' })),
+      refShotRef: Type.Optional(Type.String({ description: '图生视频的**首帧图**路径（如 screenshots/xxx.png）。用户明确要求用工作区里某张图时才传' })),
+      useTurnImage: Type.Optional(Type.Boolean({ description: '图生视频：用**用户本轮刚发的那张图**当首帧。**只有用户明说"用这张图做成视频"时才传 true**；不传就是纯文生视频' })),
+    }),
+    risky: true,
+    async execute(callId, params: any) {
+      const action = String(params?.action || 'generate').trim()
+      if (action !== 'generate') {
+        return {
+          content: [{ type: 'text', text: `【错误】不认识的 action「${action}」。video 目前只支持 generate。` }],
+          details: { ok: false, action },
+        }
+      }
+      const prompt = String(params?.prompt || '').trim()
+      if (!prompt) {
+        return {
+          content: [{ type: 'text', text: '【错误】prompt 不能为空 —— 请把用户想要的画面描述写进去。' }],
+          details: { ok: false, action },
+        }
+      }
+      const durRaw = Number(params?.duration)
+      const duration = Number.isFinite(durRaw) && durRaw > 0 ? Math.min(30, Math.round(durRaw)) : undefined
+      const aspectRatio = String(params?.aspectRatio || '').trim() || undefined
+      const resolution = String(params?.resolution || '').trim() || undefined
+
+      /* ★1126（老板纠偏）：**默认就是文生视频** —— 不传参数不等于"用本轮那张图"。
+         用户刚生成过图、又不明说的话，那是他的上下文，不该被我们偷偷塞成首帧。
+         两个显式入口：
+           · `refShotRef`        —— 指定工作区里的某张图
+           · `useTurnImage:true` —— 明确"用我刚发的这张"
+         都不给 ⇒ 纯文生视频。 */
+      let firstFrame: string | undefined
+      const refShotRef = String(params?.refShotRef || '').trim()
+      const useTurnImage = params?.useTurnImage === true
+      if (refShotRef) {
+        const img = opts.readWorkspaceImage?.(refShotRef)
+        if (!img) {
+          return {
+            content: [{ type: 'text', text: `【错误】找不到首帧图「${refShotRef}」（可能已被删除或路径不对）。` }],
+            details: { ok: false, action },
+          }
+        }
+        firstFrame = `data:${img.mimeType};base64,${img.data}`
+      } else if (useTurnImage) {
+        const turnImgs = opts.getTurnImages?.() || []
+        if (turnImgs.length) firstFrame = `data:${turnImgs[0].mimeType};base64,${turnImgs[0].data}`
+      }
+
+      const r = bgStartVideo({
+        prompt,
+        conversationId: opts.conversationId,
+        workDir: opts.workDir,
+        spawnedByCall: String(callId || ''),
+        ...(duration ? { duration } : {}),
+        ...(aspectRatio ? { aspectRatio } : {}),
+        ...(resolution ? { resolution } : {}),
+        ...(firstFrame ? { image: firstFrame } : {}),
+      })
+      if (!r.ok || !r.task) {
+        /* 配置类问题（没配视频模型）→ 明确说别重试 */
+        return {
+          content: [{ type: 'text', text: `【不要重试】${r.error || '提交失败'}\n（配置类问题，重试不会好。请如实转告用户。）` }],
+          details: { ok: false, action, error: r.error },
+        }
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `已提交后台生成${firstFrame ? '（图生视频，首帧用' + (refShotRef || '你刚发的那张图') + '）' : '（文生视频）'}（后台任务 ${r.task.task_id}）。`
+            + `视频通常要 2~3 分钟，完成后会自动通知你。\n期间**不要反复查询**，用户能在后台任务胶囊上看到真实进度。`,
+        }],
+        details: {
+          ok: true,
+          action,
+          async: true,
+          bgTaskId: r.task.task_id,
+          prompt,
+          ...(duration ? { duration } : {}),
+          ...(aspectRatio ? { aspectRatio } : {}),
+          ...(resolution ? { resolution } : {}),
+          ...(firstFrame ? { imageToVideo: true, ...(refShotRef ? { refShotRef } : {}) } : {}),
+        },
+      }
+    },
+  }
+}
+
+/* ══════ ★1126：生成图片工具 ══════
+ * 设计要点：
+ *  · 生图模型**不在会话/成员里选**，只在「设置 → 供应商 → 生成模型」配一次，
+ *    所有 agent / 团队成员共用（否则 5 个成员就要各选一次，加成员还得再选）。
+ *  · 图片落盘走注入的 saveImage（server 侧是 persistShot）：落会话工作区、details 带 shotRef，
+ *    前端现有渲染链路直接把图显示在工具块里 —— 前端零改动。
+ *  · 失败一律带【不要重试】+ 明确去处：模型不会对着"没配模型"反复试。 */
+export function buildImageTool(opts: {
+  saveImage: (base64: string, mime: string, meta?: { prompt?: string; model?: string; size?: string }) => Record<string, any>
+  /** ★1126：当前轮用户发进来的图（图生图默认拿它当参考图）；没有就返回空数组 */
+  getTurnImages?: () => Array<{ data: string; mimeType: string }>
+  /** ★1126：按相对路径从会话工作区读一张图（`refShotRef` 用，比如改刚生成的那张） */
+  readWorkspaceImage?: (ref: string) => { data: string; mimeType: string } | null
+}): AgentTool<any> {
+  return {
+    name: 'image',
+    label: '生成图片',
+    description:
+      '生成或修改图片。**只在用户明确要求出图时调用**：说"画一张/生成一张/做张图/给我个图/把这张图改成…"。\n'
+      + '不要为了"配图、装饰、演示、丰富回答"主动生成 —— 用户没提出图就别调，那会花他的钱。\n'
+      + '· action=generate：文生图。prompt 写具体：主体 + 风格 + 光影 + 构图 + 画幅。\n'
+      + '· action=edit：**图生图/改图**。默认拿用户刚发的那张图当参考；要改之前生成的图，传 refShotRef。\n'
+      + '**默认出 1 张**（耗时 20~40 秒）。用户明确要几张就传 n；要不同风格/方案就多次调用。\n'
+      + '用户说了"竖版/手机壁纸"传 1024x1536，"横版/桌面"传 1536x1024，"方图"传 1024x1024，没说就别传 size。\n'
+      + '生图模型已由用户在设置里配好，你不需要也**不要**传模型名。',
+    parameters: Type.Object({
+      action: Type.String({ description: '动作：generate=文生图 / edit=图生图（改图）' }),
+      prompt: Type.String({ description: '画面描述（主体+风格+光影+构图+画幅，越具体越好）' }),
+      size: Type.Optional(Type.String({ description: '尺寸，如 1024x1024 / 1024x1536（竖）/ 1536x1024（横）；留空用供应商默认' })),
+      n: Type.Optional(Type.Number({ description: '张数 1~4，默认 1。**按张计费**：用户没明确说要几张就只出 1 张' })),
+      refShotRef: Type.Optional(Type.String({ description: '仅 action=edit：要改的那张图的路径（如 screenshots/shot-xxx.png）。不传则用用户刚发的图' })),
+    }),
+    // 花钱操作：上市默认走审批卡（用户可在设置里关）
+    risky: true,
+    async execute(_callId, params: any) {
+      const action = String(params?.action || 'generate').trim()
+      if (action !== 'generate' && action !== 'edit') {
+        return {
+          content: [{ type: 'text', text: `【错误】不认识的 action「${action}」。image 支持 generate（文生图）/ edit（图生图）。` }],
+          details: { ok: false, action },
+        }
+      }
+      const prompt = String(params?.prompt || '').trim()
+      if (!prompt) {
+        return {
+          content: [{ type: 'text', text: '【错误】prompt 不能为空 —— 请把用户想要的画面描述写进去。' }],
+          details: { ok: false, action },
+        }
+      }
+      const size = String(params?.size || '').trim() || undefined
+      /* 张数：默认 1。**按张计费**，钳到 1~4 —— 上游对 n 不校验（实测 n=99 也照收），
+         所以这道钳位是防"模型随手传个 10"烧钱，不是防上游。 */
+      const nRaw = Number(params?.n)
+      const n = Number.isFinite(nRaw) ? Math.max(1, Math.min(4, Math.floor(nRaw))) : 1
+
+      /* 配置/解析失败：文案本身要能教模型"别再试了、去告诉用户" */
+      let target: ResolvedMediaTarget
+      try {
+        target = resolveMediaTarget('image')
+      } catch (e: any) {
+        return {
+          content: [{ type: 'text', text: `【不要重试】${String(e?.message || e)}\n（配置类问题，重试不会好。请如实转告用户。）` }],
+          details: { ok: false, action, error: String(e?.message || e) },
+        }
+      }
+
+      const t0 = Date.now()
+      let out
+      try {
+        if (action === 'edit') {
+          /* ★1126：图生图 —— 参考图来自两处：显式 refShotRef（改之前生成的图）
+             或当前轮用户刚发进来的图（getTurnImages）。两处都没有就明确报错，别硬发空图。 */
+          const refShotRef = String(params?.refShotRef || '').trim()
+          let refs: Array<{ data: string; mimeType: string }> = []
+          if (refShotRef) {
+            const img = opts.readWorkspaceImage?.(refShotRef)
+            if (!img) throw new Error(`找不到参考图「${refShotRef}」（可能已被删除或路径不对）`)
+            refs = [img]
+          } else {
+            refs = (opts.getTurnImages?.() || []).slice(0, 3)
+          }
+          if (!refs.length) {
+            throw new Error('图生图需要参考图：请让用户先发一张图片进来，或指定要修改的那张图（refShotRef）')
+          }
+          out = await editImage(target, { prompt, refs, ...(size ? { size } : {}) })
+        } else if (n <= 1) {
+          out = await generateImage(target, { prompt, ...(size ? { size } : {}) })
+        } else {
+          const settled = await Promise.allSettled(
+            Array.from({ length: n }, () => generateImage(target, { prompt, ...(size ? { size } : {}) })),
+          )
+          const imgs: Array<{ data: string; mimeType: string }> = []
+          let text: string | undefined
+          const errs: string[] = []
+          for (const s of settled) {
+            if (s.status === 'fulfilled') {
+              imgs.push(...s.value.images)
+              if (s.value.text) text = s.value.text
+            } else {
+              errs.push(String((s.reason as any)?.message || s.reason))
+            }
+          }
+          if (!imgs.length) throw new Error(`全部 ${n} 次请求都失败了：${errs[0] || '未知错误'}`)
+          out = { images: imgs, ...(text ? { text } : {}) }
+          if (errs.length) console.warn(`[image] ${n} 张里失败 ${errs.length} 张：`, errs.slice(0, 3).join(' | '))
+        }
+      } catch (e: any) {
+        return {
+          content: [{ type: 'text', text: `【生图失败】${String(e?.message || e)}\n（先原样转告用户错误内容；若明显是 key/余额/权限问题，不要重试。）` }],
+          details: { ok: false, action, error: String(e?.message || e), model: target.modelId },
+        }
+      }
+      const ms = Date.now() - t0
+
+      /* 逐张落盘。多张也不会丢（上游偶尔忽略 n=1 的约定），但前端工具块只渲染第一张。 */
+      const saved: Array<Record<string, any>> = []
+      for (const img of out.images) {
+        try { saved.push(opts.saveImage(img.data, img.mimeType, { prompt, model: target.modelId, size: size || '' })) }
+        catch (e: any) { saved.push({ saveError: String(e?.message || e) }) }
+      }
+      const first = saved[0] || {}
+      const allRefs = saved.map(s => s.shotRef).filter((x): x is string => typeof x === 'string' && !!x)
+      const okCount = saved.filter(s => s.shotRef || s.dataUrl).length
+
+      const lines = [
+        `已生成 ${okCount} 张图（模型 ${target.providerId}/${target.modelId}，${(ms / 1000).toFixed(1)}s${size ? `，${size}` : ''}${action === 'edit' ? '，图生图' : ''}）。`,
+        `实际用的 prompt：${prompt}`,
+        /* ★1126：把路径给模型看 —— 用户说"把刚才那张改成…"时，它得知道该传哪个 refShotRef */
+        ...(allRefs.length ? [`图片路径：${allRefs.join('、')}（要改其中某张：action=edit + refShotRef=上面某个路径）`] : []),
+        '图片已经在对话里显示给用户了，不要再用文字复述画面内容。',
+      ]
+      return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+        details: {
+          ok: okCount > 0,
+          action,
+          model: target.modelId,
+          providerId: target.providerId,
+          ms,
+          prompt,
+          ...first,
+          /* ★1126：多图时给全部引用 —— 前端据此渲染 1~3 列网格（单图不传，保持老链路）。
+             shotRef 仍是第一张，给只认单张的旧路径兜底显示。 */
+          ...(allRefs.length > 1 ? { shots: allRefs } : {}),
+        },
+      }
+    },
+  }
+}
+
 export function buildRepoTools(cwd: string): AgentTool<any>[] {
   const subs: any[] = [
     {
