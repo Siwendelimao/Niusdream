@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-27",
+  "_comment": "NiusDream 软件环境安装源。改这个文件即可换源，不用重新打包。allowHosts 只能收窄（代码里钉死的主机为准），不能扩充。",
+  "allowHosts": [
+    "siwendelimao.github.io",
+    "github.com",
+    "objects.githubusercontent.com",
+    "registry.npmmirror.com",
+    "registry.npmjs.org",
+    "hf-mirror.com",
+    "huggingface.co"
+  ],
+  "npm": [
+    { "url": "https://registry.npmmirror.com/npm/@@NPM@@.tgz", "label": "npmmirror 镜像" },
+    { "url": "https://registry.npmjs.org/npm/@@NPM@@.tgz", "label": "官方源" }
+  ],
+  "gitbash": [
+    { "url": "https://registry.npmmirror.com/-/binary/git-for-windows/v@@VER@@.windows.1/@@FILE@@", "label": "npmmirror 镜像" },
+    { "url": "https://github.com/git-for-windows/git/releases/download/v@@VER@@.windows.1/@@FILE@@", "label": "GitHub 官方" }
+  ],
+  "embedHfEndpoint": "https://hf-mirror.com"
+}
