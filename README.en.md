@@ -7,6 +7,10 @@
 
 **English** · [简体中文](README.md)
 
+![NiusDream: one sentence in, real files out — and it remembers your rules in the next chat](assets/demo-pc-light-en.gif)
+
+[▶ Watch in HD (MP4 · 0.8MB)](assets/demo-pc-light-en.mp4)
+
 > **有你在，我将无所不能。** *With you, I can do anything.*
 
 > **A self-hosted AI agent workbench.** Desktop, phone and messaging apps — one mind everywhere.
@@ -192,6 +196,15 @@ cd Niusdream/backend && pnpm install && pnpm start   # 127.0.0.1:8766
 - **Avoid non-ASCII data paths** (known issue, measured)
 
 ---
+
+<details>
+<summary>Dark mode / Mobile portrait</summary>
+
+| Dark | Mobile |
+|---|---|
+| ![Dark](assets/demo-pc-dark.gif) | ![Mobile](assets/demo-mobile-light.gif) |
+
+</details>
 
 ## Where data lives
 

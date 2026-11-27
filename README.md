@@ -7,6 +7,10 @@
 
 **简体中文** · [English](README.en.md)
 
+![NiusDream：一句话，它自己建目录、写文件、给结果；换个对话，它还记着你定的规矩](assets/demo-pc-light.gif)
+
+[▶ 看高清版（MP4 · 1.2MB）](assets/demo-pc-light.mp4)
+
 > **有你在，我将无所不能。**
 
 > **自托管 AI Agent 工作台**。桌面、手机、消息软件，处处是它；记忆、文件、密钥，样样在你机器上。
@@ -190,6 +194,15 @@ cd Niusdream/backend && pnpm install && pnpm start   # 默认 127.0.0.1:8766
 - **数据目录别放中文路径**（已知问题，实测踩到）
 
 ---
+
+<details>
+<summary>深色模式 / 手机竖屏</summary>
+
+| 深色 | 手机 |
+|---|---|
+| ![深色](assets/demo-pc-dark.gif) | ![手机](assets/demo-mobile-light.gif) |
+
+</details>
 
 ## 数据在哪
 
